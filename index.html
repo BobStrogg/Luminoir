@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Luminoir — 3D Sheet Music</title>
+  <link rel="stylesheet" href="/src/styles/main.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene-canvas"></canvas>
+
+    <!-- Loading overlay -->
+    <div id="loading-overlay" class="overlay">
+      <div class="loading-content">
+        <div class="spinner"></div>
+        <p id="loading-text">Initializing Luminoir...</p>
+      </div>
+    </div>
+
+    <!-- Controls bar -->
+    <div id="controls-bar" class="hidden">
+      <div class="controls-left">
+        <div class="score-select-wrap">
+          <!-- Custom dropdown.  Native <select> can't render the
+               two-line "title + composer" layout we want, so the
+               control is a <button> that opens an absolute-positioned
+               <ul> menu populated at runtime by Controls.js.  The
+               element keeps the same `id` as before so callers and
+               selectors that referenced #score-select continue to
+               work; the live value is held on `data-value`. -->
+          <button id="score-select" type="button" aria-haspopup="listbox" aria-expanded="false">
+            <span class="score-select-title">Loading…</span>
+            <span class="score-select-composer"></span>
+          </button>
+          <ul id="score-menu" class="score-menu hidden" role="listbox"></ul>
+          <!-- Loading spinner overlaid on the dropdown's right edge
+               while the score worker is parsing.  `.hidden` by default,
+               toggled by Controls.js via the app's onLoadStart /
+               onLoadEnd callbacks.  Sized so it tucks neatly inside
+               the dropdown chevron without crowding the score name. -->
+          <div id="score-loading" class="score-loading hidden" role="status" aria-label="Loading score">
+            <div class="score-loading-spinner"></div>
+          </div>
+        </div>
+        <button id="btn-import" title="Import MusicXML">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+        </button>
+        <input type="file" id="file-input" accept=".xml,.musicxml,.mxl" hidden />
+      </div>
+      <div class="controls-center">
+        <button id="btn-stop" title="Stop">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+        </button>
+        <button id="btn-play" title="Play / Pause" class="btn-primary">
+          <svg id="icon-play" viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+          <svg id="icon-pause" viewBox="0 0 24 24" width="28" height="28" fill="currentColor" class="hidden"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Debug: renderer indicator.  Shows which backend the worker
+         picked ("WebGPU" / "WebGL"), and is clickable to force a
+         switch by reloading with `?renderer=...` in the URL.  Hidden
+         until the worker's `ready` message confirms which backend
+         actually initialised. -->
+    <div id="renderer-badge" class="hidden" title="Renderer"></div>
+
+    <!-- Debug: FPS counter.  Hidden by default; toggle with the
+         `F` key (or via `?fps=1` URL parameter).  Reads its content
+         from periodic `stats` messages posted by the render worker. -->
+    <div id="fps-badge" class="hidden" title="Frames per second (worker rAF)"></div>
+
+    <!-- Settings: gear button + floating popover.  The popover is a
+         sibling of the gear button (not a child) so it can extend
+         well beyond the button's box without dragging the button's
+         CSS along for the ride.  `.open` toggles `.settings-popover`
+         visibility via SettingsPanel.js. -->
+    <button id="btn-settings" class="hidden" title="Settings" aria-label="Open settings">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19.43 12.98c.04-.32.07-.64.07-.98 0-.34-.03-.66-.07-.98l2.11-1.65a.49.49 0 0 0 .12-.61l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.5.5 0 0 0 14 2h-4a.5.5 0 0 0-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.49.49 0 0 0 .12.61l2.11 1.65c-.04.32-.07.64-.07.98 0 .34.03.66.07.98l-2.11 1.65a.49.49 0 0 0-.12.61l2 3.46c.14.24.43.34.69.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.05.24.25.42.49.42h4c.24 0 .44-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.27.12.56.02.69-.22l2-3.46a.49.49 0 0 0-.12-.61l-2.11-1.65zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>
+    </button>
+    <div id="settings-popover" class="settings-popover" role="dialog" aria-labelledby="settings-title"></div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
