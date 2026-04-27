@@ -324,9 +324,9 @@ export const SceneConfig = {
    * playback so a static scene doesn't feel still.
    *
    * **Behaviour at a glance**
-   *   • Disabled by default — opt-in from the settings panel so
-   *     users who prefer a steady, side-on view (or who are
-   *     manually framing for a recording) aren't surprised.
+   *   • Enabled by default — opt-out from the settings panel if
+   *     you prefer a steady, side-on view (or are manually
+   *     framing for a recording).
    *   • While enabled and during playback, applies sinusoidal
    *     yaw / pitch / radius offsets ON TOP of the user's current
    *     orbit pose.  Mouse drag still wins — interacting with
@@ -372,7 +372,7 @@ export const SceneConfig = {
    *     "fighting the camera".
    */
   smartCamera: {
-    enabled: false,
+    enabled: true,
     orbitStrength: 0.25,
     orbitSpeed: 0.15,
     zoomStrength: 0.10,
