@@ -388,6 +388,14 @@ export class CameraController {
       this._restOffsetStale = true;
     } else {
       this._userInteracting = false;
+      // Reset the eased smart-camera offsets to neutral so the
+      // orbit resumes smoothly from wherever the user left the
+      // camera.  Without this the stale offsets from the previous
+      // active cycle are applied on top of the new rest pose,
+      // causing a visible jump.
+      this._smartYaw = 0;
+      this._smartPitch = 0;
+      this._smartRadiusFactor = 1.0;
       const cfg = SceneConfig.smartCamera;
       const delay = cfg ? (cfg.resumeAfterUserMs ?? 1500) : 1500;
       this._smartResumeAt = performance.now() + delay;
@@ -643,9 +651,25 @@ export class CameraController {
     //   • +distance along world Z — toward the camera's "front" of
     //     the music (positive Z is in front of the staff cluster
     //     after the contentRoot rotation).
-    const pitchRad = ((cfg.pitchDegrees ?? 30) * Math.PI) / 180;
+    // In portrait orientation (aspect < 1) the horizontal FOV is narrow,
+    // so the diagonal "music flowing in from the top-right" view wastes
+    // screen width.  Steeper pitch + smaller chase keeps more notes
+    // visible in the tight horizontal span.  The blend factor ramps
+    // linearly between landscape (aspect >= 1 → factor = 0) and tall
+    // portrait (aspect ≈ 0.5 → factor ≈ 1), so intermediate sizes
+    // transition smoothly.
+    const aspect = this.camera.aspect ?? 1;
+    const portraitFactor = Math.max(0, Math.min(1, (1 - aspect) * 2));
+    const portraitPitch = 65;  // degrees — near-overhead in deep portrait
+    const portraitChase = 0.25;
+    const basePitchDeg = cfg.pitchDegrees ?? 30;
+    const baseChase = cfg.chaseRatio ?? 0.25;
+    const effectivePitch = basePitchDeg + (portraitPitch - basePitchDeg) * portraitFactor;
+    const effectiveChase = baseChase + (portraitChase - baseChase) * portraitFactor;
+
+    const pitchRad = (effectivePitch * Math.PI) / 180;
     const heightRatio = Math.tan(pitchRad);
-    const chaseRatio = cfg.chaseRatio ?? 0.25;
+    const chaseRatio = effectiveChase;
     const chaseX = -Math.min(distance * chaseRatio, 3.0);
     this.camera.position.set(
       this._target.x + chaseX,
