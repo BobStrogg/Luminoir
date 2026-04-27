@@ -1,0 +1,825 @@
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0a0a0f;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+#scene-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Loading overlay */
+.overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0a0a0f;
+  z-index: 100;
+  transition: opacity 0.6s ease;
+}
+
+.overlay.fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.loading-content {
+  text-align: center;
+}
+
+.loading-content p {
+  margin-top: 1.5rem;
+  font-size: 0.95rem;
+  color: #8888aa;
+  letter-spacing: 0.05em;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto;
+  border: 3px solid rgba(255, 220, 160, 0.15);
+  border-top-color: rgba(255, 220, 160, 0.8);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Controls bar
+ *
+ * Pinned to the top-left of the viewport.  The score (after the
+ * camera-angle change that puts upcoming notes flowing into the
+ * top-right) leaves the top-left empty almost all the time, so the
+ * bar can sit on top of the canvas without occluding any music.  The
+ * earlier bottom-centre position was problematic on phones in
+ * landscape orientation where the viewport is short and the bar fell
+ * off the screen.
+ *
+ * `flex-wrap: wrap` lets the two sections (score-select + import,
+ * transport buttons) reflow onto multiple lines on narrow
+ * phone-portrait viewports without losing any controls.  On a
+ * desktop or tablet everything fits in a single row and the wrap
+ * never triggers.
+ */
+#controls-bar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 8px 14px;
+  background: rgba(10, 10, 18, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 14px;
+  z-index: 50;
+  transition: opacity 0.4s ease;
+  /* Cap the bar's width on phones at the available canvas minus the
+   * top-right badge cluster.  `min` keeps the desktop behaviour
+   * intact (where the bar shrinks to fit its content) while
+   * preventing a tall second row of wrapped controls from extending
+   * under the renderer / FPS badges on narrow viewports. */
+  max-width: calc(100vw - 24px);
+}
+
+#controls-bar.hidden {
+  display: none;
+}
+
+.controls-left,
+.controls-center,
+.controls-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.controls-center {
+  gap: 14px;
+}
+
+/* Buttons.
+ *
+ * `:not(#score-select)` excludes the score-selector trigger because
+ * it's a wide rectangular element (≈ 180 px wide for the title +
+ * composer text), where `border-radius: 50%` would produce a
+ * pill/ellipse shape rather than the rounded rectangle the rest of
+ * its rules assume. */
+#controls-bar button:not(#score-select) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.07);
+  color: #d0d0dd;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s;
+}
+
+#controls-bar button:not(#score-select):hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+}
+
+#controls-bar button.btn-primary {
+  width: 46px;
+  height: 46px;
+  background: rgba(255, 210, 140, 0.18);
+  color: rgba(255, 220, 160, 0.95);
+}
+
+#controls-bar button.btn-primary:hover {
+  background: rgba(255, 210, 140, 0.3);
+  color: #ffe0a0;
+}
+
+/* Score selector — custom dropdown.
+ *
+ * The native <select> element can't render the two-line "title +
+ * composer" layout we want, so the trigger is a <button> styled to
+ * match the rest of the controls bar and the menu is an absolute-
+ * positioned <ul> populated at runtime.  Both lines update via
+ * separate <span>s so we can give them different font weight and
+ * colour.
+ */
+#score-select {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #c0c0d0;
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  padding: 6px 28px 6px 10px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238888aa' d='M3 4.5L6 8l3-3.5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  /* Two-line trigger: line 1 = title, line 2 = composer (when present).
+   * `display: flex; flex-direction: column` stacks them and keeps the
+   * baseline of the title aligned with the rest of the controls bar
+   * regardless of whether the composer line is shown. */
+  display: inline-flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  min-width: 180px;
+  max-width: 240px;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+}
+
+#score-select:focus,
+#score-select:hover:not(.disabled) {
+  outline: none;
+  border-color: rgba(255, 210, 140, 0.3);
+}
+
+.score-select-title {
+  /* Prominent: brighter text and slightly heavier weight than the
+   * default control colour.  Truncates with ellipsis so a long title
+   * doesn't push the controls bar wider on small viewports. */
+  color: #ffe9c8;
+  font-weight: 500;
+  font-size: 0.86rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.score-select-composer {
+  /* Dimmer + smaller — matches the on-paper subtitle.  Hidden when the
+   * span is empty (i.e. the score has no composer credit) by virtue
+   * of having no content; we don't `display: none` it so the trigger
+   * height stays stable across selections. */
+  color: #8e8e9e;
+  font-size: 0.7rem;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.score-select-composer:empty {
+  display: none;
+}
+
+/* Disable state — applied via class while the score worker is
+ * loading.  The button keeps its layout but signals it's not
+ * interactive. */
+#score-select.disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* The dropdown menu.  Absolute-positioned beneath the trigger, with
+ * its own scroll so a long score list doesn't push controls
+ * off-screen.  Z-index sits at 60 — above the controls bar (50)
+ * and the gear popover (50) so the menu is reachable when both are
+ * open simultaneously. */
+.score-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: rgba(20, 20, 28, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  min-width: 100%;
+  max-width: 320px;
+  max-height: 360px;
+  overflow-y: auto;
+  z-index: 60;
+}
+
+.score-menu li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.score-menu li:hover {
+  background: rgba(255, 220, 160, 0.08);
+}
+
+.score-menu li.selected {
+  background: rgba(255, 210, 140, 0.14);
+}
+
+.score-menu-title {
+  color: #ffe9c8;
+  font-weight: 500;
+  font-size: 0.86rem;
+  line-height: 1.2;
+}
+
+.score-menu-composer {
+  color: #8e8e9e;
+  font-size: 0.7rem;
+  line-height: 1.15;
+}
+
+/* Score-loading spinner.
+ *
+ * Overlays the right edge of the dropdown (where the chevron is)
+ * with a small spinning ring.  Hidden by default; shown when
+ * `app.onLoadStart` fires.  Uses the same compositor-friendly
+ * `transform: rotate()` animation as the initial-load `.spinner`
+ * so it keeps spinning smoothly even if the main thread is briefly
+ * busy with the post-worker scene-build hand-off (`render.buildScene` +
+ * `setTimeline` postMessages, MIDI parse — typically ≤30 ms total
+ * after the worker hands back the parsed scene). */
+.score-select-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.score-loading {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
+.score-select-wrap:has(.score-loading:not(.hidden)) #score-select {
+  background-image: none;
+}
+
+.score-loading-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 220, 160, 0.18);
+  border-top-color: rgba(255, 220, 160, 0.85);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+/* Tempo slider — removed in favour of the Playback speed setting in
+ * the gear popover.  Slider markup stripped from index.html; rules
+ * deleted from this stylesheet on the same commit. */
+
+.hidden {
+  display: none !important;
+}
+
+/* Debug renderer indicator — a subtle pill in the top-right showing
+ * which render backend initialised.  Clickable when more than one
+ * backend is available on this browser (e.g. Chrome with WebGPU +
+ * WebGL); reloads the page with the inverse `?renderer=…` URL
+ * parameter so we can compare backends without dev-tools. */
+#renderer-badge {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  padding: 5px 11px;
+  background: rgba(10, 10, 18, 0.7);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-weight: 500;
+  color: #9999bb;
+  letter-spacing: 0.06em;
+  user-select: none;
+  z-index: 40;
+  transition: background 0.2s, color 0.2s, border-color 0.2s, transform 0.15s;
+  cursor: pointer;
+}
+
+#renderer-badge:hover {
+  background: rgba(10, 10, 18, 0.9);
+  color: #e0e0ea;
+  border-color: rgba(255, 220, 160, 0.3);
+  transform: translateY(-1px);
+}
+
+#renderer-badge:active {
+  transform: translateY(0);
+}
+
+/* Applied when the active browser can only support one backend (e.g.
+ * Safari today without WebGPU, or a non-secure origin).  The badge
+ * still shows the current renderer but is non-interactive. */
+#renderer-badge.locked {
+  cursor: default;
+  opacity: 0.6;
+}
+
+#renderer-badge.locked:hover {
+  background: rgba(10, 10, 18, 0.7);
+  color: #9999bb;
+  border-color: rgba(255, 255, 255, 0.08);
+  transform: none;
+}
+
+/* Debug FPS counter.  Sits just below the renderer badge in the
+ * top-right.  Two-line monospace readout: top is rAF-to-rAF FPS
+ * (what the user perceives — includes GPU execution time), bottom
+ * is render-submit p50 / p95 in ms (cheap to read at a glance to
+ * spot whether a slowdown is GPU-bound or CPU-bound).  Tinted by
+ * frame budget: green ≥55 fps, amber ≥45 fps, red below.  Toggle
+ * with the `F` key. */
+#fps-badge {
+  position: absolute;
+  top: 50px;
+  right: 12px;
+  padding: 6px 11px;
+  background: rgba(10, 10, 18, 0.7);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  font-size: 0.68rem;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-weight: 500;
+  color: #9999bb;
+  letter-spacing: 0.04em;
+  user-select: none;
+  z-index: 40;
+  white-space: pre;
+  line-height: 1.35;
+  text-align: right;
+  pointer-events: none;
+}
+
+#fps-badge.tier-good { color: #88dda8; border-color: rgba(140, 220, 170, 0.25); }
+#fps-badge.tier-warn { color: #e8c060; border-color: rgba(232, 192, 96, 0.30); }
+#fps-badge.tier-bad  { color: #f08866; border-color: rgba(240, 136, 102, 0.35); }
+
+/* Settings: gear button + popover.
+ *
+ * The gear sits in the top-right alongside the renderer / FPS
+ * badges.  We position the popover with `right` rather than `left`
+ * so it grows leftward (toward the screen centre) as the content
+ * gets taller, never overflowing the right edge.  `top` is set just
+ * below the gear button — `transform: translateY(0)` on close,
+ * `translateY(0)` + opacity on open, with a tiny enter animation so
+ * the panel doesn't appear instantaneously.
+ *
+ * Z-index sits at 50 (above the FPS/renderer badges at 40 and the
+ * controls bar at 50; we tie it with controls-bar deliberately so a
+ * click on the bar doesn't pass through the popover).
+ */
+#btn-settings {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 30px;
+  padding: 0;
+  background: rgba(10, 10, 18, 0.7);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  color: #9999bb;
+  cursor: pointer;
+  user-select: none;
+  z-index: 40;
+  transition: background 0.2s, color 0.2s, border-color 0.2s, transform 0.15s;
+}
+
+#btn-settings:hover,
+#btn-settings.active {
+  background: rgba(10, 10, 18, 0.9);
+  color: #e0e0ea;
+  border-color: rgba(255, 220, 160, 0.3);
+}
+
+#btn-settings.active {
+  transform: rotate(40deg);
+}
+
+/* When the renderer badge is visible, slide the gear left so the
+ * three top-right widgets line up nicely (renderer | gear | … fps
+ * goes underneath).  We don't anchor the gear *between* the badges
+ * because the renderer badge can be hidden on browsers that
+ * couldn't pick a backend, in which case the gear takes its slot. */
+#renderer-badge:not(.hidden) ~ #btn-settings {
+  right: calc(12px + 80px);
+}
+
+.settings-popover {
+  position: absolute;
+  top: 50px;
+  right: 12px;
+  width: 320px;
+  max-height: calc(100vh - 80px - 110px);  /* leave room for controls bar */
+  background: rgba(10, 10, 18, 0.85);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  padding: 16px 18px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.82rem;
+  color: #e0e0ea;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  overflow-y: auto;
+  z-index: 50;
+  opacity: 0;
+  transform: translateY(-6px);
+  pointer-events: none;
+  transition: opacity 0.18s, transform 0.18s;
+}
+
+.settings-popover.open {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.settings-header h2 {
+  margin: 0 0 4px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #ffd9a0;
+}
+
+.settings-section {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settings-section:first-of-type {
+  border-top: none;
+  margin-top: 8px;
+  padding-top: 0;
+}
+
+.settings-section h3 {
+  margin: 0 0 10px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #8888a0;
+}
+
+.settings-row {
+  margin-bottom: 12px;
+}
+
+.settings-row:last-child {
+  margin-bottom: 0;
+}
+
+.settings-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #d8d8e8;
+  margin-bottom: 4px;
+  cursor: default;
+}
+
+.settings-reparse-tag {
+  font-size: 0.6rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: rgba(232, 192, 96, 0.15);
+  color: #e8c060;
+}
+
+.settings-control-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-control-range input[type='range'] {
+  flex: 1;
+  accent-color: #ffd9a0;
+}
+
+.settings-readout {
+  min-width: 56px;
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.74rem;
+  color: #ffd9a0;
+}
+
+.settings-control-checkbox {
+  display: flex;
+  align-items: center;
+}
+
+.settings-control-checkbox input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: #ffd9a0;
+  cursor: pointer;
+}
+
+/* For checkbox rows, put the checkbox to the left of the label by
+ * flipping the row to a single-line layout. */
+.settings-row:has(.settings-control-checkbox) {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 10px;
+  align-items: center;
+}
+
+.settings-row:has(.settings-control-checkbox) > .settings-label {
+  order: 2;
+  margin-bottom: 0;
+  cursor: pointer;
+  font-weight: 400;
+  color: #d8d8e8;
+}
+
+.settings-row:has(.settings-control-checkbox) > .settings-control-checkbox {
+  order: 1;
+  grid-row: 1;
+}
+
+.settings-row:has(.settings-control-checkbox) > .settings-desc {
+  order: 3;
+  grid-column: 2;
+  margin-top: 2px;
+}
+
+.settings-desc {
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: #8888a0;
+  line-height: 1.4;
+}
+
+.settings-footer {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* About section — static credits block.  Sits above the reset
+ * footer; styled with the same `.settings-section` base rules so
+ * the heading and top border match the surrounding setting groups,
+ * with a slightly looser line-height inside the body so the prose
+ * reads as text rather than as a list of controls. */
+.settings-about-intro {
+  margin: 0 0 12px;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: #b8b8c8;
+}
+
+.settings-about-credits {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-about-credits li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 8px;
+  row-gap: 2px;
+  align-items: baseline;
+}
+
+.settings-about-credit-name {
+  color: #ffd9a0;
+  font-size: 0.78rem;
+  font-weight: 500;
+  text-decoration: none;
+  border-bottom: 1px dotted rgba(255, 217, 160, 0.3);
+}
+
+.settings-about-credit-name:hover {
+  color: #ffe9c8;
+  border-bottom-color: rgba(255, 233, 200, 0.6);
+}
+
+.settings-about-credit-license {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.66rem;
+  color: #8888a0;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.settings-about-credit-role {
+  grid-column: 1 / -1;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: #8888a0;
+}
+
+.settings-reset {
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #d8d8e8;
+  font-size: 0.74rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.settings-reset:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 220, 160, 0.3);
+  color: #ffd9a0;
+}
+
+/* Phone-sized viewports.
+ *
+ * Below ≈600 px wide OR ≈500 px tall the controls bar is wider than
+ * the viewport even with `flex-wrap`, so we shrink every interactive
+ * element by roughly 20–30 % and tighten the gaps.  The score-select
+ * also loses its 200-px hard cap so the dropdown can stretch to fill
+ * whatever width is left after the import button.
+ *
+ * The height-based clause matches phone-landscape (≈ 667 × 375),
+ * where the bar itself fits in one wide row but the top-right badge
+ * cluster (renderer / gear / FPS) would otherwise overlap the bar's
+ * tail.  Tightening sizes there gives the badges enough room to
+ * sit beside the bar in their original top corner.
+ *
+ * The bar still wraps when the available width is too small for one
+ * row, though now (after the BPM widget moved to the gear popover)
+ * the score selector + transport buttons typically fit on a single
+ * row at all phone-portrait widths down to ≈ 320 px.  Wrapping kicks
+ * in only when the user has narrowed past that.
+ */
+@media (max-width: 600px), (max-height: 500px) {
+  #controls-bar {
+    top: 8px;
+    left: 8px;
+    gap: 8px;
+    padding: 6px 10px;
+    font-size: 0.78rem;
+  }
+  #controls-bar button:not(#score-select) {
+    width: 32px;
+    height: 32px;
+  }
+  #controls-bar button.btn-primary {
+    width: 38px;
+    height: 38px;
+  }
+  #controls-bar button:not(#score-select) svg {
+    width: 18px;
+    height: 18px;
+  }
+  #controls-bar button.btn-primary svg {
+    width: 22px;
+    height: 22px;
+  }
+  .controls-left,
+  .controls-center,
+  .controls-right {
+    gap: 6px;
+  }
+  #score-select {
+    font-size: 0.78rem;
+    padding: 5px 24px 5px 8px;
+    min-width: 150px;
+    max-width: 180px;
+  }
+  .score-select-title { font-size: 0.78rem; }
+  .score-select-composer { font-size: 0.66rem; }
+
+  /* Settings popover anchored top-right; on phones it's wider than
+   * the viewport at 320 px, so cap it at 90 % of the screen and
+   * lower the top so it doesn't run off the bottom on landscape. */
+  .settings-popover {
+    width: min(320px, 90vw);
+    max-height: calc(100vh - 60px);
+    top: 44px;
+    right: 8px;
+  }
+
+  /* Tighter padding for the top-right badge cluster on phones. */
+  #renderer-badge,
+  #btn-settings,
+  #fps-badge {
+    right: 8px;
+  }
+  #renderer-badge:not(.hidden) ~ #btn-settings {
+    right: calc(8px + 70px);
+  }
+}
+
+/* Phone-portrait specific override.
+ *
+ * In portrait the controls bar wraps to two rows (≈ 74 px tall), so
+ * the badges + gear button at the default `top: 12 px` would sit
+ * underneath it and become unclickable.  We push them down past the
+ * wrapped bar so they live in their own clear strip below the
+ * controls.  In landscape the bar fits in one row and the badges
+ * stay in the original top corner alongside it. */
+@media (max-width: 600px) and (orientation: portrait) {
+  #renderer-badge,
+  #btn-settings {
+    top: 92px;
+  }
+  #fps-badge {
+    top: 124px;
+  }
+  .settings-popover {
+    top: 130px;
+  }
+}
