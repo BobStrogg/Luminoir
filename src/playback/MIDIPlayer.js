@@ -340,6 +340,31 @@ export class MIDIPlayer {
   }
 
   /**
+   * Re-schedule the remaining note tail from the current playback
+   * position.  Called when the page regains visibility after being
+   * backgrounded — Chrome and Safari may suspend or throttle the
+   * AudioContext while the tab is hidden, causing pre-scheduled
+   * AudioBufferSourceNodes to be dropped or to fire in a burst.
+   * A fresh schedule pass from "now" corrects any drift.
+   *
+   * Also resumes a suspended AudioContext if the browser paused it.
+   */
+  reschedule() {
+    if (!this._isPlaying || !this._ctx) return;
+    // Capture where we are in music time.
+    const t = this.currentTime;
+    // Resume the AudioContext if the browser suspended it while
+    // the tab was hidden.
+    if (this._ctx.state === 'suspended') {
+      this._ctx.resume().catch(() => {});
+    }
+    // Re-anchor and re-schedule from the current position.
+    this._pauseOffset = t;
+    this._startTime = this._ctx.currentTime;
+    this._scheduleNotes();
+  }
+
+  /**
    * Poll-style completion check driven by the main render loop.  We
    * previously ran a second rAF loop inside the MIDI player which
    * duplicated frame pacing work (and allocations); folding this into
