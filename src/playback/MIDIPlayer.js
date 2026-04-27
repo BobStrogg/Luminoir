@@ -171,6 +171,7 @@ export class MIDIPlayer {
     // the background.  By the time the user actually hears audio,
     // the context will have transitioned to `running`.
     if (!this._ctx) this._ctx = new AudioContext();
+    this._setPlaybackAudioSession();
     this._primeAudio();
     this._unlockHtmlAudio();
     if (this._ctx.state === 'suspended') {
@@ -212,6 +213,7 @@ export class MIDIPlayer {
     // Same gesture-window discipline as `play()`: every unlock
     // primitive is synchronous, the resume promise is fire-and-
     // forget.  Do NOT add an `await` to this method.
+    this._setPlaybackAudioSession();
     this._primeAudio();
     this._unlockHtmlAudio();
     if (this._ctx.state === 'suspended') {
@@ -235,6 +237,27 @@ export class MIDIPlayer {
    * that on some iOS versions silently drops the source rather than
    * playing it.
    */
+  /**
+   * Request the "playback" audio session type so iOS routes Web Audio
+   * output through the media pipeline that ignores the hardware
+   * ringer/silent switch.  Without this, audio only plays when the
+   * ringer is on (the default "ambient" category respects the switch).
+   *
+   * The `navigator.audioSession` API is a WebKit extension available
+   * on Safari 17.4+; other browsers silently ignore this.  Must be
+   * called from inside a user-gesture handler, same as the other
+   * unlock primitives.
+   */
+  _setPlaybackAudioSession() {
+    try {
+      if (navigator.audioSession) {
+        navigator.audioSession.type = 'playback';
+      }
+    } catch {
+      // Non-fatal — falls back to ambient (ringer-dependent) behaviour.
+    }
+  }
+
   _primeAudio() {
     if (!this._ctx || this._primed) return;
     try {
@@ -280,7 +303,13 @@ export class MIDIPlayer {
       // Decoded: RIFF + WAVE + fmt sub-chunk + data sub-chunk with
       // length 0; a valid playable but silent file.
       el.src = 'data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAAAAAA=';
-      el.volume = 0;
+      // Volume must stay > 0 — iOS treats volume-0 media as
+      // ambient audio (silenced by the ringer switch).  The data URL
+      // is a silent WAV so full volume produces no audible output,
+      // but iOS still registers it as an active media playback
+      // session, switching the audio category from "ambient" to
+      // "playback" which ignores the ringer/silent switch.
+      el.volume = 1;
       // Don't add to DOM — keeping it detached avoids any layout
       // impact and the play() call still satisfies iOS's HTMLMedia
       // gate.

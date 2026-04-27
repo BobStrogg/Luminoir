@@ -234,20 +234,22 @@ function attachPointerForwarding(canvas, worker) {
     }, { passive: type !== 'wheel' && type !== 'contextmenu' });
   }
 
-  // Track whether we're in the middle of a drag so we don't flood the
-  // worker with pointermove events when nothing is being dragged.
-  let dragging = false;
-  canvas.addEventListener('pointerdown', () => { dragging = true; });
+  // Track active pointer IDs so multi-touch gestures (pinch-zoom)
+  // forward every pointerup to the worker.  A boolean flag only
+  // recorded "something is down"; the first pointerup cleared it and
+  // swallowed subsequent ups — OrbitControls then never saw the second
+  // finger lift, leaving it stuck in the two-finger (zoom) state and
+  // blocking future single-finger rotation.
+  const activePointers = new Set();
+  canvas.addEventListener('pointerdown', (ev) => { activePointers.add(ev.pointerId); });
   window.addEventListener('pointerup', (ev) => {
-    if (dragging) {
-      dragging = false;
-      // Forward pointerup as an element-targeted event so OrbitControls'
-      // element-scope listener fires and cleans up state.
+    if (activePointers.has(ev.pointerId)) {
+      activePointers.delete(ev.pointerId);
       post('element', ev);
     }
   });
   window.addEventListener('pointermove', (ev) => {
-    if (dragging) post('element', ev);
+    if (activePointers.has(ev.pointerId)) post('element', ev);
   });
 
   // Touch fallback for browsers without pointer events (mostly older
