@@ -111,6 +111,10 @@ export class CameraController {
    *  the future, the smart-camera pitch is biased upward toward an
    *  overhead view that fades back out via a half-sine. */
   _topDownEndAt = 0;
+  /** Smoothed activity multiplier — eased separately from the orbit
+   *  offsets so that sudden note-density spikes don't jerk the phase
+   *  speed (and therefore the camera speed) abruptly. */
+  _easedActivityMul = 1.0;
   /** True while we want to rebuild `_restOffset` on the next frame —
    *  set after snapToTarget() so the new chase pose becomes the
    *  smart-camera baseline. */
@@ -483,11 +487,15 @@ export class CameraController {
 
     // Activity-driven multipliers.  More notes per second → faster
     // sweep + slightly bigger amplitude.  Hard cap at 2× so frantic
-    // pieces don't induce motion sickness.
+    // pieces don't induce motion sickness.  The multiplier is eased
+    // with a long time-constant so density spikes don't jerk the
+    // camera speed.
     const { total, dominantStaff, dominance } = this._smartActivityWeights();
-    const activityMul = Math.min(2.0, 1.0 + total * 0.05);
+    const rawActivityMul = Math.min(2.0, 1.0 + total * 0.05);
+    const actEase = 1 - Math.exp(-h / 2.0);
+    this._easedActivityMul += (rawActivityMul - this._easedActivityMul) * actEase;
 
-    this._smartPhase += h * (cfg.orbitSpeed ?? 0.15) * activityMul;
+    this._smartPhase += h * (cfg.orbitSpeed ?? 0.15) * this._easedActivityMul;
 
     // Two superimposed sinusoids on yaw so the motion never traces
     // out an obvious back-and-forth period — the secondary harmonic
@@ -519,28 +527,11 @@ export class CameraController {
       desiredYaw += biasMag * sign * 0.5 * (cfg.biasStrength ?? 0.5);
     }
 
-    // Top-down moments — a one-shot near-overhead pitch dip during
-    // dense passages.  Bernoulli per frame: probability per second
-    // (`topDownChance`) is converted to per-frame via Δt.
-    if (now < this._topDownEndAt) {
-      const remaining = (this._topDownEndAt - now) / 1000;
-      const duration = cfg.topDownDuration ?? 4.0;
-      const progress = Math.max(0, Math.min(1, 1 - remaining / duration));
-      // Half-sine envelope so it eases in, peaks mid-shot, eases out.
-      const env = Math.sin(progress * Math.PI);
-      // Bias pitch upward (negative pitch in our convention puts the
-      // camera higher = more top-down).  Cap so the camera doesn't
-      // pass over the staves.
-      desiredPitch += env * 0.45;
-    } else if (total > 3.0
-        && Math.random() < (cfg.topDownChance ?? 0.01) * h) {
-      this._topDownEndAt = now + (cfg.topDownDuration ?? 4.0) * 1000;
-    }
-
     // Critically-damped easing of the live offsets toward their
-    // sinusoidal targets.  Keeps a sudden activity spike (which
-    // changes the multiplier) from stepping the camera position.
-    const ease = 1 - Math.exp(-h / 0.4);
+    // sinusoidal targets.  The 2.0 s time-constant keeps every
+    // camera movement gradual — all automatic motion ramps in/out
+    // slowly enough that the user never perceives a discrete step.
+    const ease = 1 - Math.exp(-h / 2.0);
     this._smartYaw += (desiredYaw - this._smartYaw) * ease;
     this._smartPitch += (desiredPitch - this._smartPitch) * ease;
     this._smartRadiusFactor += (desiredRadiusFactor - this._smartRadiusFactor) * ease;
@@ -558,14 +549,25 @@ export class CameraController {
 
     const halfFov = (camCfg.fov * Math.PI) / 360;
     const newYaw = baseYaw + this._smartYaw;
-    // Clamp pitch so the smart-cam camera never flips below the
-    // floor or rises so high we lose the diagonal "music flowing in
-    // from the top-right" framing.  Lower bound = a hair above
-    // halfFov so the screen top doesn't dip below the horizon
-    // (matches the SceneConfig pitchDegrees notes).
-    const newPitch = Math.max(halfFov + 0.02,
-                              Math.min(Math.PI * 0.45,
-                                       basePitch + this._smartPitch));
+    // Soft-clamp pitch so the smart camera never flips below the
+    // floor or goes fully overhead, but does so with a smooth
+    // ease-off rather than a hard Math.max/min that would cause a
+    // visible snap if the user drags to a near-boundary angle.
+    const rawPitch = basePitch + this._smartPitch;
+    const lo = halfFov + 0.02;
+    const hi = Math.PI * 0.45;
+    // Smooth repulsion at each boundary: when within `margin`
+    // radians of a limit, ease the value back quadratically.
+    const margin = 0.15;
+    let newPitch = rawPitch;
+    if (rawPitch < lo + margin) {
+      const t = Math.max(0, Math.min(1, (lo + margin - rawPitch) / margin));
+      newPitch = rawPitch + t * t * margin;
+    }
+    if (rawPitch > hi - margin) {
+      const t = Math.max(0, Math.min(1, (rawPitch - (hi - margin)) / margin));
+      newPitch = newPitch - t * t * margin;
+    }
     const newRadius = baseRadius * this._smartRadiusFactor;
 
     const cosP = Math.cos(newPitch);
@@ -617,6 +619,7 @@ export class CameraController {
     this._smartYaw = 0;
     this._smartPitch = 0;
     this._smartRadiusFactor = 1.0;
+    this._easedActivityMul = 1.0;
     this._staffActivity.clear();
     this._topDownEndAt = 0;
     this._restOffsetStale = true;
