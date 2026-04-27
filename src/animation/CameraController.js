@@ -448,7 +448,6 @@ export class CameraController {
    */
   _updateSmartCamera(h) {
     const cfg = SceneConfig.smartCamera;
-    const camCfg = SceneConfig.camera;
     if (!cfg) return;
 
     const tx = this._controls.target.x;
@@ -547,27 +546,17 @@ export class CameraController {
     const baseYaw = Math.atan2(r.x, r.z);   // 0 = +Z, π/2 = +X
     const basePitch = Math.asin(Math.max(-1, Math.min(1, r.y / baseRadius)));
 
-    const halfFov = (camCfg.fov * Math.PI) / 360;
     const newYaw = baseYaw + this._smartYaw;
-    // Soft-clamp pitch so the smart camera never flips below the
-    // floor or goes fully overhead, but does so with a smooth
-    // ease-off rather than a hard Math.max/min that would cause a
-    // visible snap if the user drags to a near-boundary angle.
-    const rawPitch = basePitch + this._smartPitch;
-    const lo = halfFov + 0.02;
-    const hi = Math.PI * 0.45;
-    // Smooth repulsion at each boundary: when within `margin`
-    // radians of a limit, ease the value back quadratically.
-    const margin = 0.15;
-    let newPitch = rawPitch;
-    if (rawPitch < lo + margin) {
-      const t = Math.max(0, Math.min(1, (lo + margin - rawPitch) / margin));
-      newPitch = rawPitch + t * t * margin;
-    }
-    if (rawPitch > hi - margin) {
-      const t = Math.max(0, Math.min(1, (rawPitch - (hi - margin)) / margin));
-      newPitch = newPitch - t * t * margin;
-    }
+    // The smart camera's pitch deviation from the user's rest pose
+    // is at most ±orbitStrength×0.3 ≈ ±0.045 rad — far too small
+    // to flip the camera below the ground plane on its own.  Any
+    // heavier clamping (the old hard-clamp at halfFov + 0.02, or
+    // the soft-clamp that replaced it) forces the camera away from
+    // the user's chosen angle when the smart orbit resumes, which
+    // is the primary source of the "jump" the user reported.  We
+    // only guard against the pathological case of going to or past
+    // the ground plane (pitch ≤ 0).
+    const newPitch = Math.max(0.01, basePitch + this._smartPitch);
     const newRadius = baseRadius * this._smartRadiusFactor;
 
     const cosP = Math.cos(newPitch);
