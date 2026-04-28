@@ -5,14 +5,32 @@ import {
   clamp,
   float,
   length,
+  max,
   materialEmissive,
   mul,
+  positionWorld,
   sub,
+  uniform,
   varyingProperty,
 } from 'three/tsl';
 import { SceneConfig } from './SceneConfig.js';
 
 const c = (r, g, b) => new THREE.Color(r, g, b);
+
+/**
+ * Module-level playhead-X uniform(s) shared by the noteHead material's
+ * emissive glow falloff.  Updated every frame by the render worker via
+ * `setPlayheadX()`.  Both the WebGPU (TSL) and WebGL (onBeforeCompile)
+ * paths write through here.
+ */
+let _playheadXTSL = null;   // TSL UniformNode (WebGPU)
+let _playheadXGLSL = null;  // { value: number } object ref (WebGL)
+
+/** Update the playhead X position used by the glow-falloff shader. */
+export function setPlayheadX(x) {
+  if (_playheadXTSL)  _playheadXTSL.value = x;
+  if (_playheadXGLSL) _playheadXGLSL.value = x;
+}
 
 /**
  * Renderer-kind flag read by `Materials.noteHead()` to choose
@@ -127,12 +145,27 @@ export const Materials = {
         float(0),
         float(1),
       );
-      const emissiveContribution = mul(mul(playedAmount, vInstanceColor), float(glowStrength));
+      // Distance-based glow falloff: full glow near the playhead,
+      // fading to zero `glowTrailLength` world units behind it.
+      // Prevents emissive cost from accumulating as the score plays.
+      const trailLen = SceneConfig.playedNote.glowTrailLength;
+      _playheadXTSL = uniform(0);
+      const dist = max(float(0), sub(_playheadXTSL, positionWorld.x));
+      const glowFade = clamp(
+        sub(float(1), mul(dist, float(1.0 / trailLen))),
+        float(0),
+        float(1),
+      );
+      const emissiveContribution = mul(
+        mul(mul(playedAmount, vInstanceColor), float(glowStrength)),
+        glowFade,
+      );
       mat.emissiveNode = add(materialEmissive, emissiveContribution);
       return mat;
     }
 
     // WebGL path — legacy shader-string injection.
+    const trailLen = SceneConfig.playedNote.glowTrailLength;
     const mat = new THREE.MeshStandardMaterial({
       color: c(nc.r, nc.g, nc.b),
       emissive: c(nc.r, nc.g, nc.b),
@@ -143,18 +176,41 @@ export const Materials = {
       // WebGL's depth-buffer z-fighting on thin extrusions.
     });
     mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uPlayheadX = { value: 0.0 };
+      _playheadXGLSL = shader.uniforms.uPlayheadX;
+
+      // Inject a world-X varying so the fragment shader can compute
+      // glow falloff from the playhead.  The vertex shader already
+      // has `instanceMatrix` and `modelMatrix`; we just need one
+      // extra `float` piped through.
+      shader.vertexShader =
+        'varying float vPlayedWorldX;\n' + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <project_vertex>',
+        [
+          '{',
+          '  vec4 _pw = vec4(transformed, 1.0);',
+          '  #ifdef USE_INSTANCING',
+          '  _pw = instanceMatrix * _pw;',
+          '  #endif',
+          '  vPlayedWorldX = (modelMatrix * _pw).x;',
+          '}',
+          '#include <project_vertex>',
+        ].join('\n'),
+      );
+
+      shader.fragmentShader =
+        'varying float vPlayedWorldX;\nuniform float uPlayheadX;\n' +
+        shader.fragmentShader;
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <emissivemap_fragment>',
         [
           '#include <emissivemap_fragment>',
           '#ifdef USE_INSTANCING_COLOR',
-          '  // Played-note glow: `vColor` is `instanceColor` after the',
-          '  // Three.js instancing multiplication — unplayed notes use',
-          '  // `noteColor` so `length(vColor)` sits at the baseline;',
-          '  // played notes are painted with a brighter staff colour',
-          '  // so `length(vColor)` moves clearly past it.',
           `  float playedAmount = clamp(length(vColor) - ${unplayedMagnitude.toFixed(4)} - 0.02, 0.0, 1.0);`,
-          `  totalEmissiveRadiance += playedAmount * vColor * ${glowStrength.toFixed(3)};`,
+          `  float glowDist = max(0.0, uPlayheadX - vPlayedWorldX);`,
+          `  float glowFade = clamp(1.0 - glowDist / ${trailLen.toFixed(1)}, 0.0, 1.0);`,
+          `  totalEmissiveRadiance += playedAmount * vColor * ${glowStrength.toFixed(3)} * glowFade;`,
           '#endif',
         ].join('\n'),
       );
