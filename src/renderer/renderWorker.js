@@ -15,7 +15,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { SVG3DBuilder } from '../rendering/SVG3DBuilder.js';
-import { setRendererKind } from '../rendering/Materials.js';
+import { setRendererKind, setPlayheadX } from '../rendering/Materials.js';
 import { LightBallController } from '../animation/LightBallController.js';
 import { CameraController } from '../animation/CameraController.js';
 import { ElementProxy } from './ElementProxy.js';
@@ -931,6 +931,9 @@ function startRenderLoop() {
     // so notation anywhere in the view always casts a visible
     // shadow rather than only the chunk near the world origin.
     _updateKeyLight(controls.target.x, controls.target.z);
+    // Feed the current playhead X into the glow-falloff uniform so the
+    // noteHead shader can fade out emissive glow on distant played notes.
+    setPlayheadX(_camTarget.x);
     // Advance / rewind the played-note cursor and apply per-staff
     // instanceColor updates.  Runs every frame so playback keeps the
     // coloured-note state exactly in sync with the current music

@@ -190,6 +190,13 @@ export const SceneConfig = {
   playedNote: {
     darkness: 0.7,
     glowStrength: 3.0,
+    // World-space distance behind the playhead where the HDR emissive
+    // glow on played notes fades to zero.  Notes closer than this
+    // keep their full glow; notes further behind retain their staff
+    // colour (visible via diffuse) but no longer emit light, which
+    // prevents the per-fragment emissive cost from accumulating as a
+    // long score plays through.
+    glowTrailLength: 4.0,
   },
 
   // Light ball defaults
