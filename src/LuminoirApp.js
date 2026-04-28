@@ -120,6 +120,18 @@ export class LuminoirApp {
     window.addEventListener('pointerdown', unlockAudio, { once: true });
     window.addEventListener('keydown', unlockAudio, { once: true });
 
+    // When the page comes back from being hidden (user switched apps
+    // or tabs), the browser may have suspended the AudioContext or
+    // dropped pre-scheduled audio nodes.  Re-scheduling from the
+    // current position fixes any drift or silence.  We also re-anchor
+    // the render worker's clock so the visual playhead stays in sync.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && this._isPlaying) {
+        this.midiPlayer.reschedule();
+        this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+      }
+    });
+
     setStatus('Loading demo score...');
     await this.loadDemoScore('albatross');
 

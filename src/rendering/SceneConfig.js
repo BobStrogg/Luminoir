@@ -380,12 +380,12 @@ export const SceneConfig = {
    */
   smartCamera: {
     enabled: true,
-    orbitStrength: 0.25,
-    orbitSpeed: 0.15,
-    zoomStrength: 0.10,
+    orbitStrength: 0.15,
+    orbitSpeed: 0.08,
+    zoomStrength: 0.06,
     activityDecaySeconds: 2.0,
-    biasStrength: 0.5,
-    topDownChance: 0.01,
+    biasStrength: 0.3,
+    topDownChance: 0,
     topDownDuration: 4.0,
     resumeAfterUserMs: 1500,
   },
