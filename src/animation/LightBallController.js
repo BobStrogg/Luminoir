@@ -38,6 +38,9 @@ export class LightBallController {
    */
   _lightPool = [];
 
+  /** Pre-allocated per-light accumulators reused every frame. */
+  _poolAccum = [];
+
   _isPlaying = false;
   _currentTime = 0; // seconds
 
@@ -117,6 +120,10 @@ export class LightBallController {
         light.name = `pooledLight_${i}`;
         this._scene.add(light);
         this._lightPool.push(light);
+      }
+      this._poolAccum = new Array(poolSize);
+      for (let i = 0; i < poolSize; i++) {
+        this._poolAccum[i] = { x: 0, y: 0, z: 0, n: 0, pulse: 0 };
       }
     }
 
@@ -250,13 +257,11 @@ export class LightBallController {
     // Scratch vector reused for camera-distance computations.
     const camPos = camera ? camera.position : null;
 
-    // Reset pooled-light aggregators for this frame.  We accumulate
-    // position and activity across every staff assigned to each pool
-    // entry, then commit the centroid at the end of the loop.
-    /** @type {Array<{x:number,y:number,z:number,n:number,pulse:number}>} */
-    const poolAccum = [];
-    for (let i = 0; i < this._lightPool.length; i++) {
-      poolAccum.push({ x: 0, y: 0, z: 0, n: 0, pulse: 0 });
+    // Reset pooled-light aggregators for this frame.
+    const poolAccum = this._poolAccum;
+    for (let i = 0; i < poolAccum.length; i++) {
+      const a = poolAccum[i];
+      a.x = 0; a.y = 0; a.z = 0; a.n = 0; a.pulse = 0;
     }
 
     for (const [staff, data] of this._staffData) {
