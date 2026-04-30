@@ -116,7 +116,54 @@ function post(msg) { self.postMessage(msg); }
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
+/** Best-effort mobile detection from the worker's user-agent.  Used to
+ *  pick a smaller shadow map, cheaper PCF filter and a tighter
+ *  device-pixel-ratio cap so iOS Safari's "frame went over 16.67 ms →
+ *  rAF clamps to 30 Hz and stays there" behaviour doesn't trigger
+ *  during dense passages of large scores like Jupiter. */
+function _isMobileUA() {
+  const ua = (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
+  return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
+}
+
+/** Smoke-test a freshly-initialised WebGPURenderer by clearing a tiny
+ *  off-screen render target to a known colour and reading the result
+ *  back.  On Chromium-based embedded browsers (notably Tesla's in-car
+ *  browser) `WebGPURenderer.init()` resolves successfully but no
+ *  pixels ever reach the canvas — the user sees audio playing over a
+ *  blank rectangle.  Detecting this case here lets us dispose the
+ *  busted WebGPU renderer and fall back to WebGL before any score
+ *  loads. */
+async function _verifyWebGPURenders(r) {
+  try {
+    const target = new THREE.WebGLRenderTarget(2, 2);
+    const prevTarget = r.getRenderTarget();
+    const prevClearColor = new THREE.Color();
+    r.getClearColor(prevClearColor);
+    const prevClearAlpha = r.getClearAlpha();
+    r.setRenderTarget(target);
+    r.setClearColor(0xff00ff, 1); // magenta — far from any background colour
+    r.clear(true, true, true);
+    const buf = await r.readRenderTargetPixelsAsync(target, 0, 0, 2, 2);
+    r.setRenderTarget(prevTarget);
+    r.setClearColor(prevClearColor, prevClearAlpha);
+    target.dispose();
+    if (!buf || buf.length < 4) return false;
+    // Magenta means the clear hit the framebuffer; black/zeros means
+    // the WebGPU pipeline is wired but not actually executing.
+    return buf[0] > 200 && buf[1] < 60 && buf[2] > 200;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL }) {
+  // Mobile devices (iOS Safari especially) sit right on the edge of
+  // the per-frame budget at desktop quality, and the OS halves the
+  // rAF rate the moment a frame goes over.  Trim shadow / DPR /
+  // antialias here so dense passages stay under 16.67 ms.
+  const isMobile = _isMobileUA();
+
   // Dual-renderer: try `WebGPURenderer` first (for Chrome/Edge on
   // secure contexts), fall back to the legacy `THREE.WebGLRenderer`
   // everywhere else.  We deliberately do *not* use `WebGPURenderer`'s
@@ -135,19 +182,36 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // `?renderer=webgl` forces the legacy fallback even on a
   // WebGPU-capable origin, useful for reproducing WebGL-specific
   // bugs from the same machine.
+  //
+  // After a successful `init()` we also run a tiny render-target
+  // readback (`_verifyWebGPURenders`) so embedded browsers that
+  // *advertise* WebGPU but don't actually draw anything (Tesla's
+  // built-in browser is the motivating case) get auto-demoted to
+  // the WebGL path instead of leaving the user staring at a blank
+  // canvas while audio plays.
   let usingWebGPU = false;
+  // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
+  // frame; turning it off is one of the bigger single-knob wins on
+  // iOS.  Desktop keeps the antialias for crisp notation edges.
+  const wantAntialias = !isMobile;
   if (!forceWebGL) {
     try {
       const { WebGPURenderer } = await import('three/webgpu');
-      renderer = new WebGPURenderer({ canvas, antialias: true });
+      renderer = new WebGPURenderer({ canvas, antialias: wantAntialias });
       await renderer.init();
-      usingWebGPU = true;
+      const works = await _verifyWebGPURenders(renderer);
+      if (works) {
+        usingWebGPU = true;
+      } else {
+        try { renderer.dispose(); } catch { /* best-effort */ }
+        renderer = null;
+      }
     } catch (e) {
       renderer = null;
     }
   }
   if (!renderer) {
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias });
   }
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
@@ -165,7 +229,11 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  // Cap DPR more aggressively on mobile — a Retina iPhone reports
+  // DPR 3, which triples fragment-shader work for very little visual
+  // gain on a 6" screen showing the entire score.
+  const dprCap = isMobile ? 1.5 : 2;
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
   renderer.setClearColor(SceneConfig.backgroundColor, 1);
 
@@ -176,8 +244,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // `receiveShadow = true`, so the resulting shadow shows the
   // notation hovering subtly above the page rather than looking
   // pasted-on.
+  //
+  // On mobile we step down to plain `PCFShadowMap`; the soft variant
+  // averages a multi-tap kernel per fragment and is one of the
+  // largest single contributors to fragment cost in the shadow pass.
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = isMobile
+    ? THREE.PCFShadowMap
+    : THREE.PCFSoftShadowMap;
 
   const cfg = SceneConfig.camera;
   camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
@@ -213,7 +287,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
 
   scene.background = new THREE.Color(SceneConfig.backgroundColor);
   scene.add(contentRoot);
-  setupLighting(scene);
+  setupLighting(scene, isMobile);
 
   cameraCtrl = new CameraController(camera, controls);
 
@@ -231,7 +305,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   startRenderLoop();
 }
 
-function setupLighting(scene) {
+function setupLighting(scene, isMobile) {
   // Bright neutral ambient so the white-ish paper reads as actually
   // lit-from-everywhere — the dark-theme value of 0.6 was tuned for
   // a near-black page and looked flat against the cream background.
@@ -255,10 +329,18 @@ function setupLighting(scene) {
   //     boundary every frame so the shadow texel raster stays
   //     pixel-aligned across frames — without that, a high-res map
   //     still produces a "crawling" shadow edge as the camera pans.
+  //
+  // On mobile the shadow map is rendered every frame by the
+  // notation depth pass, so its size dominates fragment cost.
+  // 6144² is ~38 M fragments per frame, which by itself blows past
+  // an iPhone GPU's 16.67 ms budget once any other notation is in
+  // view; clamp to 2048 (≈ 4 M fragments, 9× cheaper) so dense
+  // passages of Jupiter etc. don't trigger iOS Safari's rAF clamp.
   const sCfg = SceneConfig.shadow;
+  const mapSize = isMobile ? Math.min(sCfg.mapSize, 2048) : sCfg.mapSize;
   key.castShadow = true;
-  key.shadow.mapSize.width = sCfg.mapSize;
-  key.shadow.mapSize.height = sCfg.mapSize;
+  key.shadow.mapSize.width = mapSize;
+  key.shadow.mapSize.height = mapSize;
   const shadowCam = key.shadow.camera;
   shadowCam.left = -sCfg.frustumHalfWidth;
   shadowCam.right = sCfg.frustumHalfWidth;
