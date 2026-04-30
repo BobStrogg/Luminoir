@@ -202,11 +202,19 @@ export const Materials = {
       shader.fragmentShader =
         'varying float vPlayedWorldX;\nuniform float uPlayheadX;\n' +
         shader.fragmentShader;
+      // Guard with `USE_COLOR`, NOT `USE_INSTANCING_COLOR`: Three.js
+      // defines the latter only in the *vertex* shader prefix, never
+      // in the fragment shader prefix, so an `#ifdef USE_INSTANCING_COLOR`
+      // here would silently never fire on the legacy WebGLRenderer.
+      // `USE_COLOR` IS defined in the fragment prefix whenever any of
+      // `vertexColors / instancingColor / batchingColor` is true, and
+      // is the same flag that declares `varying vec3 vColor`, so this
+      // is the only condition that gates `vColor` being readable.
       shader.fragmentShader = shader.fragmentShader.replace(
         '#include <emissivemap_fragment>',
         [
           '#include <emissivemap_fragment>',
-          '#ifdef USE_INSTANCING_COLOR',
+          '#ifdef USE_COLOR',
           `  float playedAmount = clamp(length(vColor) - ${unplayedMagnitude.toFixed(4)} - 0.02, 0.0, 1.0);`,
           `  float glowDist = max(0.0, uPlayheadX - vPlayedWorldX);`,
           `  float glowFade = clamp(1.0 - glowDist / ${trailLen.toFixed(1)}, 0.0, 1.0);`,
