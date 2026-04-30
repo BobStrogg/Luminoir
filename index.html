@@ -59,13 +59,6 @@
       </div>
     </div>
 
-    <!-- Debug: renderer indicator.  Shows which backend the worker
-         picked ("WebGPU" / "WebGL"), and is clickable to force a
-         switch by reloading with `?renderer=...` in the URL.  Hidden
-         until the worker's `ready` message confirms which backend
-         actually initialised. -->
-    <div id="renderer-badge" class="hidden" title="Renderer"></div>
-
     <!-- Debug: FPS counter.  Hidden by default; toggle with the
          `F` key (or via `?fps=1` URL parameter).  Reads its content
          from periodic `stats` messages posted by the render worker. -->

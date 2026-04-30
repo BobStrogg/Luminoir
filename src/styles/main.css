@@ -342,60 +342,8 @@ html, body {
   display: none !important;
 }
 
-/* Debug renderer indicator — a subtle pill in the top-right showing
- * which render backend initialised.  Clickable when more than one
- * backend is available on this browser (e.g. Chrome with WebGPU +
- * WebGL); reloads the page with the inverse `?renderer=…` URL
- * parameter so we can compare backends without dev-tools. */
-#renderer-badge {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  padding: 5px 11px;
-  background: rgba(10, 10, 18, 0.7);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  font-size: 0.72rem;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-weight: 500;
-  color: #9999bb;
-  letter-spacing: 0.06em;
-  user-select: none;
-  z-index: 40;
-  transition: background 0.2s, color 0.2s, border-color 0.2s, transform 0.15s;
-  cursor: pointer;
-}
-
-#renderer-badge:hover {
-  background: rgba(10, 10, 18, 0.9);
-  color: #e0e0ea;
-  border-color: rgba(255, 220, 160, 0.3);
-  transform: translateY(-1px);
-}
-
-#renderer-badge:active {
-  transform: translateY(0);
-}
-
-/* Applied when the active browser can only support one backend (e.g.
- * Safari today without WebGPU, or a non-secure origin).  The badge
- * still shows the current renderer but is non-interactive. */
-#renderer-badge.locked {
-  cursor: default;
-  opacity: 0.6;
-}
-
-#renderer-badge.locked:hover {
-  background: rgba(10, 10, 18, 0.7);
-  color: #9999bb;
-  border-color: rgba(255, 255, 255, 0.08);
-  transform: none;
-}
-
-/* Debug FPS counter.  Sits just below the renderer badge in the
- * top-right.  Two-line monospace readout: top is rAF-to-rAF FPS
+/* Debug FPS counter.  Sits in the top-right corner alongside the
+ * settings gear.  Two-line monospace readout: top is rAF-to-rAF FPS
  * (what the user perceives — includes GPU execution time), bottom
  * is render-submit p50 / p95 in ms (cheap to read at a glance to
  * spot whether a slowdown is GPU-bound or CPU-bound).  Tinted by
@@ -473,15 +421,6 @@ html, body {
 
 #btn-settings.active {
   transform: rotate(40deg);
-}
-
-/* When the renderer badge is visible, slide the gear left so the
- * three top-right widgets line up nicely (renderer | gear | … fps
- * goes underneath).  We don't anchor the gear *between* the badges
- * because the renderer badge can be hidden on browsers that
- * couldn't pick a backend, in which case the gear takes its slot. */
-#renderer-badge:not(.hidden) ~ #btn-settings {
-  right: calc(12px + 80px);
 }
 
 .settings-popover {
@@ -649,6 +588,55 @@ html, body {
   justify-content: flex-end;
 }
 
+/* Renderer section — sits between the live/reparse settings and
+ * About.  Uses the same `.settings-section` base rules for the
+ * heading and top border, plus a single horizontal row holding the
+ * "Active backend" pill and the "Switch" button.  Description below
+ * mirrors the prose density of the About section. */
+.settings-renderer-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.settings-renderer-active {
+  flex: 1;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.78rem;
+  color: #d8d8e6;
+  letter-spacing: 0.06em;
+  user-select: none;
+}
+
+.settings-renderer-switch {
+  padding: 5px 12px;
+  background: rgba(255, 220, 160, 0.10);
+  border: 1px solid rgba(255, 220, 160, 0.20);
+  border-radius: 8px;
+  color: #ffe0a0;
+  font-size: 0.74rem;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.settings-renderer-switch:hover {
+  background: rgba(255, 220, 160, 0.18);
+  border-color: rgba(255, 220, 160, 0.40);
+  color: #fff;
+}
+
+.settings-renderer-desc {
+  margin: 0;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: #9999b0;
+}
+
 /* About section — static credits block.  Sits above the reset
  * footer; styled with the same `.settings-section` base rules so
  * the heading and top border match the surrounding setting groups,
@@ -792,27 +780,22 @@ html, body {
     right: 8px;
   }
 
-  /* Tighter padding for the top-right badge cluster on phones. */
-  #renderer-badge,
+  /* Tighter padding for the top-right cluster on phones. */
   #btn-settings,
   #fps-badge {
     right: 8px;
-  }
-  #renderer-badge:not(.hidden) ~ #btn-settings {
-    right: calc(8px + 70px);
   }
 }
 
 /* Phone-portrait specific override.
  *
  * In portrait the controls bar wraps to two rows (≈ 74 px tall), so
- * the badges + gear button at the default `top: 12 px` would sit
- * underneath it and become unclickable.  We push them down past the
- * wrapped bar so they live in their own clear strip below the
- * controls.  In landscape the bar fits in one row and the badges
- * stay in the original top corner alongside it. */
+ * the gear button at the default `top: 12 px` would sit underneath
+ * the bar's right edge and become unclickable.  We push it down past
+ * the wrapped bar so it lives in its own clear strip below the
+ * controls.  In landscape the bar fits in one row and the gear
+ * stays in the original top corner alongside it. */
 @media (max-width: 600px) and (orientation: portrait) {
-  #renderer-badge,
   #btn-settings {
     top: 92px;
   }

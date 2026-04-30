@@ -143,6 +143,13 @@ export class SettingsPanel {
       popover.appendChild(sectionEl);
     }
 
+    // Renderer section — shows the active 3D backend and a button to
+    // switch to the other one (which reloads the page with the
+    // inverse `?renderer=` URL parameter).  Lives between the regular
+    // settings and About so it reads as "advanced display options"
+    // without mixing into the persisted-config registry.
+    popover.appendChild(this._buildRendererSection());
+
     // About section — sits between the regular settings and the
     // reset button so it reads as the last block of "informational"
     // content before the destructive action.  Pure HTML; no
@@ -226,6 +233,75 @@ export class SettingsPanel {
     }
 
     return wrap;
+  }
+
+  /**
+   * Build the "Renderer" section — surfaces the active 3D backend
+   * (WebGPU vs WebGL) and, when a choice is available, a button that
+   * reloads the page on the inverse `?renderer=` URL parameter.
+   *
+   * `app.render.rendererKind` is populated by the worker's `ready`
+   * message and is therefore guaranteed to be set by the time this
+   * panel `attach()`es.  `navigator.gpu` is the same WebGPU
+   * availability proxy the old top-bar badge used: present on
+   * Chrome/Edge/Safari TP on secure origins, absent on Firefox /
+   * insecure origins / Tesla-style embedded Chromium with no WebGPU.
+   * When it's absent we render the active backend as plain text and
+   * skip the switch button — there's nothing to switch to.
+   */
+  _buildRendererSection() {
+    const sectionEl = document.createElement('div');
+    sectionEl.className = 'settings-section settings-renderer';
+
+    const h = document.createElement('h3');
+    h.textContent = 'Renderer';
+    sectionEl.appendChild(h);
+
+    const current = (this._app && this._app.render && this._app.render.rendererKind)
+      || 'unknown';
+    const webgpuAvailable = typeof navigator !== 'undefined' && !!navigator.gpu;
+
+    const row = document.createElement('div');
+    row.className = 'settings-renderer-row';
+
+    const activeLabel = document.createElement('span');
+    activeLabel.className = 'settings-renderer-active';
+    activeLabel.textContent = current;
+    row.appendChild(activeLabel);
+
+    if (webgpuAvailable) {
+      const otherName = current === 'WebGPU' ? 'WebGL' : 'WebGPU';
+      const switchBtn = document.createElement('button');
+      switchBtn.type = 'button';
+      switchBtn.className = 'settings-renderer-switch';
+      switchBtn.textContent = `Switch to ${otherName}`;
+      switchBtn.title = 'Reloads the page';
+      switchBtn.addEventListener('click', () => {
+        const url = new URL(window.location.href);
+        if (current === 'WebGPU') {
+          url.searchParams.set('renderer', 'webgl');
+        } else {
+          url.searchParams.delete('renderer');
+        }
+        // Cache-bust so Vite's dev server doesn't serve a stale
+        // worker bundle after the URL param flips (it fingerprints
+        // on path, not query).  Harmless in production.
+        url.searchParams.set('cb', Date.now().toString());
+        window.location.href = url.toString();
+      });
+      row.appendChild(switchBtn);
+    }
+
+    sectionEl.appendChild(row);
+
+    const desc = document.createElement('p');
+    desc.className = 'settings-renderer-desc';
+    desc.textContent = webgpuAvailable
+      ? 'WebGPU is faster on supported browsers; WebGL is the universal fallback.  Try the other if rendering looks wrong on this device.'
+      : 'WebGPU isn\u2019t available in this browser/context, so Luminoir is locked to WebGL.';
+    sectionEl.appendChild(desc);
+
+    return sectionEl;
   }
 
   /**
