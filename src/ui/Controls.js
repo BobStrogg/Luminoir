@@ -15,7 +15,6 @@ export function initControls(app) {
   const scoreLoading = document.getElementById('score-loading');
   const btnImport = document.getElementById('btn-import');
   const fileInput = document.getElementById('file-input');
-  const rendererBadge = document.getElementById('renderer-badge');
   const fpsBadge = document.getElementById('fps-badge');
 
   if (!bar || !btnPlay || !btnStop) {
@@ -131,10 +130,6 @@ export function initControls(app) {
       setTimeout(() => (overlay.style.display = 'none'), 700);
     }
     bar.classList.remove('hidden');
-    // Renderer is only known once the worker reports back which
-    // backend actually initialised.  We show the badge at the same
-    // time as the rest of the UI so it doesn't flash empty text.
-    initRendererBadge(rendererBadge, app.render.rendererKind);
     initFpsBadge(fpsBadge, app.render);
   };
 
@@ -204,69 +199,6 @@ export function initControls(app) {
         if (fpsBadge) fpsBadge.classList.toggle('hidden');
         break;
     }
-  });
-}
-
-/* ------------------------------------------------------------------ */
-/*  Debug renderer badge                                               */
-/* ------------------------------------------------------------------ */
-
-/**
- * Shows the currently-active renderer ("WebGPU" / "WebGL") as a small
- * pill in the top-right corner.  When the browser supports *both*
- * backends, the pill is clickable: clicking it reloads the page with
- * the inverse `?renderer=…` URL parameter, which `RenderClient.init`
- * reads and forwards to the worker as its `forceWebGL` flag.
- *
- * WebGPU availability check: the worker actually instantiates the
- * renderer, so the main thread only knows about availability
- * indirectly.  `navigator.gpu` on the main thread is a reliable
- * proxy — Chrome / Edge / Safari TP expose it on secure origins where
- * the worker's `WebGPURenderer({ }).init()` will succeed, and omit it
- * in contexts (insecure origin, WebGPU disabled, non-WebGPU browser)
- * where the worker would fall through to the `WebGLRenderer` path.
- * When `navigator.gpu` is missing we can't usefully offer a toggle —
- * the browser can only do WebGL — so we mark the badge `.locked`.
- *
- * @param {HTMLElement | null} badge
- * @param {'WebGPU' | 'WebGL' | 'unknown'} current
- */
-function initRendererBadge(badge, current) {
-  if (!badge) return;
-  badge.textContent = current;
-  badge.classList.remove('hidden');
-
-  const webgpuAvailable = typeof navigator !== 'undefined' && !!navigator.gpu;
-  // "Can toggle" = we have a choice between backends.  With only
-  // `navigator.gpu` to go on we assume WebGL is always viable, so the
-  // toggle is available whenever WebGPU also is.
-  const canToggle = webgpuAvailable;
-
-  if (!canToggle) {
-    badge.classList.add('locked');
-    badge.title = 'WebGPU not available in this browser/context — locked to WebGL';
-    return;
-  }
-
-  const nextUrl = () => {
-    const url = new URL(window.location.href);
-    if (current === 'WebGPU') {
-      url.searchParams.set('renderer', 'webgl');
-    } else {
-      url.searchParams.delete('renderer');
-    }
-    // Cache-bust so Vite's dev server doesn't serve a stale worker
-    // bundle after we change the URL param (it fingerprints on path,
-    // not query).  Harmless in production too — the browser just
-    // picks up the currently-deployed worker.
-    url.searchParams.set('cb', Date.now().toString());
-    return url.toString();
-  };
-
-  const otherName = current === 'WebGPU' ? 'WebGL' : 'WebGPU';
-  badge.title = `Click to switch to ${otherName} (reloads page)`;
-  badge.addEventListener('click', () => {
-    window.location.href = nextUrl();
   });
 }
 
