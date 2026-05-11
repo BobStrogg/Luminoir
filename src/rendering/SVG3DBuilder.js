@@ -1,13 +1,50 @@
 import * as THREE from 'three';
 import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+import { FontLoader } from 'three/addons/loaders/FontLoader.js';
 import { SceneConfig } from './SceneConfig.js';
 import { Materials } from './Materials.js';
 import { OPTIMIZATIONS } from './Optimizations.js';
 import {
-  rasteriseTitleBlock,
   computePageMargins,
   TITLE_LEFT_PADDING,
+  TITLE_HEIGHT,
+  COMPOSER_HEIGHT,
+  TITLE_LINE_GAP,
 } from './TitleBlock.js';
+// Note: `rasteriseTitleBlock` is intentionally NOT imported here.
+// The title is now rendered as extruded 3D geometry (via FontLoader +
+// ExtrudeGeometry) so it casts proper ink-shaped shadows.  The raster
+// fallback lives in TitleBlock.js and is still used by the main
+// thread's `measureTitleBlock` for paper-margin sizing.
+
+/** Resolved title font, populated by `prefetchTitleFont()` during
+ *  worker init.  `null` until the fetch completes (or if it fails).
+ *  `_addTitle` reads this synchronously so `build()` stays sync and
+ *  the buildScene → setTimeline message ordering is preserved. */
+let _titleFont = null;
+
+/**
+ * Kick off the font fetch in the background.  Call once from
+ * `handleInit` in the render worker so the font is ready (or nearly
+ * so) by the time the first `buildScene` message arrives.
+ *
+ * Fire-and-forget — no need to await.  If the fetch is still in
+ * flight when `_addTitle` runs, the title is silently omitted for
+ * that scene build; subsequent score loads will have the font cached.
+ */
+export function prefetchTitleFont() {
+  if (_titleFont) return;   // already loaded
+  (async () => {
+    try {
+      const resp = await fetch('/fonts/optimer_bold.typeface.json');
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const json = await resp.json();
+      _titleFont = new FontLoader().parse(json);
+    } catch (e) {
+      console.warn('[SVG3DBuilder] Could not load title font:', e);
+    }
+  })();
+}
 
 /** Scratch matrix reused by all bucketing helpers — avoids allocating a
  *  fresh `Matrix4` per glyph / line at scene-build time (a Sylvia-level
@@ -807,61 +844,33 @@ export class SVG3DBuilder {
   }
 
   /**
-   * Add the score's title + composer block to the paper's top-left.
+   * Add the score's title + composer block to the paper's top-left
+   * as extruded 3D geometry — the same pipeline used for all other
+   * notation — so the text casts a proper ink-shaped shadow onto the
+   * paper just like notes and staff lines do.
    *
-   * Workflow:
-   *   1. Rasterise the text on a CanvasTexture (TitleBlock.js does
-   *      the layout — same constants the main thread used to compute
-   *      the notation displacement, so the rendered ink lines up
-   *      exactly inside the patch we reserved for it).
-   *   2. Wrap the canvas in a `THREE.CanvasTexture` and place a
-   *      transparent plane on top of the paper sized to the
-   *      canvas's world-unit dimensions.
+   * Font: `optimer_bold.typeface.json` (Three.js bundled serif, 112 KB).
+   * Loaded once per worker lifetime via `_loadTitleFont()` and cached.
    *
-   * Coordinate system note: in SCORE-LOCAL coords (pre-`contentRoot`
-   * X-rotation), Y is "down the page" — small Y is at the top of the
-   * paper, larger Y is the bottom.  After the contentRoot rotates the
-   * whole tree by -π/2 around X, score-local Y maps to world -Z, so
-   * the title at small Y ends up at large Z (back of the table) and
-   * the camera looking from +Z toward the score sees it correctly
-   * placed at "the top" of the paper.
+   * Coordinate system (score-local, pre-contentRoot rotation):
+   *   • Y-up: larger Y = top of page, smaller Y = bottom.
+   *   • Z = elevation above paper.  Notes sit at `noteElevation`;
+   *     this text uses the same value so it shadows identically.
+   * `font.generateShapes(text, size)` returns shapes whose XY coords
+   * are in world units with baseline at Y = 0 — no additional scale
+   * is needed beyond `size = TITLE_HEIGHT` (or `COMPOSER_HEIGHT`).
    *
-   * Z-elevation: 0.005 is enough to avoid z-fighting with the paper
-   * (which sits at -0.05) without lifting the title visibly off the
-   * page; the camera's pitch + the title's `transparent: true`
-   * material make the gap invisible.
+   * Extrusion depth is chosen to match the visual weight of notation
+   * (glyphs extrude ≈ 0.003 wu after scale × glyphUseScale).
    */
   _addTitle(root, parsed) {
     const title = parsed.title;
     const composer = parsed.composer;
-    const block = rasteriseTitleBlock(title, composer);
-    if (!block) return;
-    const tex = new THREE.CanvasTexture(block.canvas);
-    tex.colorSpace = THREE.SRGBColorSpace;
-    tex.minFilter = THREE.LinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-    tex.anisotropy = 4;
-    // Coloured ink rendered on cream paper — `MeshBasicMaterial`
-    // is unlit so the title reads with the same hue at every camera
-    // distance regardless of how the directional key light is
-    // hitting the paper underneath.  `depthWrite: false` keeps the
-    // plane from punching a hole in the paper's shadow buffer; it
-    // sits ~0.005 above the paper, well beneath any notation.
-    const mat = new THREE.MeshBasicMaterial({
-      map: tex,
-      transparent: true,
-      depthWrite: false,
-    });
-    const geo = new THREE.PlaneGeometry(block.worldWidth, block.worldHeight);
-    const mesh = new THREE.Mesh(geo, mat);
-    // Score-local Y is Y-up after the parser's `y: -(…)` flip
-    // (SVG's Y-down → Three.js Y-up): smaller Y = bottom of page,
-    // larger Y = top of page.  `computePageMargins` returns the
-    // exact title-Y-bounds the paper was built around, so the title
-    // plane goes there directly without any local arithmetic.
-    // After the contentRoot's -π/2 X-rotation this maps to world
-    // +Z, putting the title at the visually-correct top-of-paper
-    // position from any reasonable camera angle.
+    if (!title) return;
+
+    const font = _titleFont;
+    if (!font) return;  // font not yet loaded — silently omit title this build
+
     const margins = computePageMargins(
       {
         staffMaxY: parsed.staffMaxY,
@@ -872,16 +881,55 @@ export class SVG3DBuilder {
       title,
       composer,
     );
-    const titleCenterY = (margins.titleTopY + margins.titleBottomY) / 2;
-    const titleLeftX = (parsed.contentMinX ?? 0) + TITLE_LEFT_PADDING;
-    mesh.position.set(
-      titleLeftX + block.worldWidth / 2,
-      titleCenterY,
-      0.005,
-    );
-    mesh.name = 'title';
-    mesh.frustumCulled = false;
-    root.add(mesh);
+
+    const leftX = (parsed.contentMinX ?? 0) + TITLE_LEFT_PADDING;
+    const z = SceneConfig.noteElevation;
+    // Extrusion depth: match the per-glyph world depth of notation
+    // (extrusionDepth × scale × glyphUseScale ≈ 0.003 wu).
+    const depth = SceneConfig.extrusionDepth * SceneConfig.scale * SceneConfig.glyphUseScale;
+
+    // optimer_bold font metrics (normalised to `size` units):
+    //   ascender  = 1288/1000 × size
+    //   descender = -385/1000 × size
+    // We position each text baseline so the visual cap-height sits
+    // within the reserved slot.  The reserved block = titleTopY..titleBottomY.
+    // With composer, layout from the top:
+    //   titleTopY − ascender(title) = title baseline
+    //   then a gap of TITLE_LINE_GAP
+    //   then composer baseline
+    const ASCENDER_RATIO  = 1288 / 1000;
+
+    const _addTextMesh = (text, size, baselineY, color) => {
+      let shapes;
+      try {
+        shapes = font.generateShapes(text, size);
+      } catch {
+        return;
+      }
+      if (!shapes || shapes.length === 0) return;
+      const geo = new THREE.ExtrudeGeometry(shapes, { depth, bevelEnabled: false });
+      geo.computeVertexNormals();
+      const mat = this._otherMat.clone();
+      mat.color.set(color);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(leftX, baselineY, z);
+      mesh.frustumCulled = false;
+      mesh.castShadow = true;
+      mesh.name = 'title';
+      root.add(mesh);
+    };
+
+    // Title baseline: position so ascender aligns with titleTopY.
+    const titleBaseline = margins.titleTopY - ASCENDER_RATIO * TITLE_HEIGHT;
+    _addTextMesh(title, TITLE_HEIGHT, titleBaseline, '#1f1a0e');
+
+    if (composer && margins.titleBottomY != null) {
+      // Composer baseline: sits below the title by the line gap.
+      // Place it so there's a readable gap between title descenders
+      // and composer ascenders.
+      const composerBaseline = titleBaseline - TITLE_HEIGHT * (385 / 1000) - TITLE_LINE_GAP - ASCENDER_RATIO * COMPOSER_HEIGHT;
+      _addTextMesh(composer, COMPOSER_HEIGHT, composerBaseline, '#5a4f3c');
+    }
   }
 
   dispose() {
