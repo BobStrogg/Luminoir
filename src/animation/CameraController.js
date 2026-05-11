@@ -107,6 +107,9 @@ export class CameraController {
    * @type {Map<number, { value: number, t: number }>}
    */
   _staffActivity = new Map();
+  /** Reusable scratch Map for `_smartActivityWeights()` — pre-allocated
+   *  once to avoid a `new Map()` GC allocation on every rAF tick. */
+  _smartWeightsScratch = new Map();
   /** Top-down dramatic-overhead state.  When `_topDownEndAt` is in
    *  the future, the smart-camera pitch is biased upward toward an
    *  overhead view that fades back out via a half-sine. */
@@ -412,13 +415,18 @@ export class CameraController {
    * fired in a while (otherwise the counter would only decay at
    * "next hit" time).
    *
+   * Reuses `_smartWeightsScratch` to avoid a `new Map()` allocation
+   * per rAF tick on high-staff-count scores.
+   *
    * @returns {{ weights: Map<number, number>, total: number, dominantStaff: number, dominance: number }}
    */
   _smartActivityWeights() {
     const cfg = SceneConfig.smartCamera;
     const decay = Math.max(0.001, cfg.activityDecaySeconds || 2);
     const now = performance.now() / 1000;
-    const weights = new Map();
+    // Reuse the pre-allocated scratch Map — clear() is O(n) but avoids
+    // the GC cost of allocating + discarding a new Map every frame.
+    this._smartWeightsScratch.clear();
     let total = 0;
     let dominantStaff = -1;
     let maxW = 0;
@@ -426,13 +434,13 @@ export class CameraController {
       const dtSec = Math.max(0, now - st.t);
       const w = st.value * Math.exp(-dtSec / decay);
       if (w > 0.0001) {
-        weights.set(staff, w);
+        this._smartWeightsScratch.set(staff, w);
         total += w;
         if (w > maxW) { maxW = w; dominantStaff = staff; }
       }
     }
     const dominance = total > 0 ? maxW / total : 0;
-    return { weights, total, dominantStaff, dominance };
+    return { weights: this._smartWeightsScratch, total, dominantStaff, dominance };
   }
 
   /**

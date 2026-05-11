@@ -9,6 +9,7 @@ Browser-based 3D sheet-music visualisation.  Three.js/WebGPU, Verovio WASM, Web 
 ```bash
 pnpm install          # install deps
 pnpm dev              # dev server → http://localhost:5173
+VITE_HTTPS=1 pnpm dev # dev server → https://<lan-host>:5173 (self-signed cert, for LAN access)
 pnpm build            # production build → dist/
 pnpm test             # Playwright e2e tests (requires running dev server)
 ```
@@ -82,29 +83,25 @@ Root cause on dense Jupiter bars: 6144² shadow map = ~38 M depth fragments/fram
 
 Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/iPod/Android/Mobile).
 
-**Adaptive quality system** (`_AdaptiveQuality` class, also in `renderWorker.js`):
+**GPU quality system** (two phases, in `renderWorker.js`):
 
-| Tier | Shadow map | DPR cap | PCF type |
-|------|-----------|---------|---------|
-| 0 Full | 6144² | 2.0 | PCFSoft |
-| 1 High | 4096² | 1.75 | PCFSoft |
-| 2 Medium | 2048² | 1.5 | PCF |
-| 3 Low | 1024² | 1.25 | PCF |
+**Phase 1 — load-time probe** (`_probeGpuCost` + `_applyLoadTimeQuality`, called once in `handleInit`):
+- Renders the empty scene 5 times and takes the median wall-clock time.
+- Picks the highest shadow-map resolution that fits within half the frame budget.
+- Sets shadow mapSize, DPR cap, and PCF type **once** — never changes during the session.
+- Mobile always uses 2048² PCF, DPR 1.5 regardless of probe result.
+- Probe thresholds (desktop): < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096² PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
 
-- Desktop starts at Tier 0; mobile starts at Tier 2.
-- Steps **down** after 1 s sustained p95 frame-interval ≥ 17 ms.
-- Steps **up** after 3 s sustained p95 ≤ 13 ms.
-- Controlled by `autoDegrade` flag (sent via `updateConfig({ autoDegrade: bool })`).
-- Toggle exposed in Settings panel → Renderer section; live tier label updates every 0.5 s.
+**Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
+- A 0→1 float driven by p95 rAF interval vs calibrated baseline (30-tick p10 window).
+- Rises toward 1 over ~1 s of sustained overrun (p95 ≥ baseline × 1.3).
+- Falls toward 0 over ~3 s of headroom (p95 ≤ baseline × 1.15).
+- Applied only to `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
+- `LightBallController.update()` reads `SceneConfig.lightBall.intensity` every frame → no reallocation, no flicker.
+- Controlled by `autoDegrade` flag (`updateConfig({ autoDegrade: bool })`); disabling restores full intensity immediately.
+- Settings panel shows a pressure dot (green → amber → red) instead of a tier label.
 
-Shadow map disposal pattern when changing mapSize at runtime:
-```js
-_keyLight.shadow.mapSize.width  = newSize;
-_keyLight.shadow.mapSize.height = newSize;
-if (_keyLight.shadow.map) { _keyLight.shadow.map.dispose(); _keyLight.shadow.map = null; }
-// Recompute texel size for key-light snapping
-_keyLightTexelSize.set((right - left) / newSize, (top - bottom) / newSize);
-```
+**Key design rule**: shadow map size, DPR, and PCF type must NEVER be changed at runtime. Doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame. They are load-time only.
 
 ---
 

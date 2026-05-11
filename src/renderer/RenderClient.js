@@ -29,10 +29,6 @@ export class RenderClient {
    *  exposed as a public field so callers can `client.onStats = fn`
    *  any time after `init()`. */
   onStats = null;
-  /** Optional callback fired when the adaptive-quality tier changes.
-   *  Receives `{ tier: 0|1|2|3 }` so the UI can reflect the active
-   *  quality level without polling. */
-  onQualityTier = null;
   /** Exposed so LuminoirApp can log renderer kind on startup. */
   get rendererKind() { return this._rendererKind; }
 
@@ -110,9 +106,6 @@ export class RenderClient {
         // someone subscribed.  Other consumers are free to chain
         // their own callbacks; we only support one for now.
         if (typeof this.onStats === 'function') this.onStats(msg);
-        break;
-      case 'qualityTier':
-        if (typeof this.onQualityTier === 'function') this.onQualityTier(msg);
         break;
       case 'sceneReady':
         // The new score's first frame has hit the canvas.  Fired

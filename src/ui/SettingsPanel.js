@@ -311,18 +311,17 @@ export class SettingsPanel {
     sectionEl.appendChild(desc);
 
     // --- Adaptive-quality row ----------------------------------------
-    // Checkbox + live tier label.  Wired directly to the worker via
+    // Checkbox + live pressure dot.  Wired directly to the worker via
     // `updateConfig({ autoDegrade })` — not routed through the settings
-    // registry because the degrader's state lives purely in the worker
-    // (it's not a SceneConfig knob) and doesn't need persistence.
-    const TIER_LABELS = ['Full', 'High', 'Medium', 'Low'];
+    // registry because this state lives purely in the worker and doesn't
+    // need persistence.
     const aqRow = document.createElement('div');
     aqRow.className = 'settings-row settings-aq-row';
 
     const aqLabel = document.createElement('label');
     aqLabel.className = 'settings-label';
     const aqLabelText = document.createElement('span');
-    aqLabelText.textContent = 'Auto-degrade quality';
+    aqLabelText.textContent = 'Auto-dim lights under load';
     aqLabel.appendChild(aqLabelText);
 
     const aqCtrl = document.createElement('div');
@@ -334,45 +333,42 @@ export class SettingsPanel {
     aqCheck.checked = true; // default: on
     aqLabel.htmlFor = 'setting_autoDegrade';
 
-    /** Span that shows the active tier, updated by `onQualityTier`. */
-    const tierTag = document.createElement('span');
-    tierTag.className = 'settings-aq-tier';
-    tierTag.textContent = TIER_LABELS[0];
+    /** Small dot that fills with colour proportional to GPU pressure. */
+    const pressureDot = document.createElement('span');
+    pressureDot.className = 'settings-aq-pressure';
+    pressureDot.title = 'GPU pressure (0 = none, full = lights dimmed)';
 
     aqCheck.addEventListener('change', () => {
       this._app.render.updateConfig({ autoDegrade: aqCheck.checked });
     });
 
     aqCtrl.appendChild(aqCheck);
-    aqCtrl.appendChild(tierTag);
+    aqCtrl.appendChild(pressureDot);
     aqRow.appendChild(aqLabel);
     aqRow.appendChild(aqCtrl);
 
     const aqDesc = document.createElement('div');
     aqDesc.className = 'settings-desc';
-    aqDesc.textContent = 'Steps quality down (shadow map size, render resolution) when frames exceed 60 fps budget, then recovers when the load eases. Disable to lock full quality for benchmarking.';
+    aqDesc.textContent = 'Several optimisations are always active: distance-based detail reduction, glyph culling when zoomed out, frame-skip when the GPU is behind, and a shared point-light pool. This toggle adds smooth light-ball dimming when sustained GPU pressure is detected, recovering automatically when load eases. Shadow quality and render resolution are set once at startup from a quick GPU probe and never change mid-session. Disable this toggle to lock lights at full brightness for benchmarking.';
     aqRow.appendChild(aqDesc);
 
     sectionEl.appendChild(aqRow);
 
-    // Wire up the quality-tier callback so the label stays current.
-    // We store a ref so we can remove the old callback if `_render`
-    // is ever called again (e.g. won't happen today, but defensive).
+    // Keep pressure dot and checkbox in sync via the stats heartbeat.
     if (this._app && this._app.render) {
-      this._app.render.onQualityTier = ({ tier }) => {
-        tierTag.textContent = TIER_LABELS[tier] || String(tier);
-      };
-      // Also keep tier tag in sync via `stats` heartbeat so it
-      // reflects the initial tier immediately without waiting for
-      // the first tier-change event.
       const prevOnStats = this._app.render.onStats;
       this._app.render.onStats = (msg) => {
         if (prevOnStats) prevOnStats(msg);
-        if (msg.qualityTier !== undefined) {
-          tierTag.textContent = TIER_LABELS[msg.qualityTier] || String(msg.qualityTier);
-        }
         if (msg.autoDegrade !== undefined) {
           aqCheck.checked = !!msg.autoDegrade;
+        }
+        if (msg.gpuPressure !== undefined) {
+          // Colour the dot from green (no pressure) → amber → red (high).
+          const p = Math.max(0, Math.min(1, msg.gpuPressure));
+          const r = Math.round(p * 220);
+          const g = Math.round((1 - p) * 180);
+          pressureDot.style.background = `rgb(${r},${g},40)`;
+          pressureDot.style.opacity    = 0.3 + p * 0.7;
         }
       };
     }
