@@ -14,7 +14,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
-import { SVG3DBuilder } from '../rendering/SVG3DBuilder.js';
+import { SVG3DBuilder, prefetchTitleFont } from '../rendering/SVG3DBuilder.js';
 import { setRendererKind, setPlayheadX } from '../rendering/Materials.js';
 import { LightBallController } from '../animation/LightBallController.js';
 import { CameraController } from '../animation/CameraController.js';
@@ -468,6 +468,12 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // events and the per-frame light-ball hit detector.
   controls.addEventListener('start', () => cameraCtrl?.setUserInteracting(true));
   controls.addEventListener('end', () => cameraCtrl?.setUserInteracting(false));
+
+  // Kick off the title-font fetch in the background so it is ready
+  // (or nearly so) by the time the first `buildScene` message arrives.
+  // Fire-and-forget — `prefetchTitleFont` stores the result in a
+  // module-level variable that `_addTitle` reads synchronously.
+  prefetchTitleFont();
 
   post({ type: 'ready', renderer: usingWebGPU ? 'WebGPU' : 'WebGL' });
 
@@ -1010,6 +1016,13 @@ function disposePerSceneResources(obj) {
   //     geometries are still cached, so we skip those.
   obj.traverse((node) => {
     if (node.name === 'paper') {
+      if (node.geometry) node.geometry.dispose();
+      if (node.material) node.material.dispose();
+      return;
+    }
+    // Title text: ExtrudeGeometry + cloned material, both created per
+    // score load and not in any shared cache.
+    if (node.name === 'title') {
       if (node.geometry) node.geometry.dispose();
       if (node.material) node.material.dispose();
       return;
