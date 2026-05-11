@@ -1,3 +1,13 @@
+function isSafariBrowser() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  return /AppleWebKit/i.test(ua)
+    && /Safari/i.test(ua)
+    && !/(Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android)/i.test(ua);
+}
+
+const DEFAULT_AUDIO_VISUAL_OFFSET_MS = isSafariBrowser() ? -500 : 0;
+
 /**
  * Scene configuration — central source of truth for all visual /
  * camera / light-ball constants the rendering pipeline reads.  Most
@@ -27,7 +37,7 @@ export const SceneConfig = {
    * `currentMusicTime()` every frame, so changes apply on the very
    * next rAF without any reparse or scene rebuild.
    */
-  audioVisualOffsetMs: 0,
+  audioVisualOffsetMs: DEFAULT_AUDIO_VISUAL_OFFSET_MS,
 
   /**
    * Playback-speed multiplier applied on top of the score's native
@@ -305,6 +315,12 @@ export const SceneConfig = {
    *             upcoming notes appear to flow in diagonally with
    *             pronounced forward perspective.
    *
+   *   • `lookAheadSeconds` — how far ahead of the current audio time
+   *     the camera looks while its position still follows the current
+   *     playhead.  The original SceneKit demo used 1.5 beats of
+   *     look-ahead; 0.5 s is the same ballpark at moderate tempos
+   *     without pushing the active notes too far behind centre.
+   *
    *   • `contentHeadroom`  — multiplier on the score's vertical
    *     spread when computing the auto-fit camera distance.  Lower
    *     values pack the score tighter against the FOV (more pixels
@@ -323,6 +339,7 @@ export const SceneConfig = {
     defaultDistance: 1.8,
     pitchDegrees: 45,
     chaseRatio: 1.0,
+    lookAheadSeconds: 0.5,
     contentHeadroom: 0.55,
   },
 

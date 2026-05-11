@@ -39,6 +39,7 @@ export class CameraController {
   _controls;
 
   _target = new THREE.Vector3();
+  _lookTarget = new THREE.Vector3();
   _enabled = true;
 
   // Score-framing state, set via configureForScore().  Stored in
@@ -55,6 +56,9 @@ export class CameraController {
   _springX = 0;
   _springVelX = 0;
   _springReady = false;
+  _lookSpringX = 0;
+  _lookSpringVelX = 0;
+  _lookSpringReady = false;
 
   /**
    * Piecewise-linear time→x mapping derived from the note timeline.
@@ -67,6 +71,7 @@ export class CameraController {
   _track = { times: new Float64Array(0), xs: new Float64Array(0) };
   /** Cached monotonic index into _track for O(1) lookup during playback. */
   _trackIdx = 0;
+  _lookTrackIdx = 0;
 
   /* ------------------------------------------------------------------ */
   /*  Smart camera — cinematic auto-orbit                                */
@@ -186,35 +191,31 @@ export class CameraController {
    *
    * We build a piecewise-linear time→x curve using the actual note
    * positions so the camera sits exactly on each note.  Multiple staff
-   * events at the same time (a chord) collapse into a single knot
-   * whose X is the mean of all staves' note-X at that instant — this
-   * gives a sensible central-X when treble and bass render at
-   * slightly different horizontal positions.  The spring in `update()`
-   * smooths the per-segment velocity changes into a visually
-   * continuous motion.
+   * events at the same time (a chord) collapse into a single knot at
+   * the leftmost active note, matching the original SceneKit demo's
+   * "lead note" camera target.  The spring in `update()` smooths the
+   * per-segment velocity changes into a visually continuous motion.
    * @param {Array<{ time: number, x: number }>} timeline
    */
   setTimeTrack(timeline) {
     this._trackIdx = 0;
+    this._lookTrackIdx = 0;
     if (!timeline || timeline.length === 0) {
       this._track = { times: new Float64Array(0), xs: new Float64Array(0) };
       return;
     }
     // Collapse notes sharing a time instant into a single knot at the
-    // mean X.  Times are already monotonically non-decreasing so we
+    // leftmost X.  Times are already monotonically non-decreasing so we
     // only have to look at the previous knot.
     const times = [];
-    const xSums = [];
-    const counts = [];
+    const xsByTime = [];
     let lastTime = NaN;
     for (const e of timeline) {
       if (e.time === lastTime) {
-        xSums[xSums.length - 1] += e.x;
-        counts[counts.length - 1] += 1;
+        xsByTime[xsByTime.length - 1] = Math.min(xsByTime[xsByTime.length - 1], e.x);
       } else {
         times.push(e.time);
-        xSums.push(e.x);
-        counts.push(1);
+        xsByTime.push(e.x);
         lastTime = e.time;
       }
     }
@@ -223,7 +224,7 @@ export class CameraController {
     const xs = new Float64Array(n);
     for (let i = 0; i < n; i++) {
       ts[i] = times[i];
-      xs[i] = xSums[i] / counts[i];
+      xs[i] = xsByTime[i];
     }
     this._track = { times: ts, xs };
   }
@@ -241,7 +242,7 @@ export class CameraController {
    * spacing the residual is fractions of a note, which is not
    * perceptible.
    */
-  xAtTime(time) {
+  xAtTime(time, cache = 'main') {
     const { times, xs } = this._track;
     const n = times.length;
     if (n === 0) return null;
@@ -249,10 +250,11 @@ export class CameraController {
     if (time >= times[n - 1]) return xs[n - 1];
     // Monotonic cache so playback queries are O(1); walk backwards
     // only if the caller has rewound (stop + replay).
-    let i = this._trackIdx;
+    let i = cache === 'lookAhead' ? this._lookTrackIdx : this._trackIdx;
     if (times[i] > time) i = 0;
     while (i + 1 < n && times[i + 1] <= time) i++;
-    this._trackIdx = i;
+    if (cache === 'lookAhead') this._lookTrackIdx = i;
+    else this._trackIdx = i;
     const t0 = times[i];
     const t1 = times[i + 1];
     const u = (time - t0) / (t1 - t0);
@@ -260,16 +262,24 @@ export class CameraController {
   }
 
   /**
-   * Set the horizontal target the camera should follow.
+   * Set the horizontal target the camera should follow and look toward.
    * Y is locked to the paper plane (0) and Z to the staff-spread
    * centre computed by `configureForScore`, so the orbit target
-   * always sits *on the paper* under the active note — only X moves
-   * with playback.
+   * always sits *on the paper*.  The camera position follows the
+   * current note X while the look target can sit slightly ahead, matching
+   * the original demo's anticipatory framing without changing playback
+   * timing.
    * @param {THREE.Vector3} target  Only `.x` is used.
+   * @param {number} [lookAheadX]
    */
-  setTarget(target) {
+  setTarget(target, lookAheadX = target.x) {
     this._target.set(
       target.x,
+      0,
+      this._contentCenterZ,
+    );
+    this._lookTarget.set(
+      lookAheadX,
       0,
       this._contentCenterZ,
     );
@@ -288,12 +298,8 @@ export class CameraController {
     // multi-unit jump.
     const h = Math.min(Math.max(dt, 0.0001), 0.1);
 
-    // Follow the time-derived target exactly — no look-ahead offset.
-    // The look-ahead made sense when the camera averaged ball positions
-    // (you wanted to peek at upcoming notes past the ball) but now
-    // that the camera tracks *musical time* directly it just makes the
-    // played note drift off the centre of the screen.
     const desiredX = this._target.x;
+    const desiredLookX = this._lookTarget.x;
     const desiredY = this._target.y;
     const desiredZ = this._target.z;
 
@@ -301,6 +307,11 @@ export class CameraController {
       this._springX = desiredX;
       this._springVelX = 0;
       this._springReady = true;
+    }
+    if (!this._lookSpringReady) {
+      this._lookSpringX = desiredLookX;
+      this._lookSpringVelX = 0;
+      this._lookSpringReady = true;
     }
 
     // Critically-damped spring using the closed-form approximation
@@ -310,19 +321,18 @@ export class CameraController {
     // when the browser drops a frame and hands us a spike in `dt`.
     // smoothTime ≈ the time it takes for ~63 % of the gap to close.
     //
-    // 0.9 s gives the camera a deliberately stretchy "tow rope" feel
+    // 1.25 s gives the camera a deliberately stretchy "tow rope" feel
     // — when the music speeds up the camera doesn't snap forward,
     // it leans into the new tempo and gradually catches up; when the
     // music suddenly slows or stops, the camera coasts to a halt
     // instead of stopping abruptly.  Earlier values (0.25 s, 0.5 s)
     // produced perceptible kinks on every velocity change in the
     // piecewise-linear track and the camera felt twitchy on rapid
-    // chord changes.  Going much past 1.0 s starts to feel like the
-    // camera is dragging behind the music rather than tracking it,
-    // since the steady-state lag at velocity v is v × smoothTime
-    // (e.g. at 1 unit/s playback the camera trails by 0.9 units —
-    // roughly one quarter-note's spacing).
-    const smoothTime = 0.9;
+    // chord changes.  The small look-ahead target keeps upcoming notes
+    // visible even with this slower follow spring.  The steady-state
+    // lag at velocity v is v × smoothTime (e.g. at 1 unit/s playback
+    // the camera trails by 1.25 units).
+    const smoothTime = 1.25;
     const omega = 2 / smoothTime;
     const xw = omega * h;
     const exp = 1 / (1 + xw + 0.48 * xw * xw + 0.235 * xw * xw * xw);
@@ -331,12 +341,16 @@ export class CameraController {
     this._springVelX = (this._springVelX - omega * temp) * exp;
     const prevSpringX = this._springX;
     this._springX = desiredX + (change + temp) * exp;
+    const lookChange = this._lookSpringX - desiredLookX;
+    const lookTemp = (this._lookSpringVelX + omega * lookChange) * h;
+    this._lookSpringVelX = (this._lookSpringVelX - omega * lookTemp) * exp;
+    this._lookSpringX = desiredLookX + (lookChange + lookTemp) * exp;
 
-    // Move both the orbit target and the camera by the same Δx so the
-    // user's rotation/zoom around the target is preserved.  Doing this
-    // by hand avoids two `Vector3.clone()` allocations per frame —
-    // every avoided GC trigger is one fewer source of camera stutter.
-    this._controls.target.set(this._springX, desiredY, desiredZ);
+    // Move the camera along the current-note rail while the OrbitControls
+    // target eases toward the look-ahead rail.  Doing the camera translate
+    // by hand avoids two `Vector3.clone()` allocations per frame — every
+    // avoided GC trigger is one fewer source of camera stutter.
+    this._controls.target.set(this._lookSpringX, desiredY, desiredZ);
     this.camera.position.x += this._springX - prevSpringX;
 
     // Smart-camera orbital overlay — gentle yaw/pitch/zoom variation
@@ -587,11 +601,16 @@ export class CameraController {
    * point to give the user the canonical "music-on-a-table at an
    * angle" view.  The pitch (vertical angle of view) is read from
    * `SceneConfig.camera.pitchDegrees`; the chase-cam offset on X is
-   * always `-distance × 0.25` capped at 1.5 world units.
+   * `-distance × chaseRatio` capped at 3 world units.
    */
-  snapToTarget(target) {
+  snapToTarget(target, lookAheadX = target.x) {
     this._target.set(
       target.x,
+      0,
+      this._contentCenterZ,
+    );
+    this._lookTarget.set(
+      lookAheadX,
       0,
       this._contentCenterZ,
     );
@@ -599,13 +618,16 @@ export class CameraController {
     const cfg = SceneConfig.camera;
     const distance = this._contentDistance || cfg.defaultDistance;
 
-    this._controls.target.set(this._target.x, this._target.y, this._target.z);
+    this._controls.target.set(this._lookTarget.x, this._lookTarget.y, this._lookTarget.z);
 
     // Reset the spring so it doesn't lurch back to the previous
     // smoothed position on the next update().
     this._springX = this._target.x;
     this._springVelX = 0;
     this._springReady = true;
+    this._lookSpringX = this._lookTarget.x;
+    this._lookSpringVelX = 0;
+    this._lookSpringReady = true;
 
     // Smart camera: snapping invalidates whatever rest pose the
     // overlay had been orbiting around, so flag it for recapture
