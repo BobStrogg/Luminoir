@@ -424,19 +424,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
 
   const cfg = SceneConfig.camera;
   camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
-  // Initial pose: above the floor (positive Y) and in front of the
-  // music's near edge (positive Z), looking back at the world origin
-  // — the score's left edge sits at world (0, 0, 0) before
-  // `configureForScore` runs and re-centres the orbit target on the
-  // staff cluster, so this gives a sensible above-and-behind preview
-  // until the first score loads.  Y is derived from `defaultDistance
-  // × tan(pitchDegrees)` so the pre-score pose matches the same
-  // viewing pitch the chase camera will snap to once a score loads;
-  // without this the camera appears to "jump" to a lower angle the
-  // moment configureForScore runs.
+  // Initial pose uses the same left-of-playhead chase formula as
+  // CameraController.snapToTarget(), so the first score starts from
+  // the "following from the left" side instead of briefly looking back
+  // from the playhead's right.
   const initialPitchRad = ((cfg.pitchDegrees ?? 30) * Math.PI) / 180;
   const initialHeight = cfg.defaultDistance * Math.tan(initialPitchRad);
-  camera.position.set(0, initialHeight, cfg.defaultDistance);
+  const initialChaseX = -Math.min(cfg.defaultDistance * (cfg.chaseRatio ?? 0.25), 3.0);
+  camera.position.set(initialChaseX, initialHeight, cfg.defaultDistance);
   camera.lookAt(0, 0, 0);
 
   // ElementProxy mocks the DOM element OrbitControls attaches to.
@@ -1257,8 +1252,14 @@ function startRenderLoop() {
     if (cameraCtrl) {
       const xTime = cameraCtrl.xAtTime(musicTime);
       if (xTime != null) {
+        const lookAheadSeconds = clock.state === 'playing'
+          ? Math.max(0, SceneConfig.camera.lookAheadSeconds ?? 0)
+          : 0;
+        const xLook = lookAheadSeconds > 0
+          ? cameraCtrl.xAtTime(musicTime + lookAheadSeconds, 'lookAhead')
+          : xTime;
         _camTarget.set(xTime, 0, 0);
-        cameraCtrl.setTarget(_camTarget);
+        cameraCtrl.setTarget(_camTarget, xLook ?? xTime);
       }
       cameraCtrl.update(dt);
     }

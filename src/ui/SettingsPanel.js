@@ -60,6 +60,9 @@ export class SettingsPanel {
     const stored = loadStoredSettings();
     for (const setting of SETTINGS) {
       if (stored[setting.id] !== undefined) {
+        if (setting.id === 'audioVisualOffsetMs' && stored[setting.id] === 0 && setting.default !== 0) {
+          continue;
+        }
         applyToSceneConfig(setting, stored[setting.id]);
       }
     }
