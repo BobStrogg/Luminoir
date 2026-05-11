@@ -22,12 +22,17 @@ export class RenderClient {
   /** @type {'WebGPU'|'WebGL'|'unknown'} */
   _rendererKind = 'unknown';
   _readyResolve = null;
+  _readyReject = null;
   _onResize = null;
   /** Optional consumer callback for periodic worker `stats` posts —
    *  used by the FPS-badge UI to update twice a second.  Setter is
    *  exposed as a public field so callers can `client.onStats = fn`
    *  any time after `init()`. */
   onStats = null;
+  /** Optional callback fired when the adaptive-quality tier changes.
+   *  Receives `{ tier: 0|1|2|3 }` so the UI can reflect the active
+   *  quality level without polling. */
+  onQualityTier = null;
   /** Exposed so LuminoirApp can log renderer kind on startup. */
   get rendererKind() { return this._rendererKind; }
 
@@ -47,7 +52,10 @@ export class RenderClient {
     const height = canvas.clientHeight || window.innerHeight;
     const devicePixelRatio = window.devicePixelRatio || 1;
 
-    const readyPromise = new Promise((res) => { this._readyResolve = res; });
+    const readyPromise = new Promise((res, rej) => {
+      this._readyResolve = res;
+      this._readyReject = rej;
+    });
 
     // Honour `?renderer=webgl` so developers can reproduce the
     // WebGL-only bugs users hit on insecure-origin URLs (e.g. a
@@ -88,12 +96,23 @@ export class RenderClient {
       case 'ready':
         this._rendererKind = msg.renderer;
         if (this._readyResolve) { this._readyResolve(); this._readyResolve = null; }
+        this._readyReject = null;
+        break;
+      case 'renderer_error':
+        if (this._readyReject) {
+          this._readyReject(new Error(msg.message || 'Renderer initialisation failed'));
+          this._readyReject = null;
+        }
+        this._readyResolve = null;
         break;
       case 'stats':
         // Periodic worker heartbeat — forward to the FPS badge if
         // someone subscribed.  Other consumers are free to chain
         // their own callbacks; we only support one for now.
         if (typeof this.onStats === 'function') this.onStats(msg);
+        break;
+      case 'qualityTier':
+        if (typeof this.onQualityTier === 'function') this.onQualityTier(msg);
         break;
       case 'sceneReady':
         // The new score's first frame has hit the canvas.  Fired

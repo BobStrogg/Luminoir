@@ -22,6 +22,198 @@ import { ElementProxy } from './ElementProxy.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
 
 /* ------------------------------------------------------------------ */
+/*  Adaptive quality                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Four-tier automatic quality degrader.
+ *
+ * Uses the rAF-to-rAF interval (`_frameMsRing`) — the true wall-clock
+ * frame time including GPU execution — as its pressure signal.  The
+ * degrader learns the display's baseline refresh interval from the first
+ * 90 rAF ticks of playback so it adapts automatically to 60 Hz, 90 Hz,
+ * 120 Hz and ProMotion displays without hard-coded thresholds.
+ *
+ * Once the baseline is established:
+ *   • "Overrun" (step DOWN):  p95 frame interval > baseline × 1.5
+ *     (i.e. GPU is missing more than every other vsync — the scene is
+ *     truly GPU-bound).  Step down after 1 s of sustained overrun.
+ *   • "Underrun" (step UP):   p95 frame interval < baseline × 1.15
+ *     (smooth headroom).  Step up only after 3 s so a quiet passage
+ *     doesn't immediately snap back just to degrade again.
+ *
+ * During the calibration window (first 90 rAF ticks after playback
+ * starts) the degrader holds at its current tier so a cold-start
+ * spike doesn't trigger an immediate step-down.
+ *
+ * **Tiers**  (index 0 = highest quality, 3 = lowest)
+ *
+ *   0 — Full:   shadowMap 6144², DPR cap 2.0, PCF Soft.
+ *   1 — High:   shadowMap 4096², DPR cap 1.75, PCF Soft.
+ *   2 — Medium: shadowMap 2048², DPR cap 1.5,  PCF.
+ *   3 — Low:    shadowMap 1024², DPR cap 1.25, PCF.
+ *
+ * Mobile devices start at Tier 2 (set in `handleInit`) so the degrader
+ * can still fall to Tier 3 on extremely dense scores, or recover to Tier 1
+ * if load is consistently light.
+ *
+ * The degrader is disabled when `autoDegrade` is false — quality stays
+ * pinned at whichever tier it was last set to (including the mobile
+ * starting tier) until re-enabled.
+ */
+class _AdaptiveQuality {
+  /** @param {number} initialTier  Starting tier index (0–3). */
+  constructor(initialTier = 0) {
+    this.tier = initialTier;
+    this.enabled = true;
+    /** Seconds of continuous overrun before we step down. */
+    this._downSec = 1.0;
+    /** Seconds of continuous comfortable headroom before we step up. */
+    this._upSec = 3.0;
+    /** Accumulated seconds of consecutive overrun / underrun. */
+    this._overrunAcc = 0;
+    this._underrunAcc = 0;
+    /** Cached device pixel ratio from init so tier changes can compute a
+     *  new DPR without re-querying the main thread. */
+    this._baseDpr = 1;
+    /** Shadow mapSize for each tier. */
+    this._mapSizes = [6144, 4096, 2048, 1024];
+    /** DPR caps for each tier. */
+    this._dprCaps  = [2.0,  1.75, 1.5,  1.25];
+    /** Whether to use PCF Soft (true) or plain PCF (false) per tier. */
+    this._softPcf  = [true, true, false, false];
+
+    // Calibration state — measure the display's baseline rAF interval
+    // from the first N ticks of playback.  We track a running minimum
+    // (the fastest observed interval) because the true vsync period
+    // is the shortest achievable interval; jitter and GC can only make
+    // frames *longer*, never shorter.
+    /** Number of rAF ticks to observe before locking in the baseline. */
+    this._calibTicks  = 90;
+    /** rAF ticks observed so far in the current calibration window. */
+    this._calibCount  = 0;
+    /** Minimum rAF interval observed during calibration (ms).  Initialised
+     *  to a conservative 60 Hz equivalent; updated downward each tick. */
+    this._baselineMs  = 16.67;
+    /** True once `_calibCount >= _calibTicks`. */
+    this._calibrated  = false;
+  }
+
+  /**
+   * Call once per rAF tick *before* `update()` to feed a new frame-
+   * interval sample into the calibration window.  Only active during
+   * the first `_calibTicks` ticks after playback starts (or after a
+   * `resetCalibration()` call).  Has no effect once calibrated.
+   * @param {number} frameMs  Latest rAF-to-rAF interval in milliseconds.
+   */
+  calibrate(frameMs) {
+    if (this._calibrated || frameMs <= 0 || frameMs >= 2000) return;
+    // Track the running minimum — vsync periods only get shorter as
+    // the display warms up; any longer sample is jitter.
+    if (frameMs < this._baselineMs) this._baselineMs = frameMs;
+    this._calibCount++;
+    if (this._calibCount >= this._calibTicks) {
+      // Clamp the baseline to the range [6 ms, 20 ms] so a spuriously
+      // short first tick (e.g. two rAFs fired in quick succession at
+      // worker start) doesn't set an impossibly fast baseline.
+      this._baselineMs = Math.max(6, Math.min(20, this._baselineMs));
+      this._calibrated = true;
+    }
+  }
+
+  /** Reset calibration — call when playback stops/restarts so the
+   *  baseline re-measures from the fresh play context. */
+  resetCalibration() {
+    this._calibCount = 0;
+    this._baselineMs = 16.67;
+    this._calibrated = false;
+    this._overrunAcc = 0;
+    this._underrunAcc = 0;
+  }
+
+  /**
+   * Call once per rAF tick.  `dt` is the frame duration in seconds;
+   * `frameP95` is the recent p95 rAF-interval in ms.  Returns the new
+   * tier index if a tier change was made, else -1.
+   *
+   * The decision uses the *calibrated* baseline so the thresholds
+   * adapt to the actual display refresh rate rather than assuming 60 Hz.
+   */
+  update(dt, frameP95) {
+    if (!this.enabled || !this._calibrated) return -1;
+    // Thresholds are relative to the measured baseline:
+    //   highMs = baseline × 1.5 — missing roughly every other vsync.
+    //   lowMs  = baseline × 1.15 — comfortably under budget.
+    const highMs = this._baselineMs * 1.5;
+    const lowMs  = this._baselineMs * 1.15;
+    if (frameP95 >= highMs) {
+      this._underrunAcc = 0;
+      this._overrunAcc += dt;
+      if (this._overrunAcc >= this._downSec && this.tier < 3) {
+        this.tier++;
+        this._overrunAcc = 0;
+        return this.tier;
+      }
+    } else if (frameP95 <= lowMs) {
+      this._overrunAcc = 0;
+      this._underrunAcc += dt;
+      if (this._underrunAcc >= this._upSec && this.tier > 0) {
+        this.tier--;
+        this._underrunAcc = 0;
+        return this.tier;
+      }
+    } else {
+      // In-budget but not strongly under — decay both accumulators
+      // toward zero so a mix of good/bad frames doesn't accumulate.
+      this._overrunAcc  = Math.max(0, this._overrunAcc  - dt * 0.5);
+      this._underrunAcc = Math.max(0, this._underrunAcc - dt * 0.5);
+    }
+    return -1;
+  }
+
+  /** Apply the current tier's settings to `renderer` and `_keyLight`. */
+  apply() {
+    if (!renderer) return;
+    const mapSize = this._mapSizes[this.tier];
+    const dprCap  = this._dprCaps[this.tier];
+    const soft    = this._softPcf[this.tier];
+    // DPR change: setPixelRatio re-allocates the framebuffer at the new
+    // resolution — cheap on the CPU but the next frame will re-upload
+    // the full framebuffer to the GPU.
+    renderer.setPixelRatio(Math.min(this._baseDpr, dprCap));
+    // Shadow map type change: must dispose the old map and let Three.js
+    // re-create it.  Assigning `.type` alone doesn't take effect until
+    // the map is disposed and regenerated.
+    const newType = soft ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+    if (renderer.shadowMap.type !== newType) {
+      renderer.shadowMap.type = newType;
+    }
+    if (_keyLight && (
+      _keyLight.shadow.mapSize.width  !== mapSize ||
+      _keyLight.shadow.mapSize.height !== mapSize
+    )) {
+      _keyLight.shadow.mapSize.width  = mapSize;
+      _keyLight.shadow.mapSize.height = mapSize;
+      if (_keyLight.shadow.map) {
+        _keyLight.shadow.map.dispose();
+        _keyLight.shadow.map = null;
+      }
+      // Recompute texel size so the key-light snapping stays accurate.
+      const shadowCam = _keyLight.shadow.camera;
+      _keyLightTexelSize.set(
+        (shadowCam.right - shadowCam.left) / mapSize,
+        (shadowCam.top - shadowCam.bottom) / mapSize,
+      );
+    }
+    _markDirty();
+  }
+}
+
+/** Module-level degrader instance — created in `handleInit`. */
+/** @type {_AdaptiveQuality | null} */
+let _quality = null;
+
+/* ------------------------------------------------------------------ */
 /*  Per-worker global state                                            */
 /* ------------------------------------------------------------------ */
 
@@ -126,37 +318,6 @@ function _isMobileUA() {
   return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
 }
 
-/** Smoke-test a freshly-initialised WebGPURenderer by clearing a tiny
- *  off-screen render target to a known colour and reading the result
- *  back.  On Chromium-based embedded browsers (notably Tesla's in-car
- *  browser) `WebGPURenderer.init()` resolves successfully but no
- *  pixels ever reach the canvas — the user sees audio playing over a
- *  blank rectangle.  Detecting this case here lets us dispose the
- *  busted WebGPU renderer and fall back to WebGL before any score
- *  loads. */
-async function _verifyWebGPURenders(r) {
-  try {
-    const target = new THREE.WebGLRenderTarget(2, 2);
-    const prevTarget = r.getRenderTarget();
-    const prevClearColor = new THREE.Color();
-    r.getClearColor(prevClearColor);
-    const prevClearAlpha = r.getClearAlpha();
-    r.setRenderTarget(target);
-    r.setClearColor(0xff00ff, 1); // magenta — far from any background colour
-    r.clear(true, true, true);
-    const buf = await r.readRenderTargetPixelsAsync(target, 0, 0, 2, 2);
-    r.setRenderTarget(prevTarget);
-    r.setClearColor(prevClearColor, prevClearAlpha);
-    target.dispose();
-    if (!buf || buf.length < 4) return false;
-    // Magenta means the clear hit the framebuffer; black/zeros means
-    // the WebGPU pipeline is wired but not actually executing.
-    return buf[0] > 200 && buf[1] < 60 && buf[2] > 200;
-  } catch (e) {
-    return false;
-  }
-}
-
 async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL }) {
   // Mobile devices (iOS Safari especially) sit right on the edge of
   // the per-frame budget at desktop quality, and the OS halves the
@@ -182,13 +343,6 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // `?renderer=webgl` forces the legacy fallback even on a
   // WebGPU-capable origin, useful for reproducing WebGL-specific
   // bugs from the same machine.
-  //
-  // After a successful `init()` we also run a tiny render-target
-  // readback (`_verifyWebGPURenders`) so embedded browsers that
-  // *advertise* WebGPU but don't actually draw anything (Tesla's
-  // built-in browser is the motivating case) get auto-demoted to
-  // the WebGL path instead of leaving the user staring at a blank
-  // canvas while audio plays.
   let usingWebGPU = false;
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
@@ -199,19 +353,21 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
       const { WebGPURenderer } = await import('three/webgpu');
       renderer = new WebGPURenderer({ canvas, antialias: wantAntialias });
       await renderer.init();
-      const works = await _verifyWebGPURenders(renderer);
-      if (works) {
-        usingWebGPU = true;
-      } else {
-        try { renderer.dispose(); } catch { /* best-effort */ }
-        renderer = null;
-      }
+      usingWebGPU = true;
     } catch (e) {
       renderer = null;
     }
   }
   if (!renderer) {
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias });
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias });
+    } catch (e) {
+      post({
+        type: 'renderer_error',
+        message: e?.message ?? 'WebGL context creation failed',
+      });
+      return;
+    }
   }
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
@@ -232,6 +388,11 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Cap DPR more aggressively on mobile — a Retina iPhone reports
   // DPR 3, which triples fragment-shader work for very little visual
   // gain on a 6" screen showing the entire score.
+  //
+  // The adaptive degrader will adjust both DPR and shadow mapSize at
+  // runtime; here we apply the starting tier's DPR cap directly via
+  // `setPixelRatio` — the degrader's `apply()` call below does the
+  // same thing but we need the renderer sized before `setSize`.
   const dprCap = isMobile ? 1.5 : 2;
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
@@ -288,6 +449,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   scene.background = new THREE.Color(SceneConfig.backgroundColor);
   scene.add(contentRoot);
   setupLighting(scene, isMobile);
+
+  // Create the adaptive-quality degrader.  Mobile starts at Tier 2
+  // (2048² shadow map, DPR 1.5) so `setupLighting` already applied the
+  // right shadow mapSize; we just record the state here.  Desktop starts
+  // at Tier 0 (full quality).  The degrader will step tiers at runtime
+  // based on actual frame-p95 measurements.
+  _quality = new _AdaptiveQuality(isMobile ? 2 : 0);
+  _quality._baseDpr = devicePixelRatio || 1;
 
   cameraCtrl = new CameraController(camera, controls);
 
@@ -872,6 +1041,10 @@ function handleClock({ state, musicTime, tempoScale }) {
   };
   if (state === 'playing') {
     if (lightBalls) lightBalls.play();
+    // Reset the AQ calibration window so the baseline is measured from
+    // the first frames of this play session — not from stale rAF ticks
+    // that may have occurred during a paused/idle period.
+    if (_quality) _quality.resetCalibration();
   } else if (state === 'paused') {
     if (lightBalls) lightBalls.pause();
   } else if (state === 'stopped') {
@@ -937,6 +1110,15 @@ let _rendersSkipped = 0;
 const _frameMsRing = new Float64Array(120);
 let _frameMsIdx = 0;
 let _frameMsFilled = 0;
+/** Pre-allocated scratch buffers for in-place sorting inside the hot
+ *  rAF loop and the 500 ms stats heartbeat.  Using typed arrays and
+ *  sorting them in-place avoids the `new Array` + `push` allocations
+ *  that were triggering minor GC pauses every frame and causing the
+ *  rAF interval to jitter (manifesting as inconsistent 45-60 fps on
+ *  ProMotion hardware despite <4 ms GPU render time). */
+const _aqScratch = new Float64Array(120);    // AQ p95 — written every rAF
+const _statsScratch = new Float64Array(120); // _postStats p95 — written every 500 ms
+
 /** Set to `true` while we're pre-compiling pipelines for a freshly-
  *  built scene.  We pause normal rendering during that window so a
  *  mid-compile `renderer.render()` doesn't trigger slow inline
@@ -1072,6 +1254,43 @@ function startRenderLoop() {
       _rendersSkipped++;
     }
 
+    // --- Adaptive quality --------------------------------------------
+    // Uses rAF-to-rAF interval (frameMs) as the pressure signal
+    // because that reflects true GPU execution time — when the GPU
+    // can't finish a frame before the next vsync the browser pushes
+    // the next rAF delivery back, which shows up here as frameMs > 1
+    // vsync period.  CPU-side render-submit time (renderMs) is NOT a
+    // reliable signal for GPU pressure: on WebGL, draw calls return
+    // immediately; on WebGPU, command encoding completes in 2-4 ms
+    // even when the GPU won't finish for 20 ms.
+    //
+    // The degrader calibrates the baseline vsync interval from the
+    // first 90 rAF ticks of each play session before making any tier
+    // decisions, so it auto-adapts to 60/90/120 Hz displays.
+    //
+    // Only runs while music is playing; the idle render gate already
+    // prevents unnecessary GPU work in paused/stopped state.
+    if (_quality && clock.state === 'playing' && _frameMsFilled > 0) {
+      // Feed the latest frame interval into the calibration window.
+      _quality.calibrate(frameMs);
+      const wantAq = Math.min(_frameMsFilled, 60);
+      // Write directly into the pre-allocated scratch typed array —
+      // no heap allocation per frame, no minor-GC trigger.
+      for (let i = 0; i < wantAq; i++) {
+        const idx = (_frameMsIdx - 1 - i + _frameMsRing.length) % _frameMsRing.length;
+        _aqScratch[i] = _frameMsRing[idx];
+      }
+      // Sort only the filled slice (subarray view, no copy).
+      _aqScratch.subarray(0, wantAq).sort();
+      const aqP95 = _aqScratch[Math.min(wantAq - 1, Math.floor(wantAq * 0.95))];
+      const newTier = _quality.update(dt, aqP95);
+      if (newTier >= 0) {
+        _quality.apply();
+        // Notify main thread so the Settings panel can show the active tier.
+        post({ type: 'qualityTier', tier: newTier });
+      }
+    }
+
     // --- Stats heartbeat ---------------------------------------------
     // Post a small stats summary every ~0.5 s so the main-thread FPS
     // badge has fresh numbers without flooding postMessage every
@@ -1122,16 +1341,15 @@ function _postStats() {
   let rSum = 0, rMax = 0, rP95 = 0;
   if (rLen > 0) {
     const rWant = Math.min(rLen, 60);
-    const rSamples = [];
     for (let i = 0; i < rWant; i++) {
       const idx = (_renderMsIdx - 1 - i + _renderMsRing.length) % _renderMsRing.length;
       const v = _renderMsRing[idx];
-      rSamples.push(v);
+      _statsScratch[i] = v;
       rSum += v;
       if (v > rMax) rMax = v;
     }
-    rSamples.sort((a, b) => a - b);
-    rP95 = rSamples[Math.min(rSamples.length - 1, Math.floor(rSamples.length * 0.95))];
+    _statsScratch.subarray(0, rWant).sort();
+    rP95 = _statsScratch[Math.min(rWant - 1, Math.floor(rWant * 0.95))];
   }
   const rMean = rLen > 0 ? rSum / Math.min(rLen, 60) : 0;
 
@@ -1144,6 +1362,10 @@ function _postStats() {
     renderMsP95: rP95,
     renderMsMax: rMax,
     rendering: _dirty || clock.state === 'playing',
+    qualityTier: _quality ? _quality.tier : 0,
+    autoDegrade: _quality ? _quality.enabled : false,
+    aqCalibrated: _quality ? _quality._calibrated : true,
+    aqBaselineMs: _quality ? _quality._baselineMs : 0,
   });
 }
 
@@ -1177,8 +1399,23 @@ const _camTarget = new THREE.Vector3();
  */
 function handleUpdateConfig({ updates }) {
   if (!updates || typeof updates !== 'object') return;
+  // `autoDegrade` is a pure-worker flag — not stored in SceneConfig —
+  // handled before the generic dot-path loop.
+  if ('autoDegrade' in updates && _quality) {
+    const wasEnabled = _quality.enabled;
+    _quality.enabled = !!updates.autoDegrade;
+    if (!wasEnabled && _quality.enabled) {
+      // Re-enabling: reset calibration so stale rAF intervals from the
+      // disabled period don't set a misleading baseline or cause an
+      // immediate tier jump.
+      _quality.resetCalibration();
+    }
+  }
   let cameraDirty = false;
   for (const path in updates) {
+    // `autoDegrade` is handled above; skip it here so we don't
+    // accidentally poke an `autoDegrade` key into `SceneConfig`.
+    if (path === 'autoDegrade') continue;
     const value = updates[path];
     const parts = path.split('.');
     let obj = SceneConfig;

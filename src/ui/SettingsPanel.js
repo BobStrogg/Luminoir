@@ -238,7 +238,8 @@ export class SettingsPanel {
   /**
    * Build the "Renderer" section — surfaces the active 3D backend
    * (WebGPU vs WebGL) and, when a choice is available, a button that
-   * reloads the page on the inverse `?renderer=` URL parameter.
+   * reloads the page on the inverse `?renderer=` URL parameter.  Also
+   * exposes the adaptive-quality toggle and a live tier readout.
    *
    * `app.render.rendererKind` is populated by the worker's `ready`
    * message and is therefore guaranteed to be set by the time this
@@ -257,9 +258,14 @@ export class SettingsPanel {
     h.textContent = 'Renderer';
     sectionEl.appendChild(h);
 
+    // Use the renderer kind the worker actually selected — this is the
+    // ground truth regardless of what navigator.gpu reports on the main
+    // thread (which can be absent even when WebGPU works in the worker,
+    // e.g. when COOP/COEP headers are present but navigator.gpu itself
+    // isn't exposed on the main thread's origin).
     const current = (this._app && this._app.render && this._app.render.rendererKind)
       || 'unknown';
-    const webgpuAvailable = typeof navigator !== 'undefined' && !!navigator.gpu;
+    const usingWebGPU = current === 'WebGPU';
 
     const row = document.createElement('div');
     row.className = 'settings-renderer-row';
@@ -269,8 +275,11 @@ export class SettingsPanel {
     activeLabel.textContent = current;
     row.appendChild(activeLabel);
 
-    if (webgpuAvailable) {
-      const otherName = current === 'WebGPU' ? 'WebGL' : 'WebGPU';
+    // Always show the switch button — if the worker could start WebGPU
+    // it can also start WebGL, and vice versa.  Only hide it when the
+    // renderer kind is still 'unknown' (worker hasn't reported yet).
+    if (current !== 'unknown') {
+      const otherName = usingWebGPU ? 'WebGL' : 'WebGPU';
       const switchBtn = document.createElement('button');
       switchBtn.type = 'button';
       switchBtn.className = 'settings-renderer-switch';
@@ -278,7 +287,7 @@ export class SettingsPanel {
       switchBtn.title = 'Reloads the page';
       switchBtn.addEventListener('click', () => {
         const url = new URL(window.location.href);
-        if (current === 'WebGPU') {
+        if (usingWebGPU) {
           url.searchParams.set('renderer', 'webgl');
         } else {
           url.searchParams.delete('renderer');
@@ -296,10 +305,77 @@ export class SettingsPanel {
 
     const desc = document.createElement('p');
     desc.className = 'settings-renderer-desc';
-    desc.textContent = webgpuAvailable
-      ? 'WebGPU is faster on supported browsers; WebGL is the universal fallback.  Try the other if rendering looks wrong on this device.'
-      : 'WebGPU isn\u2019t available in this browser/context, so Luminoir is locked to WebGL.';
+    desc.textContent = usingWebGPU
+      ? 'WebGPU is active — higher performance on supported browsers.  Switch to WebGL if rendering looks wrong on this device.'
+      : 'WebGL is active.  Switch to WebGPU for better performance if your browser supports it.';
     sectionEl.appendChild(desc);
+
+    // --- Adaptive-quality row ----------------------------------------
+    // Checkbox + live tier label.  Wired directly to the worker via
+    // `updateConfig({ autoDegrade })` — not routed through the settings
+    // registry because the degrader's state lives purely in the worker
+    // (it's not a SceneConfig knob) and doesn't need persistence.
+    const TIER_LABELS = ['Full', 'High', 'Medium', 'Low'];
+    const aqRow = document.createElement('div');
+    aqRow.className = 'settings-row settings-aq-row';
+
+    const aqLabel = document.createElement('label');
+    aqLabel.className = 'settings-label';
+    const aqLabelText = document.createElement('span');
+    aqLabelText.textContent = 'Auto-degrade quality';
+    aqLabel.appendChild(aqLabelText);
+
+    const aqCtrl = document.createElement('div');
+    aqCtrl.className = 'settings-control-checkbox settings-aq-ctrl';
+
+    const aqCheck = document.createElement('input');
+    aqCheck.type = 'checkbox';
+    aqCheck.id = 'setting_autoDegrade';
+    aqCheck.checked = true; // default: on
+    aqLabel.htmlFor = 'setting_autoDegrade';
+
+    /** Span that shows the active tier, updated by `onQualityTier`. */
+    const tierTag = document.createElement('span');
+    tierTag.className = 'settings-aq-tier';
+    tierTag.textContent = TIER_LABELS[0];
+
+    aqCheck.addEventListener('change', () => {
+      this._app.render.updateConfig({ autoDegrade: aqCheck.checked });
+    });
+
+    aqCtrl.appendChild(aqCheck);
+    aqCtrl.appendChild(tierTag);
+    aqRow.appendChild(aqLabel);
+    aqRow.appendChild(aqCtrl);
+
+    const aqDesc = document.createElement('div');
+    aqDesc.className = 'settings-desc';
+    aqDesc.textContent = 'Steps quality down (shadow map size, render resolution) when frames exceed 60 fps budget, then recovers when the load eases. Disable to lock full quality for benchmarking.';
+    aqRow.appendChild(aqDesc);
+
+    sectionEl.appendChild(aqRow);
+
+    // Wire up the quality-tier callback so the label stays current.
+    // We store a ref so we can remove the old callback if `_render`
+    // is ever called again (e.g. won't happen today, but defensive).
+    if (this._app && this._app.render) {
+      this._app.render.onQualityTier = ({ tier }) => {
+        tierTag.textContent = TIER_LABELS[tier] || String(tier);
+      };
+      // Also keep tier tag in sync via `stats` heartbeat so it
+      // reflects the initial tier immediately without waiting for
+      // the first tier-change event.
+      const prevOnStats = this._app.render.onStats;
+      this._app.render.onStats = (msg) => {
+        if (prevOnStats) prevOnStats(msg);
+        if (msg.qualityTier !== undefined) {
+          tierTag.textContent = TIER_LABELS[msg.qualityTier] || String(msg.qualityTier);
+        }
+        if (msg.autoDegrade !== undefined) {
+          aqCheck.checked = !!msg.autoDegrade;
+        }
+      };
+    }
 
     return sectionEl;
   }

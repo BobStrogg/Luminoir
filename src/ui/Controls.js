@@ -240,7 +240,10 @@ function initFpsBadge(badge, renderClient) {
   renderClient.onStats = (s) => {
     const fps = Math.round(s.fps);
     const submit = `${s.renderMs.toFixed(1)} / ${s.renderMsP95.toFixed(1)} ms`;
-    badge.textContent = `${fps} fps\n${submit}`;
+    const aqTierNames = ['T0:Full', 'T1:High', 'T2:Med', 'T3:Low'];
+    const aqBase = s.aqCalibrated ? `${s.aqBaselineMs.toFixed(1)}ms` : 'cal…';
+    const aqLabel = s.autoDegrade ? `${aqTierNames[s.qualityTier] ?? `T${s.qualityTier}`} base:${aqBase}` : 'AQ off';
+    badge.textContent = `${fps} fps  ${aqLabel}\nrAF ${s.frameMs.toFixed(1)}ms  gpu ${submit}`;
     // Tiering: green ≥55, amber ≥45, red < 45.  Latch on worst-case
     // for ~4 ticks so transient single-frame stalls don't strobe.
     let next;

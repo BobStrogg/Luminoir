@@ -104,23 +104,23 @@ export function measureTitleBlock(title, composer) {
 
 /**
  * Compute the per-score page margins.  Returns geometry that the
- * renderer plugs into `_addPaper` and `_addTitle` so all three of
+ * renderer plugs into `_addPaper` and `_addTitle`.
  *
- *   1. paper top → title top              (`paddingAboveTitle`)
- *   2. title bottom → topmost staff line  (`paddingBetween`)
- *   3. bottommost staff line → paper bottom (`paddingBelowStaff`)
+ * The padding is computed **independently** for the top and bottom
+ * edges so that content overhanging one side (e.g. dynamics "mf"
+ * below the bass staff) does not inflate the opposite margin:
  *
- * end up the same world-unit gap (`pad`).  When the score's content
- * bounding box (which includes pedal markers, ledger lines, octave
- * lines, etc.) extends beyond the visible 5-line staves we GROW the
- * padding so the paper still encloses every rendered element while
- * the three gaps stay equal.
+ *   padAbove = max(MIN_PAGE_PADDING, contentMaxY − staffMaxY)
+ *   padBelow = max(MIN_PAGE_PADDING, staffMinY   − contentMinY)
  *
- *   pad = max(
- *     MIN_PAGE_PADDING,                        // never tighter than the default
- *     contentMaxY - staffMaxY,                 // overhang above staff
- *     staffMinY - contentMinY,                 // overhang below staff
- *   )
+ * Layout with title (three equal-ish gaps all using padAbove):
+ *
+ *   1. paper top → title top              = padAbove
+ *   2. title bottom → topmost staff line  = padAbove
+ *   3. bottommost content edge → paper bottom = padBelow
+ *
+ * Without a title the paper sits `padAbove` above the topmost
+ * content and `padBelow` below the bottommost content.
  *
  * Caller must supply the world-unit Y bounds.  In score-local Y-up
  * coordinates (after the parser's SVG-Y flip):
@@ -130,17 +130,17 @@ export function measureTitleBlock(title, composer) {
  *   • `contentMaxY` = topmost edge of any rendered element
  *   • `contentMinY` = bottommost edge of any rendered element
  *
- * Returns the `pad` plus the absolute Y coordinates of the paper
- * top/bottom edges and the title top/bottom edges, so the caller
- * doesn't have to redo the arithmetic.  When `title` is null the
- * title-related fields are `null` and the paper sits symmetrically
- * around the staff with `MIN_PAGE_PADDING` above and below.
+ * Returns the absolute Y coordinates of the paper top/bottom edges
+ * and the title top/bottom edges so the caller doesn't have to redo
+ * the arithmetic.  When `title` is null the title-related fields are
+ * `null`.
  *
  * @param {{ staffMaxY: number, staffMinY: number, contentMaxY: number, contentMinY: number }} bounds
  * @param {string|null} title
  * @param {string|null} composer
  * @returns {{
- *   pad: number,
+ *   padAbove: number,
+ *   padBelow: number,
  *   block: { width: number, height: number, hasComposer: boolean },
  *   paperTopY: number,
  *   paperBottomY: number,
@@ -155,30 +155,36 @@ export function computePageMargins(bounds, title, composer) {
   const contentMaxY = bounds.contentMaxY ?? staffMaxY;
   const contentMinY = bounds.contentMinY ?? staffMinY;
 
+  // Independent top/bottom padding: content overhanging below (dynamics,
+  // pedal marks) only inflates the bottom margin, not the title spacing.
   const overhangAbove = Math.max(0, contentMaxY - staffMaxY);
   const overhangBelow = Math.max(0, staffMinY - contentMinY);
-  const pad = Math.max(MIN_PAGE_PADDING, overhangAbove, overhangBelow);
+  const padAbove = Math.max(MIN_PAGE_PADDING, overhangAbove);
+  const padBelow = Math.max(MIN_PAGE_PADDING, overhangBelow);
 
-  const paperBottomY = staffMinY - pad;
+  // Paper bottom clears the lowest content by padBelow.
+  const paperBottomY = contentMinY - padBelow;
+
   if (block.height === 0) {
-    // No title: paper sits symmetrically around the staff.
+    // No title: paper top clears the highest content by padAbove.
     return {
-      pad,
+      padAbove,
+      padBelow,
       block,
-      paperTopY: staffMaxY + pad,
+      paperTopY: contentMaxY + padAbove,
       paperBottomY,
       titleTopY: null,
       titleBottomY: null,
     };
   }
-  // With a title: title sits one `pad` above the staff and the
-  // paper extends another `pad` above the title — yielding three
-  // equal gaps top-to-bottom.
-  const titleBottomY = staffMaxY + pad;
+  // With a title: title sits padAbove above the topmost staff line;
+  // paper extends another padAbove above the title.
+  const titleBottomY = staffMaxY + padAbove;
   const titleTopY = titleBottomY + block.height;
-  const paperTopY = titleTopY + pad;
+  const paperTopY = titleTopY + padAbove;
   return {
-    pad,
+    padAbove,
+    padBelow,
     block,
     paperTopY,
     paperBottomY,
