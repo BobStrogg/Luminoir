@@ -22,196 +22,204 @@ import { ElementProxy } from './ElementProxy.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
 
 /* ------------------------------------------------------------------ */
-/*  Adaptive quality                                                   */
+/*  GPU quality — load-time probe + runtime pressure                  */
 /* ------------------------------------------------------------------ */
 
 /**
- * Four-tier automatic quality degrader.
+ * Two-phase GPU quality system.
  *
- * Uses the rAF-to-rAF interval (`_frameMsRing`) — the true wall-clock
- * frame time including GPU execution — as its pressure signal.  The
- * degrader learns the display's baseline refresh interval from the first
- * 90 rAF ticks of playback so it adapts automatically to 60 Hz, 90 Hz,
- * 120 Hz and ProMotion displays without hard-coded thresholds.
+ * **Phase 1 — load-time probe** (`_probeGpuCost`, called once during
+ * `handleInit`):
+ *   Renders the empty scene (paper + lights, no score geometry) several
+ *   times and measures wall-clock time.  From that cost it picks the
+ *   highest shadow-map resolution that keeps a single frame under the
+ *   target budget, then sets shadow mapSize, DPR, and PCF type once.
+ *   These settings never change again during the session — no mid-session
+ *   dispose, no resolution pop, no shadow-map flicker.
  *
- * Once the baseline is established:
- *   • "Overrun" (step DOWN):  p95 frame interval > baseline × 1.5
- *     (i.e. GPU is missing more than every other vsync — the scene is
- *     truly GPU-bound).  Step down after 1 s of sustained overrun.
- *   • "Underrun" (step UP):   p95 frame interval < baseline × 1.15
- *     (smooth headroom).  Step up only after 3 s so a quiet passage
- *     doesn't immediately snap back just to degrade again.
+ *   The probe runs in parallel with the Verovio WASM parse of the first
+ *   score, so it adds zero latency to the perceived load time.
  *
- * During the calibration window (first 90 rAF ticks after playback
- * starts) the degrader holds at its current tier so a cold-start
- * spike doesn't trigger an immediate step-down.
+ * **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
+ *   A 0→1 float that rises when frames are over-budget and falls when
+ *   there is headroom.  It is used only to smoothly scale
+ *   `SceneConfig.lightBall.intensity` (the point-light contribution of
+ *   the bouncing balls).  `LightBallController.update()` reads that
+ *   field every frame, so the change takes effect on the very next tick
+ *   with no visual artifact — the lights gently dim under pressure and
+ *   recover when the load eases.
  *
- * **Tiers**  (index 0 = highest quality, 3 = lowest)
+ *   Changing light intensity is the only runtime-safe knob: shadow map
+ *   size, DPR, and PCF type all require a dispose / reallocate that
+ *   causes a blank or flickery frame, so they are load-time only.
  *
- *   0 — Full:   shadowMap 6144², DPR cap 2.0, PCF Soft.
- *   1 — High:   shadowMap 4096², DPR cap 1.75, PCF Soft.
- *   2 — Medium: shadowMap 2048², DPR cap 1.5,  PCF.
- *   3 — Low:    shadowMap 1024², DPR cap 1.25, PCF.
- *
- * Mobile devices start at Tier 2 (set in `handleInit`) so the degrader
- * can still fall to Tier 3 on extremely dense scores, or recover to Tier 1
- * if load is consistently light.
- *
- * The degrader is disabled when `autoDegrade` is false — quality stays
- * pinned at whichever tier it was last set to (including the mobile
- * starting tier) until re-enabled.
+ * Calibration:
+ *   The baseline rAF interval is measured from the first 30 play-session
+ *   ticks (≈ 250 ms at 120 Hz) using the p10 percentile, so thresholds
+ *   adapt automatically to 60/90/120 Hz and ProMotion displays.
  */
-class _AdaptiveQuality {
-  /** @param {number} initialTier  Starting tier index (0–3). */
-  constructor(initialTier = 0) {
-    this.tier = initialTier;
-    this.enabled = true;
-    /** Seconds of continuous overrun before we step down. */
-    this._downSec = 1.0;
-    /** Seconds of continuous comfortable headroom before we step up. */
-    this._upSec = 3.0;
-    /** Accumulated seconds of consecutive overrun / underrun. */
-    this._overrunAcc = 0;
-    this._underrunAcc = 0;
-    /** Cached device pixel ratio from init so tier changes can compute a
-     *  new DPR without re-querying the main thread. */
-    this._baseDpr = 1;
-    /** Shadow mapSize for each tier. */
-    this._mapSizes = [6144, 4096, 2048, 1024];
-    /** DPR caps for each tier. */
-    this._dprCaps  = [2.0,  1.75, 1.5,  1.25];
-    /** Whether to use PCF Soft (true) or plain PCF (false) per tier. */
-    this._softPcf  = [true, true, false, false];
 
-    // Calibration state — measure the display's baseline rAF interval
-    // from the first N ticks of playback.  We track a running minimum
-    // (the fastest observed interval) because the true vsync period
-    // is the shortest achievable interval; jitter and GC can only make
-    // frames *longer*, never shorter.
-    /** Number of rAF ticks to observe before locking in the baseline. */
-    this._calibTicks  = 90;
-    /** rAF ticks observed so far in the current calibration window. */
-    this._calibCount  = 0;
-    /** Minimum rAF interval observed during calibration (ms).  Initialised
-     *  to a conservative 60 Hz equivalent; updated downward each tick. */
-    this._baselineMs  = 16.67;
-    /** True once `_calibCount >= _calibTicks`. */
-    this._calibrated  = false;
-  }
+/** Baseline rAF interval (ms) learned from the first play session.
+ *  Set once by `_calibrate()`; used by the runtime pressure logic. */
+let _baselineMs = 16.67;
+let _calibrated = false;
+let _calibCount = 0;
+const _CALIB_TICKS = 30;
+const _calibBuf  = new Float64Array(_CALIB_TICKS);
+const _calibSort = new Float64Array(_CALIB_TICKS);
 
-  /**
-   * Call once per rAF tick *before* `update()` to feed a new frame-
-   * interval sample into the calibration window.  Only active during
-   * the first `_calibTicks` ticks after playback starts (or after a
-   * `resetCalibration()` call).  Has no effect once calibrated.
-   * @param {number} frameMs  Latest rAF-to-rAF interval in milliseconds.
-   */
-  calibrate(frameMs) {
-    if (this._calibrated || frameMs <= 0 || frameMs >= 2000) return;
-    // Track the running minimum — vsync periods only get shorter as
-    // the display warms up; any longer sample is jitter.
-    if (frameMs < this._baselineMs) this._baselineMs = frameMs;
-    this._calibCount++;
-    if (this._calibCount >= this._calibTicks) {
-      // Clamp the baseline to the range [6 ms, 20 ms] so a spuriously
-      // short first tick (e.g. two rAFs fired in quick succession at
-      // worker start) doesn't set an impossibly fast baseline.
-      this._baselineMs = Math.max(6, Math.min(20, this._baselineMs));
-      this._calibrated = true;
-    }
-  }
-
-  /** Reset calibration — call when playback stops/restarts so the
-   *  baseline re-measures from the fresh play context. */
-  resetCalibration() {
-    this._calibCount = 0;
-    this._baselineMs = 16.67;
-    this._calibrated = false;
-    this._overrunAcc = 0;
-    this._underrunAcc = 0;
-  }
-
-  /**
-   * Call once per rAF tick.  `dt` is the frame duration in seconds;
-   * `frameP95` is the recent p95 rAF-interval in ms.  Returns the new
-   * tier index if a tier change was made, else -1.
-   *
-   * The decision uses the *calibrated* baseline so the thresholds
-   * adapt to the actual display refresh rate rather than assuming 60 Hz.
-   */
-  update(dt, frameP95) {
-    if (!this.enabled || !this._calibrated) return -1;
-    // Thresholds are relative to the measured baseline:
-    //   highMs = baseline × 1.5 — missing roughly every other vsync.
-    //   lowMs  = baseline × 1.15 — comfortably under budget.
-    const highMs = this._baselineMs * 1.5;
-    const lowMs  = this._baselineMs * 1.15;
-    if (frameP95 >= highMs) {
-      this._underrunAcc = 0;
-      this._overrunAcc += dt;
-      if (this._overrunAcc >= this._downSec && this.tier < 3) {
-        this.tier++;
-        this._overrunAcc = 0;
-        return this.tier;
-      }
-    } else if (frameP95 <= lowMs) {
-      this._overrunAcc = 0;
-      this._underrunAcc += dt;
-      if (this._underrunAcc >= this._upSec && this.tier > 0) {
-        this.tier--;
-        this._underrunAcc = 0;
-        return this.tier;
-      }
-    } else {
-      // In-budget but not strongly under — decay both accumulators
-      // toward zero so a mix of good/bad frames doesn't accumulate.
-      this._overrunAcc  = Math.max(0, this._overrunAcc  - dt * 0.5);
-      this._underrunAcc = Math.max(0, this._underrunAcc - dt * 0.5);
-    }
-    return -1;
-  }
-
-  /** Apply the current tier's settings to `renderer` and `_keyLight`. */
-  apply() {
-    if (!renderer) return;
-    const mapSize = this._mapSizes[this.tier];
-    const dprCap  = this._dprCaps[this.tier];
-    const soft    = this._softPcf[this.tier];
-    // DPR change: setPixelRatio re-allocates the framebuffer at the new
-    // resolution — cheap on the CPU but the next frame will re-upload
-    // the full framebuffer to the GPU.
-    renderer.setPixelRatio(Math.min(this._baseDpr, dprCap));
-    // Shadow map type change: must dispose the old map and let Three.js
-    // re-create it.  Assigning `.type` alone doesn't take effect until
-    // the map is disposed and regenerated.
-    const newType = soft ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
-    if (renderer.shadowMap.type !== newType) {
-      renderer.shadowMap.type = newType;
-    }
-    if (_keyLight && (
-      _keyLight.shadow.mapSize.width  !== mapSize ||
-      _keyLight.shadow.mapSize.height !== mapSize
-    )) {
-      _keyLight.shadow.mapSize.width  = mapSize;
-      _keyLight.shadow.mapSize.height = mapSize;
-      if (_keyLight.shadow.map) {
-        _keyLight.shadow.map.dispose();
-        _keyLight.shadow.map = null;
-      }
-      // Recompute texel size so the key-light snapping stays accurate.
-      const shadowCam = _keyLight.shadow.camera;
-      _keyLightTexelSize.set(
-        (shadowCam.right - shadowCam.left) / mapSize,
-        (shadowCam.top - shadowCam.bottom) / mapSize,
-      );
-    }
-    _markDirty();
+/** Feed one rAF interval sample.  Locks `_baselineMs` after
+ *  `_CALIB_TICKS` samples using the p10 of the collected window. */
+function _calibrate(frameMs) {
+  if (_calibrated || frameMs <= 0 || frameMs >= 2000) return;
+  _calibBuf[_calibCount++] = frameMs;
+  if (_calibCount >= _CALIB_TICKS) {
+    _calibSort.set(_calibBuf);
+    _calibSort.sort();
+    // p10 = index 3 in a 30-element sorted array (floor(30 × 0.10)).
+    // Robust against isolated GC / OS-scheduler spikes; clamp to a
+    // sane range in case the tab is throttled or vsync is locked.
+    _baselineMs = Math.max(6, Math.min(20, _calibSort[Math.floor(_CALIB_TICKS * 0.10)]));
+    _calibrated = true;
   }
 }
 
-/** Module-level degrader instance — created in `handleInit`. */
-/** @type {_AdaptiveQuality | null} */
-let _quality = null;
+/** Reset calibration — call on play-start so baseline re-measures
+ *  from the fresh play context, not stale idle intervals. */
+function _resetCalibration() {
+  _calibCount = 0;
+  _calibBuf.fill(0);
+  _baselineMs = 16.67;
+  _calibrated = false;
+}
+
+/**
+ * 0→1 runtime pressure float.  0 = no pressure (lights at full
+ * intensity); 1 = maximum pressure (lights fully dimmed).
+ * Driven by `_updateRuntimePressure()` in the rAF loop.
+ */
+let _runtimePressure = 0;
+/** Base light intensity saved at init so pressure can scale it. */
+let _baseLightIntensity = 0;
+/** Whether the auto-dim system is enabled (mirrors the Settings toggle). */
+let _autoDimEnabled = true;
+
+/**
+ * Update `_runtimePressure` and apply it to light intensity.
+ * Call once per rAF tick after computing `frameP95`.
+ * @param {number} dt        Frame duration in seconds.
+ * @param {number} frameP95  Recent p95 rAF interval in ms.
+ */
+function _updateRuntimePressure(dt, frameP95) {
+  if (!_autoDimEnabled || !_calibrated) return;
+
+  const highMs = _baselineMs * 1.3;  // > 30 % over budget → build pressure
+  const lowMs  = _baselineMs * 1.15; // comfortably under → release pressure
+
+  if (frameP95 >= highMs) {
+    // Rise toward 1 over ~1 s of sustained overrun.
+    _runtimePressure = Math.min(1, _runtimePressure + dt);
+  } else if (frameP95 <= lowMs) {
+    // Fall back toward 0 over ~3 s of sustained headroom.
+    _runtimePressure = Math.max(0, _runtimePressure - dt / 3);
+  } else {
+    // In-budget but not strongly under — decay slowly so a mix of
+    // good/bad frames doesn't cause visible light flutter.
+    _runtimePressure = Math.max(0, _runtimePressure - dt * 0.15);
+  }
+
+  // Apply to light intensity.  LightBallController reads
+  // SceneConfig.lightBall.intensity every update() call, so writing
+  // here takes effect on the very next frame with no artifacts.
+  SceneConfig.lightBall.intensity = _baseLightIntensity * (1 - _runtimePressure * 0.85);
+}
+
+/**
+ * Probe GPU rendering cost with the empty scene (lights, paper, no
+ * score geometry) by rendering it `count` times synchronously and
+ * returning the median wall-clock time per frame in milliseconds.
+ *
+ * Called once during `handleInit`, before `startRenderLoop`, while the
+ * score worker is busy parsing the first score's Verovio WASM.  On a
+ * fast machine this takes 20–60 ms and is invisible to the user.
+ */
+function _probeGpuCost(count = 5) {
+  if (!renderer || !scene || !camera) return 0;
+  // Warm-up render — don't measure: first call often stalls on driver
+  // JIT / shader cache miss regardless of scene complexity.
+  renderer.render(scene, camera);
+  const times = [];
+  for (let i = 0; i < count; i++) {
+    const t0 = performance.now();
+    renderer.render(scene, camera);
+    times.push(performance.now() - t0);
+  }
+  times.sort((a, b) => a - b);
+  return times[Math.floor(times.length / 2)]; // median
+}
+
+/**
+ * Choose and apply shadow-map size, DPR cap, and PCF type based on the
+ * result of `_probeGpuCost()`.  Called once from `handleInit`.
+ *
+ * Target budget per probe frame = baseline / 2 (leave half the frame
+ * time for geometry + shading once a score is loaded).  For a 120 Hz
+ * display the budget is ~4 ms; for 60 Hz ~8 ms.
+ *
+ * Shadow cost candidates (measured on Apple M2):
+ *   6144² PCFSoft  ≈ 6–8 ms/frame empty scene
+ *   4096² PCFSoft  ≈ 2–4 ms/frame
+ *   2048² PCF      ≈ 0.5–1 ms/frame
+ *   1024² PCF      ≈ 0.2 ms/frame
+ */
+function _applyLoadTimeQuality(probeMs, baseDpr, isMobile) {
+  // On mobile the rAF rate halves permanently the first time a frame
+  // exceeds budget, so we are extremely conservative.
+  if (isMobile) {
+    _setShadowQuality(2048, false, baseDpr, 1.5);
+    return;
+  }
+  // For desktop, pick the highest quality that fits half the frame budget.
+  // Probe was done on empty scene; real scene costs more, so the half-
+  // budget target provides headroom for geometry + shading.
+  if (probeMs < 2) {
+    // Very fast GPU (M3/M4, dedicated GPU) — full quality.
+    _setShadowQuality(6144, true, baseDpr, 2.0);
+  } else if (probeMs < 5) {
+    // Typical Apple Silicon or recent integrated GPU.
+    _setShadowQuality(4096, true, baseDpr, 1.75);
+  } else {
+    // Slower integrated GPU — drop to 2048 with plain PCF.
+    _setShadowQuality(2048, false, baseDpr, 1.5);
+  }
+}
+
+/** Apply shadow quality and DPR settings.  Must be called before
+ *  the render loop starts so there is no mid-session dispose. */
+function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
+  if (!renderer || !_keyLight) return;
+  renderer.shadowMap.type = softPcf
+    ? THREE.PCFSoftShadowMap
+    : THREE.PCFShadowMap;
+  renderer.setPixelRatio(Math.min(baseDpr, dprCap));
+  if (_keyLight.shadow.mapSize.width !== mapSize) {
+    _keyLight.shadow.mapSize.width  = mapSize;
+    _keyLight.shadow.mapSize.height = mapSize;
+    if (_keyLight.shadow.map) {
+      _keyLight.shadow.map.dispose();
+      _keyLight.shadow.map = null;
+    }
+    _keyLight.shadow.autoUpdate = true;
+    _lastKeyLightSnapped.x = null;
+    _lastKeyLightSnapped.z = null;
+    const shadowCam = _keyLight.shadow.camera;
+    _keyLightTexelSize.set(
+      (shadowCam.right - shadowCam.left) / mapSize,
+      (shadowCam.top - shadowCam.bottom) / mapSize,
+    );
+  }
+  _markDirty();
+}
 
 /* ------------------------------------------------------------------ */
 /*  Per-worker global state                                            */
@@ -450,13 +458,17 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   scene.add(contentRoot);
   setupLighting(scene, isMobile);
 
-  // Create the adaptive-quality degrader.  Mobile starts at Tier 2
-  // (2048² shadow map, DPR 1.5) so `setupLighting` already applied the
-  // right shadow mapSize; we just record the state here.  Desktop starts
-  // at Tier 0 (full quality).  The degrader will step tiers at runtime
-  // based on actual frame-p95 measurements.
-  _quality = new _AdaptiveQuality(isMobile ? 2 : 0);
-  _quality._baseDpr = devicePixelRatio || 1;
+  // Save base light intensity so the runtime pressure system can scale it.
+  _baseLightIntensity = SceneConfig.lightBall.intensity;
+
+  // Load-time GPU probe — renders the empty scene (lights + paper, no score
+  // geometry) and uses the measured cost to select the highest shadow-map
+  // resolution the GPU can sustain within half the per-frame budget.
+  // Runs synchronously here, while the score worker is busy with Verovio WASM,
+  // so it adds no perceptible latency to the overall load time.
+  const baseDpr  = devicePixelRatio || 1;
+  const probeMs  = _probeGpuCost(5);
+  _applyLoadTimeQuality(probeMs, baseDpr, isMobile);
 
   cameraCtrl = new CameraController(camera, controls);
 
@@ -573,6 +585,13 @@ const _keyLightTexelSize = new THREE.Vector2(0.01, 0.01);
  *  bias so notation casts a visible cast-shadow toward the camera. */
 const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
 
+/** Last texel-snapped X/Z position used to position the key light.
+ *  Stored as a plain pair so `_updateKeyLight` can skip re-rendering
+ *  the shadow map on frames where the light hasn't moved — typically
+ *  every idle frame and every play frame where the playhead stayed
+ *  within the same texel column (≈ 1-2 cm in world units). */
+const _lastKeyLightSnapped = { x: null, z: null };
+
 /** Slide the key directional light and its target to the given world
  *  XZ position (Y = 0 since the paper plane sits there after the
  *  contentRoot rotation).  Called every frame from the render loop
@@ -597,6 +616,27 @@ function _updateKeyLight(x, z) {
   const tz = _keyLightTexelSize.y;
   const xs = Math.round(x / tx) * tx;
   const zs = Math.round(z / tz) * tz;
+
+  // Disable automatic per-frame shadow re-render so we can drive it
+  // manually.  This is set once on the first call; Three.js WebGPU's
+  // ShadowNode.js respects `shadow.autoUpdate / shadow.needsUpdate`
+  // the same way the classic WebGLShadowMap does (ShadowNode.js:771).
+  if (_keyLight.shadow.autoUpdate) {
+    _keyLight.shadow.autoUpdate = false;
+    // Force the very first shadow render now (the light was just placed
+    // at the initial position; without this the map stays empty until
+    // the camera pans for the first time).
+    _keyLight.shadow.needsUpdate = true;
+  }
+
+  // Skip position update + shadow re-render when the snapped position
+  // hasn't changed — on most frames during playback the playhead moves
+  // less than one texel width per tick, so this fires only once every
+  // several frames rather than every frame.
+  if (xs === _lastKeyLightSnapped.x && zs === _lastKeyLightSnapped.z) return;
+  _lastKeyLightSnapped.x = xs;
+  _lastKeyLightSnapped.z = zs;
+
   _keyLight.target.position.set(xs, 0, zs);
   _keyLight.position.set(
     xs + _KEY_LIGHT_OFFSET.x,
@@ -608,6 +648,9 @@ function _updateKeyLight(x, z) {
   // shadow camera's `lookAt(target.matrixWorld.position)` sees the
   // freshly-set value on the same frame.
   _keyLight.target.updateMatrixWorld();
+  // Request a shadow map re-render for this frame now that the light
+  // has moved to a new texel-grid position.
+  _keyLight.shadow.needsUpdate = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1054,10 +1097,13 @@ function handleClock({ state, musicTime, tempoScale }) {
   };
   if (state === 'playing') {
     if (lightBalls) lightBalls.play();
-    // Reset the AQ calibration window so the baseline is measured from
-    // the first frames of this play session — not from stale rAF ticks
-    // that may have occurred during a paused/idle period.
-    if (_quality) _quality.resetCalibration();
+    // Reset the baseline calibration so it re-measures from the first
+    // frames of this play session — not from stale idle-period rAF ticks.
+    _resetCalibration();
+    // Also flush the play-frame ring so old intervals from before this
+    // play session don't distort the p95 pressure signal.
+    _playFrameMsIdx = 0;
+    _playFrameMsFilled = 0;
   } else if (state === 'paused') {
     if (lightBalls) lightBalls.pause();
   } else if (state === 'stopped') {
@@ -1119,10 +1165,20 @@ let _rendersSkipped = 0;
  *  is a frame actually taking" metric, including GPU execution time
  *  that `renderer.render()`'s submit-time doesn't capture.  A 2 fps
  *  user experience shows up here as ~500 ms intervals even though
- *  submit time is <5 ms. */
+ *  submit time is <5 ms.
+ *  Written on *every* rAF tick (playing + idle) — used by `probe()`
+ *  for the full frame-time histogram in the developer overlay. */
 const _frameMsRing = new Float64Array(120);
 let _frameMsIdx = 0;
 let _frameMsFilled = 0;
+/** Subset of `_frameMsRing` — only records intervals from ticks that
+ *  occur while `clock.state === 'playing'`.  The AQ p95 window reads
+ *  from this ring instead of `_frameMsRing` so that idle frames
+ *  (camera settled, music paused) don't dilute the pressure signal
+ *  and cause the AQ system to see artificially low percentiles. */
+const _playFrameMsRing = new Float64Array(120);
+let _playFrameMsIdx = 0;
+let _playFrameMsFilled = 0;
 /** Pre-allocated scratch buffers for in-place sorting inside the hot
  *  rAF loop and the 500 ms stats heartbeat.  Using typed arrays and
  *  sorting them in-place avoids the `new Array` + `push` allocations
@@ -1183,6 +1239,13 @@ function startRenderLoop() {
       _frameMsRing[_frameMsIdx] = frameMs;
       _frameMsIdx = (_frameMsIdx + 1) % _frameMsRing.length;
       if (_frameMsFilled < _frameMsRing.length) _frameMsFilled++;
+      // Separate ring for AQ: only record play-session frames so that
+      // long idle intervals don't make the p95 look deceptively low.
+      if (clock.state === 'playing') {
+        _playFrameMsRing[_playFrameMsIdx] = frameMs;
+        _playFrameMsIdx = (_playFrameMsIdx + 1) % _playFrameMsRing.length;
+        if (_playFrameMsFilled < _playFrameMsRing.length) _playFrameMsFilled++;
+      }
     }
 
     // --- Animation phase (always runs) -------------------------------
@@ -1267,41 +1330,30 @@ function startRenderLoop() {
       _rendersSkipped++;
     }
 
-    // --- Adaptive quality --------------------------------------------
-    // Uses rAF-to-rAF interval (frameMs) as the pressure signal
-    // because that reflects true GPU execution time — when the GPU
-    // can't finish a frame before the next vsync the browser pushes
-    // the next rAF delivery back, which shows up here as frameMs > 1
-    // vsync period.  CPU-side render-submit time (renderMs) is NOT a
-    // reliable signal for GPU pressure: on WebGL, draw calls return
-    // immediately; on WebGPU, command encoding completes in 2-4 ms
-    // even when the GPU won't finish for 20 ms.
+    // --- Runtime pressure (light dimming) ----------------------------
+    // Uses rAF-to-rAF interval as the GPU pressure signal; only fires
+    // once the baseline has been calibrated from play-session frames.
+    // Also feeds the calibration window while playing.
     //
-    // The degrader calibrates the baseline vsync interval from the
-    // first 90 rAF ticks of each play session before making any tier
-    // decisions, so it auto-adapts to 60/90/120 Hz displays.
-    //
-    // Only runs while music is playing; the idle render gate already
-    // prevents unnecessary GPU work in paused/stopped state.
-    if (_quality && clock.state === 'playing' && _frameMsFilled > 0) {
-      // Feed the latest frame interval into the calibration window.
-      _quality.calibrate(frameMs);
-      const wantAq = Math.min(_frameMsFilled, 60);
-      // Write directly into the pre-allocated scratch typed array —
-      // no heap allocation per frame, no minor-GC trigger.
+    // Unlike the old tier system this does NOT change shadow map size,
+    // DPR, or PCF type at runtime — those are set once by the load-time
+    // probe and never touched again, eliminating all mid-session flicker.
+    // The only runtime adjustment is smoothly scaling light-ball intensity
+    // via SceneConfig.lightBall.intensity, which LightBallController reads
+    // every frame with no reallocation.
+    if (_playFrameMsFilled > 0) {
+      // Calibration: only feeds play-session rAF intervals.
+      if (clock.state === 'playing') _calibrate(frameMs);
+      // Compute p95 over the play-frame ring — same logic as before,
+      // no heap allocation.
+      const wantAq = Math.min(_playFrameMsFilled, 60);
       for (let i = 0; i < wantAq; i++) {
-        const idx = (_frameMsIdx - 1 - i + _frameMsRing.length) % _frameMsRing.length;
-        _aqScratch[i] = _frameMsRing[idx];
+        const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
+        _aqScratch[i] = _playFrameMsRing[idx];
       }
-      // Sort only the filled slice (subarray view, no copy).
       _aqScratch.subarray(0, wantAq).sort();
       const aqP95 = _aqScratch[Math.min(wantAq - 1, Math.floor(wantAq * 0.95))];
-      const newTier = _quality.update(dt, aqP95);
-      if (newTier >= 0) {
-        _quality.apply();
-        // Notify main thread so the Settings panel can show the active tier.
-        post({ type: 'qualityTier', tier: newTier });
-      }
+      _updateRuntimePressure(dt, aqP95);
     }
 
     // --- Stats heartbeat ---------------------------------------------
@@ -1366,19 +1418,32 @@ function _postStats() {
   }
   const rMean = rLen > 0 ? rSum / Math.min(rLen, 60) : 0;
 
+  // Compute play-frame p95 for the pressure diagnostic.
+  let playP95 = 0;
+  if (_playFrameMsFilled > 0) {
+    const pWant = Math.min(_playFrameMsFilled, 60);
+    for (let i = 0; i < pWant; i++) {
+      const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
+      _statsScratch[i] = _playFrameMsRing[idx];
+    }
+    _statsScratch.subarray(0, pWant).sort();
+    playP95 = _statsScratch[Math.min(pWant - 1, Math.floor(pWant * 0.95))];
+  }
+
   post({
     type: 'stats',
     fps,
     frameMs: fMean,
     frameMsMax: fMax,
+    frameMsP95: playP95,
     renderMs: rMean,
     renderMsP95: rP95,
     renderMsMax: rMax,
     rendering: _dirty || clock.state === 'playing',
-    qualityTier: _quality ? _quality.tier : 0,
-    autoDegrade: _quality ? _quality.enabled : false,
-    aqCalibrated: _quality ? _quality._calibrated : true,
-    aqBaselineMs: _quality ? _quality._baselineMs : 0,
+    autoDegrade: _autoDimEnabled,
+    gpuPressure: _runtimePressure,
+    aqBaselineMs: _baselineMs,
+    aqCalibrated: _calibrated,
   });
 }
 
@@ -1412,16 +1477,22 @@ const _camTarget = new THREE.Vector3();
  */
 function handleUpdateConfig({ updates }) {
   if (!updates || typeof updates !== 'object') return;
-  // `autoDegrade` is a pure-worker flag — not stored in SceneConfig —
-  // handled before the generic dot-path loop.
-  if ('autoDegrade' in updates && _quality) {
-    const wasEnabled = _quality.enabled;
-    _quality.enabled = !!updates.autoDegrade;
-    if (!wasEnabled && _quality.enabled) {
-      // Re-enabling: reset calibration so stale rAF intervals from the
-      // disabled period don't set a misleading baseline or cause an
-      // immediate tier jump.
-      _quality.resetCalibration();
+  // Pure-worker flags — not stored in SceneConfig — handled before
+  // the generic dot-path loop.
+  if ('autoDegrade' in updates) {
+    const wasEnabled = _autoDimEnabled;
+    _autoDimEnabled = !!updates.autoDegrade;
+    if (!wasEnabled && _autoDimEnabled) {
+      // Re-enabling after a manual disable: reset calibration so stale
+      // rAF intervals from the disabled period don't seed a misleading
+      // baseline.  Also restore full light intensity immediately.
+      _resetCalibration();
+      _runtimePressure = 0;
+      SceneConfig.lightBall.intensity = _baseLightIntensity;
+    } else if (!_autoDimEnabled) {
+      // Disabling: restore full intensity so lights snap back.
+      _runtimePressure = 0;
+      SceneConfig.lightBall.intensity = _baseLightIntensity;
     }
   }
   let cameraDirty = false;

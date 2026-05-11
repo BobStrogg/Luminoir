@@ -81,5 +81,5 @@ export const OPTIMIZATIONS = {
 
   // Render-loop optimisations (renderWorker)
   PRECOMPILE_PIPELINES: true,
-  RENDER_BUDGET_SKIP: false,
+  RENDER_BUDGET_SKIP: true,
 };

@@ -653,24 +653,23 @@ html, body {
 }
 
 /* Adaptive-quality row inside the Renderer section.
- * `.settings-aq-ctrl` holds the checkbox + tier label inline.
- * `.settings-aq-tier` is a small pill reflecting the active tier. */
+ * `.settings-aq-ctrl` holds the checkbox + pressure dot inline.
+ * `.settings-aq-pressure` is a small circle whose colour reflects
+ * current GPU pressure (green → amber → red). */
 .settings-aq-ctrl {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.settings-aq-tier {
-  padding: 2px 8px;
-  background: rgba(160, 220, 255, 0.08);
-  border: 1px solid rgba(160, 220, 255, 0.15);
-  border-radius: 6px;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: 0.70rem;
-  color: #a0d8ff;
-  letter-spacing: 0.04em;
-  user-select: none;
+.settings-aq-pressure {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: rgb(0, 180, 40);
+  opacity: 0.3;
+  flex-shrink: 0;
+  transition: background 0.6s ease, opacity 0.6s ease;
   pointer-events: none;
 }
 
