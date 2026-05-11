@@ -936,19 +936,30 @@ export class SVGSceneParser {
       }
     }
 
-    // Other elements: glyph (<use>) entries have a tight bbox that's
-    // close to their position — including just `(x, y)` is good
-    // enough.  Path entries go through `trackPath` so their full
-    // visual extent contributes (pedal markers below the bass staff,
-    // octave brackets above the treble, system braces spanning all
-    // staves, etc.) without polluting the bounds with the (0.5, -0.5)
-    // ancestor translate carried by stem-like absolute-coord paths.
+    // Other elements: glyph (<use>) entries are tracked by their full
+    // path bounding box (scaled by glyphUseScale) so that wide glyphs
+    // like dynamics ("mf", "ff") don't overhang the paper edge.
+    // Path entries go through `trackPath` so their full visual extent
+    // contributes (pedal markers below the bass staff, octave brackets
+    // above the treble, system braces spanning all staves, etc.)
+    // without polluting the bounds with the (0.5, -0.5) ancestor
+    // translate carried by stem-like absolute-coord paths.
+    const glyphWorldScale = SceneConfig.scale * SceneConfig.glyphUseScale;
     for (const el of out.otherElements) {
       if (el.isLine) {
         track(el.x1, el.y1);
         track(el.x2, el.y2);
       } else if (el.glyphPath) {
-        track(el.x, el.y);
+        // Glyph paths use uniform positive-Y scaling (no Y flip):
+        //   world = (el.x + glyph.x × glyphWorldScale,
+        //            el.y + glyph.y × glyphWorldScale)
+        const bb = _pathBBox(el.glyphPath);
+        if (bb) {
+          track(el.x + bb.minX * glyphWorldScale, el.y + bb.minY * glyphWorldScale);
+          track(el.x + bb.maxX * glyphWorldScale, el.y + bb.maxY * glyphWorldScale);
+        } else {
+          track(el.x, el.y);
+        }
       } else if (el.d) {
         trackPath(el.d, el.x, el.y);
       }

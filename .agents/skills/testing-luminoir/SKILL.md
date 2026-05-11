@@ -13,9 +13,11 @@ Luminoir is a browser-based 3D sheet music visualization app using Three.js, Ver
 ## App UI Layout
 
 - **Top-left**: Score dropdown selector + playback controls (upload, stop, play/pause)
-- **Top-right**: Settings gear icon (opens settings panel) + "WebGPU" badge
+- **Top-right**: Settings gear icon (opens settings panel)
 - **Main area**: 3D rendered sheet music with interactive camera (OrbitControls)
-- **Settings panel**: Playback speed, audio sync, smart camera toggle + sliders, light ball settings
+- **Settings panel**: Playback speed, audio sync, smart camera toggle + sliders, light ball settings,
+  notation show/hide checkboxes, Renderer section (active backend + Switch button +
+  Auto-degrade quality checkbox + tier pill), About section
 
 ## Key Testing Scenarios
 
@@ -49,6 +51,29 @@ Luminoir is a browser-based 3D sheet music visualization app using Three.js, Ver
 - After portrait test, re-maximize with `wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz`
 - Smart camera orbit is subtle — wait at least 5-6 seconds of playback to see clear movement
 - The camera jump fix is best tested by dragging to an extreme angle (e.g., below the score) during playback, then releasing
+
+### Adaptive quality
+
+- Open Settings → scroll to Renderer section → "Auto-degrade quality" checkbox should be checked by default
+- The tier pill next to the checkbox shows `Full` / `High` / `Medium` / `Low`
+- On mobile (or a device struggling with the default 6144² shadow map) the tier should
+  eventually step from `Full` toward `Low` during busy Jupiter playback
+- Unchecking the toggle sends `updateConfig({ autoDegrade: false })` to the worker;
+  the tier pill should stop changing
+
+### Played-note glow (WebGL)
+
+- Use `?renderer=webgl` URL param to force the WebGL path
+- Play a score; played notes should glow gold / cyan / violet / green
+- If they show no glow (look identical to unplayed notes), check `Materials.js`
+  `onBeforeCompile` fragment injection — the guard must be `#ifdef USE_COLOR`,
+  not `#ifdef USE_INSTANCING_COLOR`
+
+### Renderer badge
+
+- The "WebGPU" / "WebGL" active backend label is now inside the Settings panel
+  (Renderer section), not a top-bar overlay badge
+- On narrow mobile viewport the gear icon should be fully visible (not clipped)
 
 ## Devin Secrets Needed
 

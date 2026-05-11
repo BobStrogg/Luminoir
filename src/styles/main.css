@@ -67,6 +67,21 @@ html, body {
   to { transform: rotate(360deg); }
 }
 
+/* Error state: stop the spinner animation and recolour it red so the
+ * user immediately sees something went wrong rather than an endless
+ * loading loop. */
+.spinner.error {
+  animation: none;
+  border-color: rgba(255, 80, 80, 0.25);
+  border-top-color: rgba(255, 80, 80, 0.85);
+}
+
+/* Error text in the loading overlay — brighter than the default muted
+ * colour so it stands out as an actionable message, not just status. */
+.overlay .loading-content p.error-text {
+  color: #ff9090;
+}
+
 /* Controls bar
  *
  * Pinned to the top-left of the viewport.  The score (after the
@@ -635,6 +650,28 @@ html, body {
   font-size: 0.72rem;
   line-height: 1.5;
   color: #9999b0;
+}
+
+/* Adaptive-quality row inside the Renderer section.
+ * `.settings-aq-ctrl` holds the checkbox + tier label inline.
+ * `.settings-aq-tier` is a small pill reflecting the active tier. */
+.settings-aq-ctrl {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-aq-tier {
+  padding: 2px 8px;
+  background: rgba(160, 220, 255, 0.08);
+  border: 1px solid rgba(160, 220, 255, 0.15);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.70rem;
+  color: #a0d8ff;
+  letter-spacing: 0.04em;
+  user-select: none;
+  pointer-events: none;
 }
 
 /* About section — static credits block.  Sits above the reset

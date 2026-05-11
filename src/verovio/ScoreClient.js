@@ -27,6 +27,10 @@ export class ScoreClient {
    * receive a `loadXML` / `loadMXL` request — typically ~150–250 ms
    * after construction (one-off cost; subsequent score loads don't
    * pay it again).
+   *
+   * Rejects if the worker crashes before it can respond (e.g. the
+   * browser blocked the worker's module imports due to a CORS /
+   * private-address-space restriction on a non-localhost origin).
    */
   async init() {
     if (this._readyPromise) return this._readyPromise;
@@ -36,12 +40,23 @@ export class ScoreClient {
     this._worker.onmessage = (e) => this._onMessage(e.data);
     this._worker.onerror = (err) => {
       console.error('[ScoreClient] worker error:', err);
-      // Reject any in-flight requests so the UI can recover instead of
-      // hanging forever.
+      // The worker's module failed to load — most commonly because
+      // Chrome blocks ES-module workers on non-localhost HTTP origins
+      // (private-address-space CORS policy).  Use localhost or HTTPS.
+      const isLocalhost = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+      const hint = !isLocalhost && location.protocol === 'http:'
+        ? ' (try opening via localhost instead of a LAN hostname)'
+        : '';
+      const error = new Error(`score worker crashed${hint}`);
+      // Reject any in-flight requests (including the init promise)
+      // so the UI can surface the error instead of hanging forever.
       for (const { reject } of this._pending.values()) {
-        reject(new Error(err.message || 'score worker crashed'));
+        reject(error);
       }
       this._pending.clear();
+      // Clear _readyPromise so a future init() call gets a fresh attempt
+      // rather than re-returning the stale rejected promise.
+      this._readyPromise = null;
     };
     this._readyPromise = this._send('init');
     return this._readyPromise;

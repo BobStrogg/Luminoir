@@ -81,7 +81,12 @@ export class LuminoirApp {
     await this.scoreClient.init();
 
     setStatus('Initialising 3D renderer...');
-    await this.render.init(canvas);
+    try {
+      await this.render.init(canvas);
+    } catch (e) {
+      console.error('[Luminoir] Renderer init failed:', e);
+      throw new Error('3D renderer unavailable — WebGL / WebGPU could not start in this browser session.');
+    }
 
     // Apply any persisted playback-speed value before the first score
     // loads.  SettingsPanel hydrates SceneConfig from localStorage in

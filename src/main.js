@@ -119,6 +119,13 @@ async function main() {
     }
   } catch (err) {
     console.error('[Luminoir] Initialization failed:', err);
+    // Stop the spinner and show the error prominently.  The overlay
+    // stays visible (no fade-out) so the user sees the message rather
+    // than an empty black canvas.
+    const overlay = document.getElementById('loading-overlay');
+    const spinner = overlay?.querySelector('.spinner');
+    if (spinner) spinner.classList.add('error');
+    if (loadingText) loadingText.classList.add('error-text');
     setStatus(`Error: ${err.message}`);
   }
 }
