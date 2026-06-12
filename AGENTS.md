@@ -9,13 +9,35 @@ Browser-based 3D sheet-music visualisation.  Three.js/WebGPU, Verovio WASM, Web 
 ```bash
 pnpm install          # install deps
 pnpm dev              # dev server → http://localhost:5173
-VITE_HTTPS=1 pnpm dev # dev server → https://<lan-host>:5173 (self-signed cert, for LAN access)
+pnpm dev:lan          # dev server → https://<lan-host>:5173 (mkcert cert, for LAN access)
 pnpm build            # production build → dist/
 pnpm test             # Playwright e2e tests (requires running dev server)
 ```
 
 `package.json` `packageManager` field pins the exact pnpm version.  If `corepack enable`
 fails (signature validation errors), use `npm install -g pnpm@<version>` directly.
+
+### LAN HTTPS setup (one-time, per machine)
+
+Chrome's Private Network Access policy blocks subresource loads from `.local` hostnames
+over plain HTTP.  `pnpm dev:lan` serves over HTTPS using a mkcert-issued cert.
+
+**Server machine (this Mac) — one-time:**
+```bash
+brew install mkcert nss   # nss = Firefox support
+mkcert -install           # installs root CA into macOS Keychain (requires password)
+# Regenerate cert if hostname/IP changes:
+mkcert -cert-file .certs/cert.pem -key-file .certs/key.pem \
+  localhost MacBook-Pro.local 192.168.1.110
+```
+
+The `.certs/` directory is `.gitignore`d — never committed.
+
+**Remote devices — one-time per device:**
+- **macOS/iOS**: AirDrop or email `$(mkcert -CAROOT)/rootCA.pem` → open → trust in Settings.
+- **Android/Chrome**: Settings → Security → Install certificate → CA certificate → select `rootCA.pem`.
+- **Windows**: Double-click `rootCA.pem` → Install → Trusted Root Certification Authorities.
+- **Quickest fallback**: Just visit `https://MacBook-Pro.local:5173` and click "Advanced → Proceed anyway" once per browser — no CA import needed, but you'll see a warning.
 
 ---
 

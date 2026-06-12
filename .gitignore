@@ -3,6 +3,9 @@ dist
 .DS_Store
 *.local
 
+# mkcert TLS certs for local LAN dev — never commit private keys
+.certs/
+
 # Editor / IDE
 .vscode
 .idea

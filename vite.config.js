@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
-import basicSsl from '@vitejs/plugin-basic-ssl';
+import fs from 'fs';
+import path from 'path';
 
 /**
  * Vite config.
@@ -28,21 +29,34 @@ import basicSsl from '@vitejs/plugin-basic-ssl';
  * eliminate the race.
  *
  * Running the dev server over HTTPS removes the PNA preflight entirely
- * (PNA only applies to HTTP→private-network).  Set `VITE_HTTPS=1`
- * when starting the server for LAN access:
+ * (PNA only applies to HTTP→private-network).  Use:
  *
- *   VITE_HTTPS=1 pnpm dev
+ *   pnpm dev:lan
  *
- * The self-signed cert will trigger a browser warning on first visit;
- * clicking through once per browser is sufficient.  Plain `pnpm dev`
- * (no env var) stays on HTTP for local localhost development so HMR
- * websocket behaviour is unaffected.
+ * This uses a mkcert-issued cert from `.certs/` (trusted by all local
+ * browsers after `mkcert -install` is run once on this machine).  If
+ * the cert files are absent, Vite falls back to the @vitejs/plugin-basic-ssl
+ * auto-generated self-signed cert (requires a one-time click-through).
+ * Regenerate the cert with:
+ *
+ *   mkcert -cert-file .certs/cert.pem -key-file .certs/key.pem \
+ *     localhost MacBook-Pro.local 192.168.1.110
+ *
+ * Plain `pnpm dev` (no env var) stays on HTTP for local localhost
+ * development so HMR websocket behaviour is unaffected.
  */
+
+import basicSsl from '@vitejs/plugin-basic-ssl';
 
 const useHttps = !!process.env.VITE_HTTPS && !process.env.GITHUB_ACTIONS;
 
+// Use mkcert cert files if present, otherwise fall back to basicSsl plugin.
+const certPath = path.resolve('.certs/cert.pem');
+const keyPath  = path.resolve('.certs/key.pem');
+const hasMkcert = useHttps && fs.existsSync(certPath) && fs.existsSync(keyPath);
+
 export default defineConfig({
-  plugins: useHttps ? [basicSsl()] : [],
+  plugins: useHttps && !hasMkcert ? [basicSsl()] : [],
   base: process.env.GITHUB_ACTIONS ? '/Luminoir/' : '/',
   root: '.',
   publicDir: 'public',
@@ -62,7 +76,9 @@ export default defineConfig({
     // Vite 5+ blocks requests from unknown Hosts by default; allow any so
     // mDNS hostnames (e.g. `macbook-pro.local`) and other LAN devices work.
     allowedHosts: true,
-    https: useHttps,
+    https: hasMkcert
+      ? { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) }
+      : useHttps || undefined,
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',
