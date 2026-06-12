@@ -146,11 +146,19 @@ export class SVG3DBuilder {
       // offset them back into the note-local frame.  See `_buildNote` below
       // for the full derivation.  These use `_noteMat` (dark base) and
       // don't get recoloured on playback.
+      //
+      // `lodDetail: true` — these are exactly the "small per-note
+      // decorations (child paths — stems, flags, ledger lines)" that
+      // `OPTIMIZATIONS.LOD_DISTANT_ELEMENTS` is documented to skip
+      // when the camera is beyond `LOD_DISTANCE_THRESHOLD`.  The tag
+      // flows through the bucket onto the emitted meshes' `userData`,
+      // where the render worker's per-frame LOD pass gates visibility.
       const offX = (note.ancestorX ?? 0) - note.x;
       const offY = (note.ancestorY ?? 0) - note.y;
       for (const d of note.childPaths) {
         this._bucketGlyph(glyphBuckets, d, SceneConfig.extrusionDepth * 0.5,
-          this._noteMat, 'path', note.x + offX, note.y + offY, SceneConfig.noteElevation);
+          this._noteMat, 'path', note.x + offX, note.y + offY, SceneConfig.noteElevation,
+          null, 0, true);
       }
     }
 
@@ -195,6 +203,12 @@ export class SVG3DBuilder {
       const attached = NOTE_ATTACHED_TYPES.has(el.type);
       const mat = attached ? this._noteMat : this._otherMat;
       const z = attached ? SceneConfig.noteElevation : SceneConfig.otherElementsElevation;
+      // Stems and flags are the per-note detail class the LOD pass can
+      // hide at distance.  Beams are deliberately NOT tagged: they're
+      // thick horizontal bars that remain clearly visible well past
+      // the LOD threshold, and hiding them would visibly change the
+      // music's texture at moderate zoom-outs.
+      const lodDetail = el.type === 'stem' || el.type === 'flag';
       if (el.isLine) {
         // Beam bars (and any future axis-aligned quad elements) are
         // emitted by the parser as `isLine: true` with a thickness.
@@ -212,13 +226,13 @@ export class SVG3DBuilder {
           el.x1, el.y1, el.x2, el.y2,
           thickness,
           SceneConfig.notationDepth,
-          z);
+          z, lodDetail);
       } else if (el.glyphPath) {
         this._bucketGlyph(glyphBuckets, el.glyphPath, SceneConfig.extrusionDepth * 0.8,
-          mat, 'glyph', el.x, el.y, z, null, el.rotation || 0);
+          mat, 'glyph', el.x, el.y, z, null, el.rotation || 0, lodDetail);
       } else if (el.d) {
         this._bucketGlyph(glyphBuckets, el.d, SceneConfig.extrusionDepth * 0.5,
-          mat, 'path', el.x, el.y, z, null, el.rotation || 0);
+          mat, 'path', el.x, el.y, z, null, el.rotation || 0, lodDetail);
       }
     }
 
@@ -275,18 +289,35 @@ export class SVG3DBuilder {
     );
     for (const bucket of glyphBuckets.values()) {
       const isNoteHead = bucket.material === this._noteHeadMat;
+      // World-unit footprint of one glyph instance — instance matrices
+      // for glyphs are pure translations, so the shared geometry's
+      // bounding box IS the world size.  The runtime LOD pass uses
+      // this for `DISTANCE_CLIP_GLYPHS` sub-pixel culling.
+      if (!bucket.geometry.boundingBox) bucket.geometry.computeBoundingBox();
+      const bb = bucket.geometry.boundingBox;
+      const lodSize = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y);
       this._emitInstancedChunks(
         root, bucket.geometry, bucket.material, bucket.matrices,
         CULL_CHUNK_WIDTH,
         isNoteHead ? noteHeadDefault : null,
         isNoteHead ? bucket.noteIds : null,
         isNoteHead ? noteMeshMap : null,
+        { lodSize, lodDetail: !!bucket.lodDetail },
       );
     }
 
     // --- Emit one InstancedMesh per box bucket -------------------------
     for (const bucket of boxBuckets.values()) {
-      this._emitInstancedChunks(root, this._unitBox, bucket.material, bucket.matrices, CULL_CHUNK_WIDTH);
+      // Box lines use their largest cross-section width as the LOD
+      // size: a line vanishes visually when its *thin* axis goes
+      // sub-pixel, regardless of its length.  Only detail-tagged line
+      // buckets (stems) participate; structural lines (staff, bar,
+      // beams) carry lodDetail=false and are never hidden by the
+      // distance rule — for them lodSize=0 also disables sub-pixel
+      // culling, keeping the page structure visible at any zoom.
+      this._emitInstancedChunks(root, this._unitBox, bucket.material, bucket.matrices, CULL_CHUNK_WIDTH,
+        null, null, null,
+        { lodSize: bucket.lodDetail ? bucket.lodSize : 0, lodDetail: !!bucket.lodDetail });
     }
 
     // --- Paper backdrop ---
@@ -465,8 +496,13 @@ export class SVG3DBuilder {
    *   so the wavy arpeggio symbol renders standing upright next to its
    *   chord rather than lying flat.  Skipped (zero) for the common
    *   case so unrotated glyphs don't pay an extra matrix multiply.
+   * @param {boolean=} lodDetail Marks this element as a small per-note
+   *   decoration (stem / flag / ledger line) for the
+   *   `LOD_DISTANT_ELEMENTS` runtime pass — the emitted mesh's
+   *   `userData.lodDetail` lets the render worker hide the bucket
+   *   beyond `LOD_DISTANCE_THRESHOLD`.
    */
-  _bucketGlyph(buckets, pathD, depth, material, kind, x, y, z, noteId = null, rotation = 0) {
+  _bucketGlyph(buckets, pathD, depth, material, kind, x, y, z, noteId = null, rotation = 0, lodDetail = false) {
     // Path-kind paths (stems, ledger lines, etc.) that are plain line
     // segments go through the line-detection fast path.
     if (OPTIMIZATIONS.STEM_DEDUP && kind === 'path' && !rotation) {
@@ -487,7 +523,7 @@ export class SVG3DBuilder {
           // 8-px-wide cross-section matching the staff-line style;
           // Z thickness is the shared `notationDepth` so simple
           // stems sit at the same depth as every other element.
-          0.007, SceneConfig.notationDepth, z);
+          0.007, SceneConfig.notationDepth, z, lodDetail);
         return;
       }
     }
@@ -496,9 +532,14 @@ export class SVG3DBuilder {
     if (!bucket) {
       const geometry = this._makeExtrudedGeometry(pathD, depth, kind);
       if (!geometry) return;
-      bucket = { geometry, material, matrices: [], noteIds: [], kind };
+      bucket = { geometry, material, matrices: [], noteIds: [], kind, lodDetail: false };
       buckets.set(key, bucket);
     }
+    // A bucket counts as "detail" if any contributor tags it — stems /
+    // flags routed via note childPaths and via `otherElements` share
+    // path-d buckets, and both classes are the small per-note
+    // decorations the LOD pass targets.
+    if (lodDetail) bucket.lodDetail = true;
     // Compose translate × rotateZ when rotation is requested; the plain
     // translate path is the hot one (every notehead, beam, stem, …)
     // so we keep its makeTranslation fast-path.
@@ -534,17 +575,26 @@ export class SVG3DBuilder {
    * `SceneConfig.noteElevation` for stems) puts them in the same
    * plane as their owning note.
    */
-  _bucketBoxLine(buckets, material, x1, y1, x2, y2, widthAcross, depth, zElevation) {
+  _bucketBoxLine(buckets, material, x1, y1, x2, y2, widthAcross, depth, zElevation, lodDetail = false) {
     const dx = x2 - x1;
     const dy = y2 - y1;
     const len = Math.hypot(dx, dy);
     if (len < 0.001) return;
-    const key = material.uuid;
+    // Detail-tagged lines (simple-line stems rerouted from
+    // `_bucketGlyph`) get their own bucket, separate from structural
+    // lines that share the same material (beams also use `_noteMat`).
+    // Costs at most one extra InstancedMesh per material, and lets
+    // the LOD pass hide *just* the stems beyond the distance
+    // threshold while beams / staff lines / bar lines stay visible.
+    const key = material.uuid + (lodDetail ? ':detail' : '');
     let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { material, matrices: [] };
+      bucket = { material, matrices: [], lodDetail, lodSize: 0 };
       buckets.set(key, bucket);
     }
+    // Track the *largest* cross-section in the bucket — sub-pixel
+    // culling must only fire when even the widest member is invisible.
+    if (widthAcross > bucket.lodSize) bucket.lodSize = widthAcross;
     const m = new THREE.Matrix4();
     const cx = (x1 + x2) / 2;
     const cy = (y1 + y2) / 2;
@@ -589,8 +639,20 @@ export class SVG3DBuilder {
   _emitInstancedChunks(
     root, geometry, material, matrices, chunkWidth,
     defaultInstanceColor = null, noteIds = null, noteMeshMap = null,
+    lodInfo = null,
   ) {
     if (matrices.length === 0) return;
+    // Stamp the LOD metadata on every mesh this call emits.  The render
+    // worker collects meshes with a `lodSize`/`lodDetail` tag after each
+    // scene build and gates their `.visible` from camera distance — see
+    // `_applyLodVisibility` in renderWorker.js (LOD_DISTANT_ELEMENTS /
+    // DISTANCE_CLIP_GLYPHS).
+    const tagLod = (mesh) => {
+      if (lodInfo && (lodInfo.lodSize > 0 || lodInfo.lodDetail)) {
+        mesh.userData.lodSize = lodInfo.lodSize;
+        mesh.userData.lodDetail = lodInfo.lodDetail;
+      }
+    };
     // Three.js 0.172 WebGPU bug: `InstancedMesh` with `count === 1`
     // renders with the instance matrix effectively ignored (the single
     // instance appears at world origin with its raw geometry, not at
@@ -625,6 +687,7 @@ export class SVG3DBuilder {
       // Every notation mesh casts a shadow onto the paper.  The
       // paper itself opts in to `receiveShadow` in `_addPaper`.
       mesh.castShadow = true;
+      tagLod(mesh);
       root.add(mesh);
       if (singleNoteId && noteMeshMap) {
         noteMeshMap.set(singleNoteId, { mesh, index: -1, material: perMeshMat });
@@ -657,6 +720,7 @@ export class SVG3DBuilder {
           if (id) noteMeshMap.set(id, { mesh, index: i });
         }
       }
+      tagLod(mesh);
       root.add(mesh);
       return;
     }
@@ -686,6 +750,7 @@ export class SVG3DBuilder {
         mesh.applyMatrix4(arr[0].m);
         mesh.frustumCulled = false;
         mesh.castShadow = true;
+        tagLod(mesh);
         root.add(mesh);
         if (singleNoteId && noteMeshMap) {
           noteMeshMap.set(singleNoteId, { mesh, index: -1, material: perMeshMat });
@@ -715,6 +780,7 @@ export class SVG3DBuilder {
           if (arr[i].noteId) noteMeshMap.set(arr[i].noteId, { mesh, index: i });
         }
       }
+      tagLod(mesh);
       root.add(mesh);
     }
   }

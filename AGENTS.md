@@ -86,20 +86,54 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 **GPU quality system** (two phases, in `renderWorker.js`):
 
 **Phase 1 — load-time probe** (`_probeGpuCost` + `_applyLoadTimeQuality`, called once in `handleInit`):
-- Renders the empty scene 5 times and takes the median wall-clock time.
+- Renders the empty scene 7 times **with a forced shadow pass per frame** and a
+  **GPU-completion fence per frame** (`_gpuSync`: WebGPU `queue.onSubmittedWorkDone()`,
+  WebGL 1×1 `readPixels`); returns the **minimum** sample.
+- CRITICAL: the GPU fence is what makes the probe meaningful on Chromium — bare
+  `renderer.render()` only measures CPU submit time (~0.25 ms on any machine), which
+  used to route every Chromium browser into the top tier regardless of GPU speed.
+  The minimum (not median) is used because early samples are inflated by idle GPU
+  clock ramp-up, which flipped borderline machines between tiers across reloads.
 - Picks the highest shadow-map resolution that fits within half the frame budget.
 - Sets shadow mapSize, DPR cap, and PCF type **once** — never changes during the session.
+  (`handleResize` must respect `_chosenDprCap` — it used to hardcode `min(dpr, 2)` and
+  silently undo the probe's choice on the first window resize.)
 - Mobile always uses 2048² PCF, DPR 1.5 regardless of probe result.
-- Probe thresholds (desktop): < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096² PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
+- Probe thresholds (desktop, GPU-synced): < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096² PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
 
 **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
-- A 0→1 float driven by p95 rAF interval vs calibrated baseline (30-tick p10 window).
+- A 0→1 float driven by p95 rAF interval vs calibrated baseline (30-tick **p95** window).
+- CRITICAL: baseline and signal must be the SAME statistic (p95 vs p95).  The old p10
+  baseline sat below healthy p95 vsync jitter, so pressure ratcheted to 1.0 within
+  seconds of starting any playback — even at a rock-solid 120 fps — and permanently
+  dimmed the lights.
 - Rises toward 1 over ~1 s of sustained overrun (p95 ≥ baseline × 1.3).
 - Falls toward 0 over ~3 s of headroom (p95 ≤ baseline × 1.15).
-- Applied only to `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
-- `LightBallController.update()` reads `SceneConfig.lightBall.intensity` every frame → no reallocation, no flicker.
+- Two actuators:
+  1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`) — cosmetic dim.
+  2. **Shadow-update throttle** (`_updateKeyLight`): under pressure, shadow-map re-renders
+     are spaced out up to `pressure × 150 ms` apart.  This is the actuator that actually
+     recovers GPU time (the shadow pass re-renders nearly every frame during playback
+     because the playhead crosses a texel almost every tick).  Visually free: translating
+     a DirectionalLight never moves the shadows, it only slides the coverage frustum
+     (half-width 20 wu vs ≈ 0.5 wu/s playhead motion).
 - Controlled by `autoDegrade` flag (`updateConfig({ autoDegrade: bool })`); disabling restores full intensity immediately.
 - Settings panel shows a pressure dot (green → amber → red) instead of a tier label.
+
+**Runtime LOD** (`_applyLodVisibility` in `renderWorker.js` + bucket tags from `SVG3DBuilder`):
+- Implements `LOD_DISTANT_ELEMENTS` / `DISTANCE_CLIP_GLYPHS` / `LOD_DISTANCE_THRESHOLD`
+  from `Optimizations.js` (these flags were previously declared but wired to nothing).
+- Build time: stems/flags/ledger-line buckets are tagged `userData.lodDetail`; every
+  glyph bucket gets `userData.lodSize` (world-unit footprint).  Detail-tagged box lines
+  (simple-line stems) get their own InstancedMesh, separate from beams/staff/bar lines.
+- Runtime: detail buckets hide beyond `LOD_DISTANCE_THRESHOLD` (12 wu, where they are
+  ≈ 1 px); any tagged bucket hides when its footprint projects below ~0.7 device px.
+  Both rules have 15–20 % hysteresis so the smart camera's ±6 % zoom oscillation can't
+  flicker them.  The pass runs only when camera distance changes > 1 %.
+- Staff lines, bar lines, beams, and noteheads are never distance-hidden (structure);
+  noteheads only go sub-pixel past d ≈ 100 (controls maxDistance = 100).
+- Mesh `.visible` toggling does NOT recompile WebGPU pipelines (unlike light `.visible`)
+  and all pipelines are pre-warmed by `precompilePipelines` regardless of visibility.
 
 **Key design rule**: shadow map size, DPR, and PCF type must NEVER be changed at runtime. Doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame. They are load-time only.
 
@@ -207,9 +241,10 @@ there so the gear icon isn't pushed off-screen on narrow mobile viewports.
 5. **Shadow map type changes**: Must dispose the existing shadow map for the new
    `shadowMap.type` to take effect.  See the pattern above under "Adaptive quality".
 
-6. **DPR on resize**: `handleResize` in the worker hardcodes `Math.min(dpr, 2)` rather
-   than using the adaptive tier's DPR cap.  If you add DPR tracking to the resize
-   handler, consult `_quality._baseDpr` and `_quality._dprCaps[_quality.tier]`.
+6. **DPR on resize**: `handleResize` in the worker must use `_chosenDprCap` (the
+   probe-selected cap), never a hardcoded `Math.min(dpr, 2)` — the hardcoded form
+   silently restored full resolution on weak GPUs at the first window resize.
+   (Fixed; kept here as a warning for future resize-handler edits.)
 
 ---
 

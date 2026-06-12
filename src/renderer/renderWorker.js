@@ -55,8 +55,10 @@ import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
  *
  * Calibration:
  *   The baseline rAF interval is measured from the first 30 play-session
- *   ticks (≈ 250 ms at 120 Hz) using the p10 percentile, so thresholds
- *   adapt automatically to 60/90/120 Hz and ProMotion displays.
+ *   ticks (≈ 250 ms at 120 Hz) using the p95 percentile — the *same*
+ *   statistic the runtime signal uses, so healthy-vs-degraded comparisons
+ *   are like-for-like and thresholds adapt automatically to 60/90/120 Hz
+ *   and ProMotion displays.
  */
 
 /** Baseline rAF interval (ms) learned from the first play session.
@@ -69,17 +71,31 @@ const _calibBuf  = new Float64Array(_CALIB_TICKS);
 const _calibSort = new Float64Array(_CALIB_TICKS);
 
 /** Feed one rAF interval sample.  Locks `_baselineMs` after
- *  `_CALIB_TICKS` samples using the p10 of the collected window. */
+ *  `_CALIB_TICKS` samples using the **p95** of the collected window.
+ *
+ *  The percentile choice matters: the runtime pressure signal compares
+ *  the *p95* of recent play frames against this baseline, so the
+ *  baseline must be the same statistic measured under healthy
+ *  conditions.  The previous p10 baseline (the *fastest* frames)
+ *  guaranteed a mismatch — at 120 Hz, healthy vsync jitter puts p95 at
+ *  ≈ 9.5–10.3 ms while p10 reads ≈ 7.9 ms, so p95 never dropped below
+ *  the release threshold (p10 × 1.15 ≈ 9.1 ms) and pressure ratcheted
+ *  to 1.0 within seconds of starting *any* playback, permanently
+ *  dimming the lights even at a rock-solid 120 fps.
+ *
+ *  p95 of a 30-sample window (index 28) is also robust to a single
+ *  outlier — e.g. the one-off soundfont-load stall right at play
+ *  start lands at index 29 and doesn't skew the baseline. */
 function _calibrate(frameMs) {
   if (_calibrated || frameMs <= 0 || frameMs >= 2000) return;
   _calibBuf[_calibCount++] = frameMs;
   if (_calibCount >= _CALIB_TICKS) {
     _calibSort.set(_calibBuf);
     _calibSort.sort();
-    // p10 = index 3 in a 30-element sorted array (floor(30 × 0.10)).
-    // Robust against isolated GC / OS-scheduler spikes; clamp to a
-    // sane range in case the tab is throttled or vsync is locked.
-    _baselineMs = Math.max(6, Math.min(20, _calibSort[Math.floor(_CALIB_TICKS * 0.10)]));
+    // Clamp to a sane range in case the tab is throttled, vsync is
+    // locked, or the calibration window caught a multi-spike burst
+    // (upper bound covers 60 Hz p95 ≈ 17–18 ms with margin).
+    _baselineMs = Math.max(6, Math.min(25, _calibSort[Math.floor(_CALIB_TICKS * 0.95)]));
     _calibrated = true;
   }
 }
@@ -103,6 +119,12 @@ let _runtimePressure = 0;
 let _baseLightIntensity = 0;
 /** Whether the auto-dim system is enabled (mirrors the Settings toggle). */
 let _autoDimEnabled = true;
+/** Diagnostics: what the load-time probe measured and chose.  Exposed
+ *  via `probe()` so the dev overlay / Playwright tests can verify the
+ *  quality selection matches the hardware. */
+let _probeMsMeasured = -1;
+let _chosenShadowMapSize = 0;
+let _chosenDprCap = 0;
 
 /**
  * Update `_runtimePressure` and apply it to light intensity.
@@ -135,27 +157,77 @@ function _updateRuntimePressure(dt, frameP95) {
 }
 
 /**
+ * Block until the GPU has actually finished executing all submitted
+ * work.  `renderer.render()` only measures CPU-side command encoding —
+ * on Chromium (WebGPU *and* WebGL) submission never waits for the GPU,
+ * so timing `render()` alone reads ~0.2 ms regardless of how slow the
+ * GPU is.  That made the old probe classify every Chromium machine as
+ * "very fast" and hand out 6144² shadows + DPR 2.0 unconditionally —
+ * exactly the machines that then couldn't hold a consistent frame rate.
+ *
+ *   • WebGPU: `device.queue.onSubmittedWorkDone()` resolves when the
+ *     queue is drained.
+ *   • WebGL: a 1×1 `readPixels` forces a full pipeline flush + sync
+ *     (the classic synchronous fence).
+ */
+async function _gpuSync() {
+  if (!renderer) return;
+  const device = renderer.backend?.device;
+  if (device?.queue?.onSubmittedWorkDone) {
+    await device.queue.onSubmittedWorkDone();
+    return;
+  }
+  const gl = typeof renderer.getContext === 'function' ? renderer.getContext() : null;
+  if (gl && typeof gl.readPixels === 'function') {
+    const px = new Uint8Array(4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  }
+}
+
+/**
  * Probe GPU rendering cost with the empty scene (lights, paper, no
- * score geometry) by rendering it `count` times synchronously and
- * returning the median wall-clock time per frame in milliseconds.
+ * score geometry) by rendering it `count` times and returning the
+ * best-case wall-clock time per frame in milliseconds — *including*
+ * GPU execution time (see `_gpuSync`) and *including* a full
+ * shadow-map pass per frame.
+ *
+ * The shadow pass must be forced explicitly: `_updateKeyLight` switches
+ * the key light to manual shadow updates (`shadow.autoUpdate = false`)
+ * during `setupLighting`, so without `needsUpdate = true` per frame the
+ * probe would measure frames with no shadow render at all — and the
+ * shadow pass is precisely the dominant cost the probe exists to
+ * measure (during playback the playhead crosses a shadow texel almost
+ * every frame, so the real render loop re-renders the map nearly every
+ * frame).
  *
  * Called once during `handleInit`, before `startRenderLoop`, while the
  * score worker is busy parsing the first score's Verovio WASM.  On a
  * fast machine this takes 20–60 ms and is invisible to the user.
+ *
+ * Returns the **minimum** sample rather than the median: the probe
+ * classifies *capability* ("can this GPU sustain the top tier?"), and
+ * the minimum is the GPU's demonstrated best case.  Early probe frames
+ * run while the GPU is still ramping up from idle clocks, which
+ * inflates the median enough to flip borderline machines between
+ * tiers from one reload to the next; the min is stable because a
+ * genuinely slow GPU's best case is still slow.
  */
-function _probeGpuCost(count = 5) {
+async function _probeGpuCost(count = 7) {
   if (!renderer || !scene || !camera) return 0;
   // Warm-up render — don't measure: first call often stalls on driver
   // JIT / shader cache miss regardless of scene complexity.
   renderer.render(scene, camera);
-  const times = [];
+  await _gpuSync();
+  let best = Infinity;
   for (let i = 0; i < count; i++) {
+    if (_keyLight) _keyLight.shadow.needsUpdate = true;
     const t0 = performance.now();
     renderer.render(scene, camera);
-    times.push(performance.now() - t0);
+    await _gpuSync();
+    const t = performance.now() - t0;
+    if (t < best) best = t;
   }
-  times.sort((a, b) => a - b);
-  return times[Math.floor(times.length / 2)]; // median
+  return Number.isFinite(best) ? best : 0;
 }
 
 /**
@@ -166,11 +238,14 @@ function _probeGpuCost(count = 5) {
  * time for geometry + shading once a score is loaded).  For a 120 Hz
  * display the budget is ~4 ms; for 60 Hz ~8 ms.
  *
- * Shadow cost candidates (measured on Apple M2):
- *   6144² PCFSoft  ≈ 6–8 ms/frame empty scene
- *   4096² PCFSoft  ≈ 2–4 ms/frame
- *   2048² PCF      ≈ 0.5–1 ms/frame
- *   1024² PCF      ≈ 0.2 ms/frame
+ * Probe cost reference, GPU-synced via `_gpuSync` (empty scene with a
+ * forced 6144² PCFSoft shadow pass at DPR ≤ 2 — see `_probeGpuCost`):
+ *   Apple M-series / discrete GPU   ≈ 1.5–2 ms/frame  → keep 6144²
+ *   recent integrated GPU           ≈ 2–5 ms/frame    → 4096²
+ *   older / budget integrated GPU   ≈ 5 ms+           → 2048²
+ * (The pre-GPU-sync numbers that used to live here were submit-time
+ * only and read ~0.25 ms on every Chromium machine, which routed all
+ * of them into the top tier regardless of actual GPU speed.)
  */
 function _applyLoadTimeQuality(probeMs, baseDpr, isMobile) {
   // On mobile the rAF rate halves permanently the first time a frame
@@ -198,6 +273,8 @@ function _applyLoadTimeQuality(probeMs, baseDpr, isMobile) {
  *  the render loop starts so there is no mid-session dispose. */
 function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
   if (!renderer || !_keyLight) return;
+  _chosenShadowMapSize = mapSize;
+  _chosenDprCap = dprCap;
   renderer.shadowMap.type = softPcf
     ? THREE.PCFSoftShadowMap
     : THREE.PCFShadowMap;
@@ -405,6 +482,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
   renderer.setClearColor(SceneConfig.backgroundColor, 1);
+  _viewportHeightCss = height;
 
   // Enable shadow rendering on whichever renderer we got.  The key
   // light below casts a soft shadow (PCF on WebGL, an equivalent
@@ -459,10 +537,11 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Load-time GPU probe — renders the empty scene (lights + paper, no score
   // geometry) and uses the measured cost to select the highest shadow-map
   // resolution the GPU can sustain within half the per-frame budget.
-  // Runs synchronously here, while the score worker is busy with Verovio WASM,
-  // so it adds no perceptible latency to the overall load time.
+  // Awaited here (the GPU-sync fences are async), while the score worker is
+  // busy with Verovio WASM, so it adds no perceptible latency to load time.
   const baseDpr  = devicePixelRatio || 1;
-  const probeMs  = _probeGpuCost(5);
+  const probeMs  = await _probeGpuCost(5);
+  _probeMsMeasured = probeMs;
   _applyLoadTimeQuality(probeMs, baseDpr, isMobile);
 
   cameraCtrl = new CameraController(camera, controls);
@@ -587,6 +666,28 @@ const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
  *  within the same texel column (≈ 1-2 cm in world units). */
 const _lastKeyLightSnapped = { x: null, z: null };
 
+/** `performance.now()` of the last shadow-map re-render triggered by
+ *  `_updateKeyLight`.  Used by the pressure-driven shadow throttle. */
+let _lastShadowUpdateMs = 0;
+
+/** Maximum extra delay (ms) between shadow re-renders at full runtime
+ *  pressure.  Scales linearly with `_runtimePressure`, so 0 pressure
+ *  keeps today's behaviour (re-render whenever the snapped position
+ *  changes — nearly every frame during playback) and full pressure
+ *  caps the shadow pass at ~7 Hz.
+ *
+ *  Why this is visually free: the key light is a **DirectionalLight**
+ *  — translating it never moves the shadows themselves (the cast
+ *  direction is constant); it only slides the orthographic frustum
+ *  that decides which part of the world the map covers.  The frustum
+ *  half-width is 20 wu while the playhead moves ≈ 0.3–1 wu/s, so even
+ *  a 150 ms update lag leaves visible casters comfortably inside the
+ *  covered region.  Unlike dimming lights, skipping 6144² shadow
+ *  passes recovers *most* of the over-budget GPU time — this is the
+ *  actuator that actually restores a consistent frame rate when the
+ *  pressure system fires. */
+const _SHADOW_THROTTLE_MAX_MS = 150;
+
 /** Slide the key directional light and its target to the given world
  *  XZ position (Y = 0 since the paper plane sits there after the
  *  contentRoot rotation).  Called every frame from the render loop
@@ -629,6 +730,22 @@ function _updateKeyLight(x, z) {
   // less than one texel width per tick, so this fires only once every
   // several frames rather than every frame.
   if (xs === _lastKeyLightSnapped.x && zs === _lastKeyLightSnapped.z) return;
+
+  // Pressure-driven shadow throttle: under sustained GPU pressure,
+  // space shadow-map re-renders out in time instead of re-rendering on
+  // every texel crossing.  See `_SHADOW_THROTTLE_MAX_MS` for why this
+  // is invisible (directional light translation only slides the
+  // coverage frustum, never the shadows themselves).  The position
+  // intentionally stays *unsnapped-pending* — we return before writing
+  // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
+  if (_runtimePressure > 0 && _lastShadowUpdateMs > 0) {
+    const now = performance.now();
+    if (now - _lastShadowUpdateMs < _runtimePressure * _SHADOW_THROTTLE_MAX_MS) return;
+    _lastShadowUpdateMs = now;
+  } else {
+    _lastShadowUpdateMs = performance.now();
+  }
+
   _lastKeyLightSnapped.x = xs;
   _lastKeyLightSnapped.z = zs;
 
@@ -649,6 +766,100 @@ function _updateKeyLight(x, z) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Runtime LOD — LOD_DISTANT_ELEMENTS + DISTANCE_CLIP_GLYPHS          */
+/* ------------------------------------------------------------------ */
+
+/** Meshes carrying LOD tags (`userData.lodSize` / `userData.lodDetail`)
+ *  collected once per scene build by `_collectLodMeshes`.  Kept as a
+ *  flat array so the per-frame pass doesn't re-traverse the graph. */
+let _lodMeshes = [];
+/** Camera-to-target distance at the last LOD evaluation; -1 forces a
+ *  re-evaluation (scene rebuild, resize, DPR change). */
+let _lodLastDistance = -1;
+/** Viewport CSS height, tracked from init/resize for the pixel-size
+ *  estimate in `_applyLodVisibility`. */
+let _viewportHeightCss = 600;
+
+/** Collect the LOD-managed meshes from a freshly-built scene root.
+ *  Called from handleBuildScene after the root is attached. */
+function _collectLodMeshes(root) {
+  _lodMeshes.length = 0;
+  _lodLastDistance = -1;
+  if (!OPTIMIZATIONS.LOD_DISTANT_ELEMENTS && !OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS) return;
+  root.traverse((n) => {
+    if (n.isMesh && n.userData && (n.userData.lodSize > 0 || n.userData.lodDetail)) {
+      _lodMeshes.push(n);
+    }
+  });
+}
+
+/**
+ * Distance-driven visibility gating for the tagged buckets — this is
+ * the runtime half of the two LOD flags in `Optimizations.js`:
+ *
+ *   • `LOD_DISTANT_ELEMENTS` — buckets tagged `lodDetail` (stems,
+ *     flags, ledger lines: the small per-note decorations) hide when
+ *     the camera is further than `LOD_DISTANCE_THRESHOLD` from its
+ *     orbit target.  At that distance they're ≈ 1 device pixel and
+ *     contribute nothing visually, but they're the *most numerous*
+ *     instance class — on a dense score they dominate both the shadow
+ *     pass and the main pass primitive count.
+ *
+ *   • `DISTANCE_CLIP_GLYPHS` — any tagged bucket hides when its
+ *     world-unit footprint (`lodSize`) projects below ~0.7 device
+ *     pixels.  This is the generic safety net for extreme zoom-outs;
+ *     noteheads only cross it past d ≈ 100+.
+ *
+ * Both rules use hysteresis (hide and show thresholds differ by
+ * ~15–20 %) so the smart camera's gentle zoom oscillation (±6 %
+ * radius) can never make buckets flicker at a boundary.
+ *
+ * Cost: a single distance check per frame; the full mesh pass (a few
+ * dozen entries) only runs when the distance actually moved > 1 %.
+ * Visibility toggling on plain/instanced meshes does NOT invalidate
+ * WebGPU pipelines (unlike light visibility) — pipelines for every
+ * mesh were warmed by `precompilePipelines` regardless of visibility.
+ */
+function _applyLodVisibility() {
+  if (_lodMeshes.length === 0 || !camera || !controls) return;
+  const d = camera.position.distanceTo(controls.target);
+  if (_lodLastDistance > 0 && Math.abs(d - _lodLastDistance) < _lodLastDistance * 0.01) return;
+  _lodLastDistance = d;
+
+  // World units per *device* pixel at the orbit-target distance.
+  const fovRad = (camera.fov * Math.PI) / 180;
+  const pr = renderer && typeof renderer.getPixelRatio === 'function' ? renderer.getPixelRatio() : 1;
+  const viewportDevicePx = Math.max(1, _viewportHeightCss * pr);
+  const wupp = (2 * d * Math.tan(fovRad / 2)) / viewportDevicePx;
+
+  const detailRule = OPTIMIZATIONS.LOD_DISTANT_ELEMENTS;
+  const clipRule = OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS;
+  const T = OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12;
+
+  let toggled = false;
+  for (let i = 0; i < _lodMeshes.length; i++) {
+    const mesh = _lodMeshes[i];
+    const ud = mesh.userData;
+    let wantVisible;
+    if (mesh.visible) {
+      const hideDetail = detailRule && ud.lodDetail && d > T;
+      const hideSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.7;
+      wantVisible = !(hideDetail || hideSubPixel);
+    } else {
+      // Re-show only once we're clearly back inside both thresholds.
+      const stillDetailHidden = detailRule && ud.lodDetail && d > T * 0.85;
+      const stillSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.85;
+      wantVisible = !(stillDetailHidden || stillSubPixel);
+    }
+    if (wantVisible !== mesh.visible) {
+      mesh.visible = wantVisible;
+      toggled = true;
+    }
+  }
+  if (toggled) _markDirty();
+}
+
+/* ------------------------------------------------------------------ */
 /*  Resize / pointer                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -656,8 +867,15 @@ function handleResize({ width, height, devicePixelRatio, rect }) {
   if (!renderer || !camera) return;
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  // Respect the DPR cap chosen by the load-time GPU probe — the old
+  // hardcoded `min(dpr, 2)` silently undid the probe's choice on the
+  // first window resize, putting weak GPUs right back at full
+  // resolution.
+  const dprCap = _chosenDprCap > 0 ? _chosenDprCap : 2;
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false);
+  _viewportHeightCss = height;
+  _lodLastDistance = -1; // viewport changed → pixel sizes changed → re-evaluate LOD
   if (elementProxy) elementProxy.setRect(rect);
   _markDirty();
 }
@@ -822,6 +1040,9 @@ function handleBuildScene({ parsed }) {
   }
   const { root, noteMeshMap } = builder.build(parsed);
   contentRoot.add(root);
+  // Collect the LOD-tagged meshes for the runtime visibility pass
+  // (LOD_DISTANT_ELEMENTS / DISTANCE_CLIP_GLYPHS).
+  _collectLodMeshes(root);
   // Replace the per-scene note-mesh map.  Previous entries point at
   // meshes that just got removed from the scene, so they must not
   // leak into the next score's colour updates.
@@ -1272,6 +1493,12 @@ function startRenderLoop() {
     // so notation anywhere in the view always casts a visible
     // shadow rather than only the chunk near the world origin.
     _updateKeyLight(controls.target.x, controls.target.z);
+    // Distance-LOD visibility gating (LOD_DISTANT_ELEMENTS /
+    // DISTANCE_CLIP_GLYPHS).  Skipped while a precompile is in flight
+    // — precompilePipelines temporarily toggles hidden meshes visible
+    // and restores them afterwards, and a concurrent LOD pass would
+    // corrupt that bookkeeping.
+    if (!_compiling) _applyLodVisibility();
     // Feed the current playhead X into the glow-falloff uniform so the
     // noteHead shader can fade out emissive glow on distant played notes.
     setPlayheadX(_camTarget.x);
@@ -1539,6 +1766,8 @@ function handleDispose() {
   _staffColors.clear();
   _dirtyInstanceMeshes.clear();
   _lastFraming = null;
+  _lodMeshes.length = 0;
+  _lodLastDistance = -1;
 }
 
 /** Read-back hook used by tests: returns a small snapshot of camera +
@@ -1635,6 +1864,20 @@ function handleProbe({ id }) {
         pointLights: pointLightCount,
         directionalLights: directionalLightCount,
         ambientLights: ambientLightCount,
+      },
+      quality: {
+        probeMs: _probeMsMeasured,
+        shadowMapSize: _chosenShadowMapSize,
+        dprCap: _chosenDprCap,
+        pixelRatio: renderer && renderer.getPixelRatio ? renderer.getPixelRatio() : 0,
+        pressure: _runtimePressure,
+        baselineMs: _baselineMs,
+        calibrated: _calibrated,
+      },
+      lod: {
+        managed: _lodMeshes.length,
+        hidden: _lodMeshes.reduce((n, m) => n + (m.visible ? 0 : 1), 0),
+        lastDistance: _lodLastDistance,
       },
     },
   });
