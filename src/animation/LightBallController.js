@@ -49,6 +49,20 @@ export class LightBallController {
   _hitTime = new Map();
 
   /**
+   * Per-staff cursor into `chordGroups` — index of the latest group
+   * whose start time is <= the current music time.  Advanced (or
+   * rewound) incrementally each frame instead of re-scanning the
+   * whole array: on long scores (Jupiter ≈ 10³ groups/staff, large
+   * orchestral scores far more) a full scan per staff per frame was
+   * costing O(totalGroups × staves) every rAF tick, which competes
+   * with the render submit for worker CPU and shows up as frame
+   * jitter on slower machines.  The incremental walk is O(Δgroups)
+   * — almost always 0 or 1 steps per frame.
+   * @type {Map<number, number>}
+   */
+  _groupCursor = new Map();
+
+  /**
    * Optional callback fired the first time the playhead arrives at a
    * new chord on a given staff during playback.  Used by the smart
    * camera (CameraController.recordBeatGroupHit) to track per-staff
@@ -89,6 +103,7 @@ export class LightBallController {
     this._clearAll();
     this._lastVisitedIdx.clear();
     this._hitTime.clear();
+    this._groupCursor.clear();
 
     // Group events by staff
     /** @type {Map<number, Array>} */
@@ -217,6 +232,7 @@ export class LightBallController {
     this._currentTime = 0;
     this._lastVisitedIdx.clear();
     this._hitTime.clear();
+    this._groupCursor.clear();
     // Return balls to their first chord-group positions
     for (const data of this._staffData.values()) {
       const { chordGroups, balls } = data;
@@ -269,10 +285,16 @@ export class LightBallController {
       if (chordGroups.length === 0) continue;
 
       // Find the latest chord group whose start time is <= current time.
-      let prevIdx = 0;
-      for (let i = 0; i < chordGroups.length; i++) {
-        if (chordGroups[i].time <= this._currentTime) prevIdx = i;
-      }
+      // Incremental cursor walk — O(Δ) instead of a full O(n) scan per
+      // staff per frame.  Handles forward playback (advance), scrubbing
+      // backward / transport reset (rewind), and seeking (multi-step in
+      // either direction).
+      let prevIdx = this._groupCursor.get(staff) ?? 0;
+      if (prevIdx >= chordGroups.length) prevIdx = chordGroups.length - 1;
+      while (prevIdx + 1 < chordGroups.length
+        && chordGroups[prevIdx + 1].time <= this._currentTime) prevIdx++;
+      while (prevIdx > 0 && chordGroups[prevIdx].time > this._currentTime) prevIdx--;
+      this._groupCursor.set(staff, prevIdx);
       const nextIdx = Math.min(prevIdx + 1, chordGroups.length - 1);
 
       const prev = chordGroups[prevIdx];
