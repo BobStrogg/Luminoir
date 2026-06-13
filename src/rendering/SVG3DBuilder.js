@@ -36,7 +36,7 @@ export function prefetchTitleFont() {
   if (_titleFont) return;   // already loaded
   (async () => {
     try {
-      const resp = await fetch('/fonts/optimer_bold.typeface.json');
+      const resp = await fetch(`${import.meta.env.BASE_URL}fonts/optimer_bold.typeface.json`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const json = await resp.json();
       _titleFont = new FontLoader().parse(json);
