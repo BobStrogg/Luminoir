@@ -384,6 +384,19 @@ export class MIDIPlayer {
   /* ------------------------------------------------------------------ */
 
   async _loadInstruments() {
+    // smplr's Soundfont constructor immediately calls AudioContext.decodeAudioData
+    // to decode the downloaded samples.  On Safari (both desktop and iOS) with a
+    // remote origin (e.g. GitHub Pages), the AudioContext starts in 'suspended'
+    // state and decodeAudioData on a suspended context silently produces empty
+    // buffers — the instruments appear to load successfully but play silence.
+    //
+    // We must wait until the context has transitioned to 'running' (i.e. the
+    // resume() promise from play() has resolved) before creating Soundfonts.
+    // This is safe: resume() was already fired fire-and-forget inside the
+    // gesture handler — we're just waiting for Safari to honour it before
+    // handing the context to smplr.
+    await this._waitForContextRunning();
+
     // Collect unique program numbers used across channels
     const programs = new Set(this._channelPrograms.values());
     if (programs.size === 0) programs.add(0); // default to piano
@@ -408,6 +421,28 @@ export class MIDIPlayer {
     } catch (err) {
       console.warn('[Luminoir] Some instruments failed to load:', err);
     }
+  }
+
+  /**
+   * Wait until the AudioContext transitions to 'running'.  Safari on remote
+   * origins (GitHub Pages etc.) starts the context in 'suspended' and the
+   * resume() promise can take up to ~100 ms to resolve.  Polling via
+   * statechange event is the cleanest approach; a 2 s timeout prevents
+   * hanging forever if the browser refuses the unlock.
+   */
+  _waitForContextRunning() {
+    if (!this._ctx || this._ctx.state === 'running') return Promise.resolve();
+    return new Promise((resolve) => {
+      const timeout = setTimeout(resolve, 2000); // give up after 2 s
+      const onStateChange = () => {
+        if (this._ctx.state === 'running') {
+          clearTimeout(timeout);
+          this._ctx.removeEventListener('statechange', onStateChange);
+          resolve();
+        }
+      };
+      this._ctx.addEventListener('statechange', onStateChange);
+    });
   }
 
   /** Resolve the loaded instrument for a given MIDI channel */
