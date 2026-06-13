@@ -1,6 +1,9 @@
 import { defineConfig } from 'vite';
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const { version } = require('./package.json');
 
 /**
  * Vite config.
@@ -57,6 +60,10 @@ const hasMkcert = useHttps && fs.existsSync(certPath) && fs.existsSync(keyPath);
 
 export default defineConfig({
   plugins: useHttps && !hasMkcert ? [basicSsl()] : [],
+  // Expose package.json version to the app as a compile-time constant.
+  define: {
+    __APP_VERSION__: JSON.stringify(version),
+  },
   base: process.env.GITHUB_ACTIONS ? '/Luminoir/' : '/',
   root: '.',
   publicDir: 'public',

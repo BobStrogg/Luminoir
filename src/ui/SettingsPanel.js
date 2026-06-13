@@ -397,6 +397,10 @@ export class SettingsPanel {
 
     const h = document.createElement('h3');
     h.textContent = 'About';
+    const versionTag = document.createElement('span');
+    versionTag.className = 'settings-about-version';
+    versionTag.textContent = `v${__APP_VERSION__}`;
+    h.appendChild(versionTag);
     sectionEl.appendChild(h);
 
     const intro = document.createElement('p');
