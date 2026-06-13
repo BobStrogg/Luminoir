@@ -17,6 +17,17 @@ pnpm test             # Playwright e2e tests (requires running dev server)
 `package.json` `packageManager` field pins the exact pnpm version.  If `corepack enable`
 fails (signature validation errors), use `npm install -g pnpm@<version>` directly.
 
+### Versioning
+
+**Bump the patch version in `package.json` with every commit** (or batch of commits in
+a single session).  The version is compiled into the app via Vite's `define` config
+(`__APP_VERSION__`) and shown in Settings → About.
+
+Semver convention:
+- **Patch** (`1.0.x`): bug fixes, perf tweaks, config changes.
+- **Minor** (`1.x.0`): new user-visible features, new settings, new scores.
+- **Major** (`x.0.0`): breaking changes to the architecture or data format.
+
 ### LAN HTTPS setup (one-time, per machine)
 
 Chrome's Private Network Access policy blocks subresource loads from `.local` hostnames
