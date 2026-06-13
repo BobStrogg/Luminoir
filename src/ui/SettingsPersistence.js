@@ -16,7 +16,9 @@
  * registry default.
  */
 const STORAGE_KEY = 'luminoir.settings.v1';
-const SCHEMA_VERSION = 1;
+// Bumped from 1→2: audioVisualOffsetMs Safari default changed from -500→0.
+// Old stored -500ms value would otherwise persist on existing Safari installs.
+const SCHEMA_VERSION = 2;
 
 /** Read all persisted settings as a plain `{ id: value }` map. */
 export function loadStoredSettings() {

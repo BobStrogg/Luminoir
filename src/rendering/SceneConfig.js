@@ -6,7 +6,9 @@ function isSafariBrowser() {
     && !/(Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android)/i.test(ua);
 }
 
-const DEFAULT_AUDIO_VISUAL_OFFSET_MS = isSafariBrowser() ? -500 : 0;
+// Static Safari offset disabled — the -500ms guess caused more harm than good;
+// proper clock-slave sync will replace it.
+const DEFAULT_AUDIO_VISUAL_OFFSET_MS = 0;
 
 /**
  * Scene configuration — central source of truth for all visual /
