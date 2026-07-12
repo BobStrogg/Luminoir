@@ -320,8 +320,10 @@ export class SVG3DBuilder {
         { lodSize: bucket.lodDetail ? bucket.lodSize : 0, lodDetail: !!bucket.lodDetail });
     }
 
+    const titleLayout = parsed.title ? this._measureTitleLayout(parsed.title, parsed.composer) : null;
+
     // --- Paper backdrop ---
-    this._addPaper(root, parsed);
+    this._addPaper(root, parsed, titleLayout?.block);
 
     // --- Title block (top-left of paper) ---
     // The paper's far (top) margin is sized to fit the title block
@@ -330,7 +332,7 @@ export class SVG3DBuilder {
     // when `parsed.title` is null (e.g. when an unrecognised file is
     // imported and we couldn't derive a sensible name).
     if (parsed.title) {
-      this._addTitle(root, parsed);
+      this._addTitle(root, parsed, titleLayout);
     }
 
     return { root, noteMeshMap };
@@ -836,20 +838,13 @@ export class SVG3DBuilder {
 
   /* ------------------------------------------------------------------ */
 
-  _addPaper(root, parsed) {
+  _addPaper(root, parsed, titleBlock = null) {
     const paperMat = Materials.paper();
-    // Page margins around the score's visible 5-line staves.
-    //
-    // **Equal-padding layout**: the gaps above the title, between the
-    // title and the topmost staff line, and below the bottommost
-    // staff line are all the same world-unit value (`pad`), so the
-    // page reads as evenly balanced top-to-bottom.  When the score
-    // has elements that extend past the staves themselves (pedal
-    // markers below the bass staff, octave 8va lines above the
-    // treble staff, fermatas / hairpins / dynamics) we GROW the pad
-    // so the paper still encloses every rendered glyph while the
-    // three gaps stay equal.  See `TitleBlock.computePageMargins`
-    // for the exact formula.
+    // **Equal-padding layout**: paper edge → title, title → highest
+    // rendered notation, and lowest notation → paper edge all use the
+    // same fixed world-unit gap.  Full content bounds already include
+    // ledger notes, slurs, dynamics, and octave lines, so their extent
+    // is never counted a second time as exterior whitespace.
     //
     // The X (horizontal) margin stays symmetric; the camera doesn't
     // tilt left-right, so X appears uniform.  We do bias the camera
@@ -861,13 +856,12 @@ export class SVG3DBuilder {
     const minX = parsed.contentMinX ?? 0;
     const margins = computePageMargins(
       {
-        staffMaxY: parsed.staffMaxY,
-        staffMinY: parsed.staffMinY,
         contentMaxY: (parsed.contentMinY ?? 0) + (parsed.totalHeight ?? 0),
         contentMinY: parsed.contentMinY ?? 0,
       },
       parsed.title,
       parsed.composer,
+      titleBlock,
     );
     const w = totalWidth + marginX * 2;
     const h = margins.paperTopY - margins.paperBottomY;
@@ -909,6 +903,46 @@ export class SVG3DBuilder {
     root.add(mesh);
   }
 
+  _measureTitleLayout(title, composer) {
+    if (!_titleFont || !title) return null;
+    const measure = (text, size) => {
+      if (!text) return null;
+      let shapes;
+      try {
+        shapes = _titleFont.generateShapes(text, size);
+      } catch {
+        return null;
+      }
+      if (!shapes || shapes.length === 0) return null;
+      const geometry = new THREE.ShapeGeometry(shapes);
+      geometry.computeBoundingBox();
+      const bounds = geometry.boundingBox;
+      const metrics = {
+        shapes,
+        minY: bounds.min.y,
+        maxY: bounds.max.y,
+        width: bounds.max.x - bounds.min.x,
+        height: bounds.max.y - bounds.min.y,
+      };
+      geometry.dispose();
+      return metrics;
+    };
+    const titleMetrics = measure(title, TITLE_HEIGHT);
+    if (!titleMetrics) return null;
+    const composerMetrics = measure(composer, COMPOSER_HEIGHT);
+    const height = titleMetrics.height
+      + (composerMetrics ? TITLE_LINE_GAP + composerMetrics.height : 0);
+    return {
+      block: {
+        width: Math.max(titleMetrics.width, composerMetrics?.width || 0),
+        height,
+        hasComposer: !!composerMetrics,
+      },
+      title: titleMetrics,
+      composer: composerMetrics,
+    };
+  }
+
   /**
    * Add the score's title + composer block to the paper's top-left
    * as extruded 3D geometry — the same pipeline used for all other
@@ -929,23 +963,19 @@ export class SVG3DBuilder {
    * Extrusion depth is chosen to match the visual weight of notation
    * (glyphs extrude ≈ 0.003 wu after scale × glyphUseScale).
    */
-  _addTitle(root, parsed) {
+  _addTitle(root, parsed, layout) {
     const title = parsed.title;
     const composer = parsed.composer;
-    if (!title) return;
-
-    const font = _titleFont;
-    if (!font) return;  // font not yet loaded — silently omit title this build
+    if (!title || !_titleFont || !layout) return;
 
     const margins = computePageMargins(
       {
-        staffMaxY: parsed.staffMaxY,
-        staffMinY: parsed.staffMinY,
         contentMaxY: (parsed.contentMinY ?? 0) + (parsed.totalHeight ?? 0),
         contentMinY: parsed.contentMinY ?? 0,
       },
       title,
       composer,
+      layout.block,
     );
 
     const leftX = (parsed.contentMinX ?? 0) + TITLE_LEFT_PADDING;
@@ -954,26 +984,8 @@ export class SVG3DBuilder {
     // (extrusionDepth × scale × glyphUseScale ≈ 0.003 wu).
     const depth = SceneConfig.extrusionDepth * SceneConfig.scale * SceneConfig.glyphUseScale;
 
-    // optimer_bold font metrics (normalised to `size` units):
-    //   ascender  = 1288/1000 × size
-    //   descender = -385/1000 × size
-    // We position each text baseline so the visual cap-height sits
-    // within the reserved slot.  The reserved block = titleTopY..titleBottomY.
-    // With composer, layout from the top:
-    //   titleTopY − ascender(title) = title baseline
-    //   then a gap of TITLE_LINE_GAP
-    //   then composer baseline
-    const ASCENDER_RATIO  = 1288 / 1000;
-
-    const _addTextMesh = (text, size, baselineY, color) => {
-      let shapes;
-      try {
-        shapes = font.generateShapes(text, size);
-      } catch {
-        return;
-      }
-      if (!shapes || shapes.length === 0) return;
-      const geo = new THREE.ExtrudeGeometry(shapes, { depth, bevelEnabled: false });
+    const _addTextMesh = (metrics, baselineY, color) => {
+      const geo = new THREE.ExtrudeGeometry(metrics.shapes, { depth, bevelEnabled: false });
       geo.computeVertexNormals();
       const mat = this._otherMat.clone();
       mat.color.set(color);
@@ -985,16 +997,13 @@ export class SVG3DBuilder {
       root.add(mesh);
     };
 
-    // Title baseline: position so ascender aligns with titleTopY.
-    const titleBaseline = margins.titleTopY - ASCENDER_RATIO * TITLE_HEIGHT;
-    _addTextMesh(title, TITLE_HEIGHT, titleBaseline, '#1f1a0e');
+    const titleBaseline = margins.titleTopY - layout.title.maxY;
+    _addTextMesh(layout.title, titleBaseline, '#1f1a0e');
 
-    if (composer && margins.titleBottomY != null) {
-      // Composer baseline: sits below the title by the line gap.
-      // Place it so there's a readable gap between title descenders
-      // and composer ascenders.
-      const composerBaseline = titleBaseline - TITLE_HEIGHT * (385 / 1000) - TITLE_LINE_GAP - ASCENDER_RATIO * COMPOSER_HEIGHT;
-      _addTextMesh(composer, COMPOSER_HEIGHT, composerBaseline, '#5a4f3c');
+    if (composer && layout.composer && margins.titleBottomY != null) {
+      const titleVisualBottom = titleBaseline + layout.title.minY;
+      const composerBaseline = titleVisualBottom - TITLE_LINE_GAP - layout.composer.maxY;
+      _addTextMesh(layout.composer, composerBaseline, '#5a4f3c');
     }
   }
 

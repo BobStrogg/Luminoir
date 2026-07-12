@@ -205,6 +205,43 @@ Worker-side settings that are NOT in the registry (design-time tunables):
 
 ---
 
+## Score loading and playback lifecycle
+
+- `_isScoreLoading` covers the entire fetch/file-read → Verovio → SVG parse → scene build →
+  GPU precompile → first rendered frame sequence.  `play()` must return without touching
+  `MIDIPlayer` while this flag is true; starting audio before `sceneReady` permanently
+  offsets it from the visual clock, especially on Safari.
+- `Controls.onLoadStart` disables score selection, import, and Play.  The `play()` guard is
+  still required for Space-key and programmatic calls.  `onLoadEnd` runs only after the
+  worker's `sceneReady` acknowledgment (or after load failure).
+- First play can await SoundFont decoding.  `_playPending` prevents duplicate starts and
+  `_playRequestId` lets Stop/score-load invalidate that continuation before it can anchor
+  audio or the worker clock against a newer scene.
+- `stop()` only resets the worker clock to music time 0.  Do not call `snapCameraTo` there:
+  the existing critically-damped camera spring then animates naturally back to the first
+  note for both explicit Stop and `MIDIPlayer.onPlaybackComplete`.
+
+---
+
+## Paper and title layout
+
+- `SVGSceneParser._pathBBox()` solves quadratic/cubic Bézier extrema analytically.  Never
+  bound slurs using their control points directly: long Clair-de-Lune slurs inflated the
+  parsed content from ~5.36 to ~7.27 world units even though the curve never reached those
+  control points.
+- Note bounds include the complete notehead glyph, not only its anchor.  Full content bounds
+  therefore enclose every mesh emitted by the builder.
+- `computePageMargins()` uses a fixed `MIN_PAGE_PADDING` (0.30 wu) for all three visible
+  gaps: paper top→title, title→highest notation, and lowest notation→paper bottom.  Do not
+  turn notation overhang into extra exterior padding; that counts the same extent twice.
+- `SVG3DBuilder._measureTitleLayout()` measures the actual Optimer glyph geometry and uses
+  those same bounds for paper sizing and title baselines.  Canvas/Georgia font metrics are
+  only a fallback when the 3D font has not loaded.
+- Reference results: Albatross paper height ≈4.09 wu; Clair de Lune ≈6.71 wu; every built-in
+  score has 0.30 wu visible top/title/bottom gaps.
+
+---
+
 ## Scene coordinate system
 
 `contentRoot` (scene child) is rotated `-π/2` around X so the score's "flat on table" layout
