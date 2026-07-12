@@ -704,10 +704,8 @@ const _keyLightTexelSize = new THREE.Vector2(0.01, 0.01);
 const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
 
 /** Last texel-snapped X/Z position used to position the key light.
- *  Stored as a plain pair so `_updateKeyLight` can skip re-rendering
- *  the shadow map on frames where the light hasn't moved — typically
- *  every idle frame and every play frame where the playhead stayed
- *  within the same texel column (≈ 1-2 cm in world units). */
+ *  The shadow camera recentres only after the view target leaves a
+ *  2-world-unit dead zone around this point. */
 const _lastKeyLightSnapped = { x: null, z: null };
 
 /** `performance.now()` of the last shadow-map re-render triggered by
@@ -730,6 +728,7 @@ let _shadowThrottled = 0;
  *  passes recovers *most* of the over-budget GPU time — this is the
  *  actuator that actually restores a consistent frame rate when the
  *  pressure system fires. */
+const _SHADOW_RECENTER_DISTANCE = 2;
 const _SHADOW_UPDATE_MIN_MS = 1000 / 30;
 const _SHADOW_THROTTLE_MAX_MS = 150;
 
@@ -751,7 +750,7 @@ const _SHADOW_THROTTLE_MAX_MS = 150;
  *  frame, even while the camera pans, and the shimmer disappears.
  *  The texel size used here is computed in `setupLighting` from the
  *  resolution and frustum dimensions in `SceneConfig.shadow`. */
-function _updateKeyLight(x, z) {
+function _updateKeyLight(x, z, frameNow = performance.now()) {
   if (!_keyLight) return;
   const tx = _keyLightTexelSize.x;
   const tz = _keyLightTexelSize.y;
@@ -770,10 +769,13 @@ function _updateKeyLight(x, z) {
     _keyLight.shadow.needsUpdate = true;
   }
 
-  // Skip position update + shadow re-render when the snapped position
-  // hasn't changed — on most frames during playback the playhead moves
-  // less than one texel width per tick, so this fires only once every
-  // several frames rather than every frame.
+  // Keep the shadow projection completely static while the camera target
+  // remains inside a small dead zone.  The orthographic shadow frustum is
+  // 40×30 world units, so a 2-unit lag leaves ample coverage while turning
+  // a 6144² re-render from a 30 Hz cost into an occasional recenter.
+  if (_lastKeyLightSnapped.x !== null
+      && Math.abs(x - _lastKeyLightSnapped.x) < _SHADOW_RECENTER_DISTANCE
+      && Math.abs(z - _lastKeyLightSnapped.z) < _SHADOW_RECENTER_DISTANCE) return;
   if (xs === _lastKeyLightSnapped.x && zs === _lastKeyLightSnapped.z) return;
 
   // Pressure-driven shadow throttle: under sustained GPU pressure,
@@ -783,7 +785,7 @@ function _updateKeyLight(x, z) {
   // coverage frustum, never the shadows themselves).  The position
   // intentionally stays *unsnapped-pending* — we return before writing
   // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
-  const now = performance.now();
+  const now = frameNow;
   const shadowInterval = _SHADOW_UPDATE_MIN_MS
     + _runtimePressure * (_SHADOW_THROTTLE_MAX_MS - _SHADOW_UPDATE_MIN_MS);
   if (_lastShadowUpdateMs > 0 && now - _lastShadowUpdateMs < shadowInterval) {
@@ -1026,10 +1028,12 @@ function _applyNoteColor(noteId, color) {
 }
 
 function _flushDirtyMeshes() {
+  const count = _dirtyInstanceMeshes.size;
   for (const mesh of _dirtyInstanceMeshes) {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
   }
   _dirtyInstanceMeshes.clear();
+  return count;
 }
 
 /**
@@ -1043,7 +1047,7 @@ function _flushDirtyMeshes() {
  * previous frame.
  */
 function _syncNoteColors(musicTime) {
-  if (!_playedTimeline || !_noteMeshMap || _playedTimeline.length === 0) return;
+  if (!_playedTimeline || !_noteMeshMap || _playedTimeline.length === 0) return 0;
   const tl = _playedTimeline;
   // Forward: cursor points at the next *un-played* entry.  Advance
   // while that entry's time is at or before the current music time.
@@ -1062,7 +1066,7 @@ function _syncNoteColors(musicTime) {
     const evt = tl[_playedCursor];
     _applyNoteColor(evt.id, _defaultNoteColor);
   }
-  _flushDirtyMeshes();
+  return _flushDirtyMeshes();
 }
 
 function handleBuildScene({ parsed }) {
@@ -1076,6 +1080,7 @@ function handleBuildScene({ parsed }) {
   _shadowThrottled = 0;
   _lastKeyLightSnapped.x = null;
   _lastKeyLightSnapped.z = null;
+  _resetJitterTotals();
 
   // Remove previous content.  We don't dispose the InstancedMesh
   // geometries / materials because they're cached inside the builder
@@ -1378,6 +1383,12 @@ function handleClock({ state, musicTime, tempoScale }) {
     // play session don't distort the p95 pressure signal.
     _playFrameMsIdx = 0;
     _playFrameMsFilled = 0;
+    _frameMsIdx = 0;
+    _frameMsFilled = 0;
+    _frameMsRing.fill(0);
+    _lastFrameFlags = 0;
+    _lastFrameCpuMs = 0;
+    _resetJitterTotals();
   } else if (state === 'paused') {
     if (lightBalls) lightBalls.pause();
   } else if (state === 'stopped') {
@@ -1391,7 +1402,7 @@ function handleClock({ state, musicTime, tempoScale }) {
   _markDirty();
 }
 
-function currentMusicTime() {
+function currentMusicTime(frameNow = performance.now()) {
   // `audioVisualOffsetMs` is added unconditionally to the music time
   // the visual side reads each frame.  Anchored on `SceneConfig` so a
   // settings-panel slider can move it live; the rAF loop calls into
@@ -1400,7 +1411,7 @@ function currentMusicTime() {
   // convention (+N = visuals lead audio by N ms).
   const offsetSec = (SceneConfig.audioVisualOffsetMs || 0) / 1000;
   if (clock.state === 'playing') {
-    const elapsed = (performance.now() - clock.perfAnchor) / 1000;
+    const elapsed = (frameNow - clock.perfAnchor) / 1000;
     return clock.musicAnchor + elapsed * clock.tempoScale + offsetSec;
   }
   return clock.musicAnchor + offsetSec;
@@ -1443,6 +1454,52 @@ let _rendersSkipped = 0;
  *  Written on *every* rAF tick (playing + idle) — used by `probe()`
  *  for the full frame-time histogram in the developer overlay. */
 const _frameMsRing = new Float64Array(120);
+const _FRAME_SHADOW = 1;
+const _FRAME_COLORS = 2;
+const _FRAME_STATS = 4;
+const _FRAME_BUDGET_SKIP = 8;
+let _lastFrameFlags = 0;
+let _lastFrameCpuMs = 0;
+const _newJitterBucket = () => ({ count: 0, sum: 0, max: 0, cpuSum: 0, cpuMax: 0, over12: 0, over16: 0, over20: 0, over33: 0 });
+const _jitterTotals = {
+  all: _newJitterBucket(),
+  afterShadow: _newJitterBucket(),
+  afterNoShadow: _newJitterBucket(),
+  afterColorUpload: _newJitterBucket(),
+  afterStats: _newJitterBucket(),
+  afterBudgetSkip: _newJitterBucket(),
+};
+function _addJitterSample(bucket, frame, cpu) {
+  bucket.count++;
+  bucket.sum += frame;
+  bucket.cpuSum += cpu;
+  if (frame > bucket.max) bucket.max = frame;
+  if (cpu > bucket.cpuMax) bucket.cpuMax = cpu;
+  if (frame > 12) bucket.over12++;
+  if (frame > 16) bucket.over16++;
+  if (frame > 20) bucket.over20++;
+  if (frame > 33) bucket.over33++;
+}
+function _recordJitterSample(frame, cpu, flags) {
+  _addJitterSample(_jitterTotals.all, frame, cpu);
+  _addJitterSample(flags & _FRAME_SHADOW ? _jitterTotals.afterShadow : _jitterTotals.afterNoShadow, frame, cpu);
+  if (flags & _FRAME_COLORS) _addJitterSample(_jitterTotals.afterColorUpload, frame, cpu);
+  if (flags & _FRAME_STATS) _addJitterSample(_jitterTotals.afterStats, frame, cpu);
+  if (flags & _FRAME_BUDGET_SKIP) _addJitterSample(_jitterTotals.afterBudgetSkip, frame, cpu);
+}
+function _resetJitterTotals() {
+  for (const bucket of Object.values(_jitterTotals)) {
+    bucket.count = 0;
+    bucket.sum = 0;
+    bucket.max = 0;
+    bucket.cpuSum = 0;
+    bucket.cpuMax = 0;
+    bucket.over12 = 0;
+    bucket.over16 = 0;
+    bucket.over20 = 0;
+    bucket.over33 = 0;
+  }
+}
 let _frameMsIdx = 0;
 let _frameMsFilled = 0;
 /** Subset of `_frameMsRing` — only records intervals from ticks that
@@ -1503,9 +1560,10 @@ function _markDirty() { _dirty = true; }
 
 function startRenderLoop() {
   lastFrameTime = performance.now();
-  const loop = () => {
+  const loop = (frameNow) => {
     rafId = requestAnimationFrame(loop);
-    const now = performance.now();
+    const now = Number.isFinite(frameNow) ? frameNow : performance.now();
+    const cpuStart = performance.now();
     const dt = Math.min(Math.max((now - lastFrameTime) / 1000, 0), 0.1);
     const frameMs = now - lastFrameTime;
     lastFrameTime = now;
@@ -1514,6 +1572,7 @@ function startRenderLoop() {
     // submit-time from real GPU-bound frame time.
     if (frameMs > 0 && frameMs < 2000) {
       _frameMsRing[_frameMsIdx] = frameMs;
+      if (clock.state === 'playing') _recordJitterSample(frameMs, _lastFrameCpuMs, _lastFrameFlags);
       _frameMsIdx = (_frameMsIdx + 1) % _frameMsRing.length;
       if (_frameMsFilled < _frameMsRing.length) _frameMsFilled++;
       // Separate ring for AQ: only record play-session frames so that
@@ -1525,8 +1584,10 @@ function startRenderLoop() {
       }
     }
 
+    let frameFlags = 0;
+
     // --- Animation phase (always runs) -------------------------------
-    const musicTime = currentMusicTime();
+    const musicTime = currentMusicTime(now);
     if (lightBalls) {
       lightBalls.setTime(musicTime);
       lightBalls.update(dt, camera);
@@ -1553,7 +1614,7 @@ function startRenderLoop() {
     // is automatically "focused" wherever the user's attention is,
     // so notation anywhere in the view always casts a visible
     // shadow rather than only the chunk near the world origin.
-    _updateKeyLight(controls.target.x, controls.target.z);
+    _updateKeyLight(controls.target.x, controls.target.z, now);
     // Distance-LOD visibility gating (LOD_DISTANT_ELEMENTS /
     // DISTANCE_CLIP_GLYPHS).  Skipped while a precompile is in flight
     // — precompilePipelines temporarily toggles hidden meshes visible
@@ -1568,7 +1629,8 @@ function startRenderLoop() {
     // coloured-note state exactly in sync with the current music
     // time — a scrub-back to 0 automatically reverts every played
     // note to the default dark colour in a single frame.
-    _syncNoteColors(musicTime);
+    const colorUploadCount = _syncNoteColors(musicTime);
+    if (colorUploadCount > 0) frameFlags |= _FRAME_COLORS;
 
     // --- Render phase (can be skipped when idle or under pressure) ----
     // Two reasons to skip a frame:
@@ -1594,6 +1656,7 @@ function startRenderLoop() {
       || _framesSinceRender >= 1;
     const shouldRender = !_compiling && _dirty && budgetGate;
     if (shouldRender) {
+      if (_keyLight?.shadow?.needsUpdate) frameFlags |= _FRAME_SHADOW;
       const t0 = performance.now();
       renderer.render(scene, camera);
       _lastRenderMs = performance.now() - t0;
@@ -1615,6 +1678,7 @@ function startRenderLoop() {
         self.postMessage({ type: 'sceneReady' });
       }
     } else {
+      if (!_compiling && _dirty && !budgetGate) frameFlags |= _FRAME_BUDGET_SKIP;
       _framesSinceRender++;
       _rendersSkipped++;
     }
@@ -1651,9 +1715,12 @@ function startRenderLoop() {
     // `handleProbe` reads, so the badge agrees with what `probe()`
     // would report on demand.
     if (now - _lastStatsPostMs >= STATS_POST_INTERVAL_MS) {
+      frameFlags |= _FRAME_STATS;
       _postStats();
       _lastStatsPostMs = now;
     }
+    _lastFrameFlags = frameFlags;
+    _lastFrameCpuMs = performance.now() - cpuStart;
   };
   loop();
 }
@@ -1866,6 +1933,17 @@ function handleProbe({ id }) {
   }
   fSamples.sort((a, b) => a - b);
   const fp = (q) => fSamples[Math.min(fSamples.length - 1, Math.floor(fSamples.length * q))];
+  const summarizeBucket = (bucket) => ({
+    count: bucket.count,
+    mean: bucket.count ? bucket.sum / bucket.count : 0,
+    max: bucket.max,
+    cpuMean: bucket.count ? bucket.cpuSum / bucket.count : 0,
+    cpuMax: bucket.cpuMax,
+    over12: bucket.over12,
+    over16: bucket.over16,
+    over20: bucket.over20,
+    over33: bucket.over33,
+  });
 
   // Mesh + light count in the scene graph (lights matter because each
   // one adds a loop iteration to every fragment shader).
@@ -1926,6 +2004,14 @@ function handleProbe({ id }) {
         p95: _frameMsFilled ? fp(0.95) : 0,
         p99: _frameMsFilled ? fp(0.99) : 0,
         max: fMax,
+      },
+      jitter: {
+        all: summarizeBucket(_jitterTotals.all),
+        afterShadow: summarizeBucket(_jitterTotals.afterShadow),
+        afterNoShadow: summarizeBucket(_jitterTotals.afterNoShadow),
+        afterColorUpload: summarizeBucket(_jitterTotals.afterColorUpload),
+        afterStats: summarizeBucket(_jitterTotals.afterStats),
+        afterBudgetSkip: summarizeBucket(_jitterTotals.afterBudgetSkip),
       },
       scene: {
         meshCount, instancedMeshCount, totalInstances, spriteCount,
