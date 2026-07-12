@@ -19,7 +19,7 @@ export const TITLE_LEFT_PADDING = 0.18;
  *  title → highest rendered notation, and lowest notation → paper edge.
  *  Measuring from full content bounds keeps spacing consistent when
  *  ledger notes, dynamics, slurs, or octave lines extend past a staff. */
-export const MIN_PAGE_PADDING = 0.30;
+export const MIN_PAGE_PADDING = 0.45;
 
 /** Title text height in world units.  Sized so that a single-line
  *  title plus its top + bottom padding stays a comfortable
