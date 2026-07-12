@@ -259,10 +259,12 @@ under `contentRoot`.  Direct scene children (lights) use world coordinates.
 
 ## Shadow / key light
 
-- `_keyLight` is a `DirectionalLight` that slides with `controls.target` every frame
-  so the shadow frustum always straddles what the camera is looking at.
-- `_updateKeyLight(x, z)` snaps the light position to texel-grid boundaries (rounds to
-  `_keyLightTexelSize` multiples) to prevent shadow-edge "crawling" during camera pan.
+- `_keyLight` is a `DirectionalLight` whose direction stays constant while its orthographic
+  coverage follows the camera target.
+- `_updateKeyLight(x, z)` keeps that coverage completely static inside a 2-world-unit
+  recenter dead zone, then moves by a texel-aligned amount.  The 40×30 frustum still has
+  ample coverage, while expensive 6144² shadow passes fall from ~26 Hz to ~3 Hz on Jupiter.
+- Texel-grid snapping (`_keyLightTexelSize`) prevents shadow-edge crawling at recenter time.
 - `_KEY_LIGHT_OFFSET` = `(-5, 12, 8)` gives an upper-left-front incident angle.
 
 ---
@@ -281,6 +283,13 @@ skip one frame to let the GPU drain.  Skips at most 1 frame in a row.
 
 **Note-glow fade by distance** (`setPlayheadX`): `glowTrailLength` in SceneConfig (default 4.0
 world units) determines how far behind the playhead notes keep their emissive.
+
+**Jitter diagnostics** (`probe().jitter`): frame intervals are correlated with the work from
+preceding frames (shadow pass, note-colour upload, stats heartbeat, budget skip) and include
+worker CPU time plus >12/16/20/33ms counts.  Measurements showed rare Chromium WebGPU
+20–34ms stalls occurring after ordinary low-CPU frames, i.e. browser/OS rAF scheduling rather
+than camera math, shadows, colour uploads, or stats.  Animation time is sampled from the rAF
+callback timestamp to keep all per-frame systems on one presentation clock.
 
 ---
 
