@@ -41,12 +41,15 @@ export class LuminoirApp {
   midiPlayer = new MIDIPlayer();
 
   _isPlaying = false;
+  _playPending = false;
+  _playRequestId = 0;
   _timemap = [];
   _noteTimeline = []; // { time, x, y, id, staff }
   /** Set to true once a score has been loaded successfully — gates
    *  `reloadCurrentScore` so the settings panel doesn't try to
    *  reparse before the user has picked anything. */
   _hasScoreLoaded = false;
+  _isScoreLoading = false;
   /**
    * Title / composer for the currently-loading or currently-loaded
    * score.  Set by `loadDemoScore` / `loadFile` before the score
@@ -64,8 +67,8 @@ export class LuminoirApp {
   /**
    * Fired right before a score-load (or reparse) starts and right
    * after it finishes.  The controls bar subscribes to these to show
-   * / hide the loading indicator and disable the score-select
-   * dropdown for the duration.  `onLoadEnd` fires regardless of
+   * / hide the loading indicator and disable score selection,
+   * import, and playback for the duration.  `onLoadEnd` fires regardless of
    * success or failure so the UI never gets stuck in a loading
    * state.
    */
@@ -147,8 +150,10 @@ export class LuminoirApp {
       console.warn(`[Luminoir] Unknown demo score: ${name}`);
       return;
     }
+    if (this._isScoreLoading) return;
     this._currentTitle = entry.title || null;
     this._currentComposer = entry.composer || null;
+    this._beginScoreLoad();
     // Fetch compressed MusicXML from `public/scores/` (first time)
     // and hand the ArrayBuffer to the worker.  Browser HTTP cache
     // handles subsequent picks of the same score.
@@ -159,49 +164,54 @@ export class LuminoirApp {
       await this._loadMXL(buffer);
     } catch (err) {
       console.error(`[Luminoir] Failed to load ${entry.url}:`, err);
+    } finally {
+      this._endScoreLoad();
     }
   }
 
   async loadFile(file) {
+    if (this._isScoreLoading) return;
     // Imported file: take the filename minus extension as the title,
     // leave the composer blank.  Users can rename their file before
     // import if they want richer metadata on the paper.
     this._currentTitle = (file.name || 'Imported file').replace(/\.[^.]+$/, '');
     this._currentComposer = null;
-    const isMXL = file.name.toLowerCase().endsWith('.mxl');
-    if (isMXL) {
-      const buffer = await file.arrayBuffer();
-      await this._loadMXL(buffer);
-    } else {
-      const text = await file.text();
-      await this._loadMusicXML(text);
+    this._beginScoreLoad();
+    try {
+      const isMXL = file.name.toLowerCase().endsWith('.mxl');
+      if (isMXL) {
+        const buffer = await file.arrayBuffer();
+        await this._loadMXL(buffer);
+      } else {
+        const text = await file.text();
+        await this._loadMusicXML(text);
+      }
+    } catch (err) {
+      console.error('[Luminoir] Failed to load imported score:', err);
+    } finally {
+      this._endScoreLoad();
     }
   }
 
   async _loadMXL(buffer) {
-    this.stop();
-    if (this.onLoadStart) this.onLoadStart();
-    try {
-      const result = await this.scoreClient.loadMXL(buffer);
-      await this._consumeScoreResult(result);
-    } catch (err) {
-      console.error('[Luminoir] Failed to load compressed MusicXML:', err);
-    } finally {
-      if (this.onLoadEnd) this.onLoadEnd();
-    }
+    const result = await this.scoreClient.loadMXL(buffer);
+    await this._consumeScoreResult(result);
   }
 
   async _loadMusicXML(xml) {
+    const result = await this.scoreClient.loadXML(xml);
+    await this._consumeScoreResult(result);
+  }
+
+  _beginScoreLoad() {
     this.stop();
+    this._isScoreLoading = true;
     if (this.onLoadStart) this.onLoadStart();
-    try {
-      const result = await this.scoreClient.loadXML(xml);
-      await this._consumeScoreResult(result);
-    } catch (err) {
-      console.error('[Luminoir] Failed to load MusicXML:', err);
-    } finally {
-      if (this.onLoadEnd) this.onLoadEnd();
-    }
+  }
+
+  _endScoreLoad() {
+    this._isScoreLoading = false;
+    if (this.onLoadEnd) this.onLoadEnd();
   }
 
   /**
@@ -213,16 +223,15 @@ export class LuminoirApp {
    * hasn't been loaded yet.
    */
   async reloadCurrentScore() {
-    if (!this._hasScoreLoaded) return;
-    this.stop();
-    if (this.onLoadStart) this.onLoadStart();
+    if (!this._hasScoreLoaded || this._isScoreLoading) return;
+    this._beginScoreLoad();
     try {
       const result = await this.scoreClient.reparse();
       await this._consumeScoreResult(result);
     } catch (err) {
       console.error('[Luminoir] Reparse failed:', err);
     } finally {
-      if (this.onLoadEnd) this.onLoadEnd();
+      this._endScoreLoad();
     }
   }
 
@@ -333,8 +342,22 @@ export class LuminoirApp {
   /* ------------------------------------------------------------------ */
 
   async play() {
-    if (this._isPlaying) return;
-    await this.midiPlayer.play();
+    if (this._isPlaying || this._playPending || this._isScoreLoading || !this._hasScoreLoaded) return;
+    const requestId = ++this._playRequestId;
+    this._playPending = true;
+    try {
+      await this.midiPlayer.play();
+    } catch (err) {
+      this._playPending = false;
+      if (requestId === this._playRequestId) throw err;
+      return;
+    }
+    if (requestId !== this._playRequestId || this._isScoreLoading || !this._hasScoreLoaded) {
+      this.midiPlayer.stop();
+      this._playPending = false;
+      return;
+    }
+    this._playPending = false;
     this._isPlaying = true;
     // Lightweight main-thread ticker that polls the MIDI player for
     // end-of-playback + feeds the optional UI time callback.  All the
@@ -361,13 +384,10 @@ export class LuminoirApp {
   }
 
   stop() {
+    this._playRequestId++;
     this._isPlaying = false;
     this.midiPlayer.stop();
     this.render.setClock('stopped', 0, this.midiPlayer.tempoScale);
-    if (this._noteTimeline.length > 0) {
-      const first = this._noteTimeline[0];
-      this.render.snapCameraTo(first.x, first.y);
-    }
     if (this.onStateChange) this.onStateChange(false);
   }
 

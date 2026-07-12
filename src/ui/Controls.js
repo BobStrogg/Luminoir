@@ -136,8 +136,8 @@ export function initControls(app) {
   // Loading indicator: the score worker fires onLoadStart when a
   // load (or reparse) begins and onLoadEnd when it finishes.  We
   // show a small spinner over the score-select chevron and disable
-  // the dropdown + import button so the user can't queue up
-  // overlapping loads.  The `.disabled` class fades the dropdown
+  // score selection, import, and playback until the renderer confirms
+  // the new scene's first frame.  The `.disabled` class fades the dropdown
   // and switches the cursor to `not-allowed` (since the new
   // dropdown is a <button>, not a native <select> with a
   // built-in `:disabled` style).
@@ -145,11 +145,13 @@ export function initControls(app) {
     if (scoreLoading) scoreLoading.classList.remove('hidden');
     if (scoreSelect) scoreSelect.classList.add('disabled');
     if (btnImport) btnImport.disabled = true;
+    if (btnPlay) btnPlay.disabled = true;
   };
   app.onLoadEnd = () => {
     if (scoreLoading) scoreLoading.classList.add('hidden');
     if (scoreSelect) scoreSelect.classList.remove('disabled');
     if (btnImport) btnImport.disabled = false;
+    if (btnPlay) btnPlay.disabled = false;
   };
 
   // Play / Pause toggle

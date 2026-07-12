@@ -112,14 +112,9 @@ export class SVGSceneParser {
       contentMinX: bounds.minX,
       contentMinY: bounds.minY,
       // Visible-staff Y-bounds (highest top staff line, lowest bottom
-      // staff line — ledger lines and otherElements like pedals or
-      // octave brackets are excluded).  The page-margin sizer in
-      // `TitleBlock.computePageMargins` uses these so the title sits
-      // a fixed distance above the staff itself instead of above
-      // wherever the highest stray ledger line happened to land.
-      // Falls back to the full content bounds for scores with no
-      // staff lines at all (the parser hasn't seen one yet, but it's
-      // the safe default).
+      // staff line — ledger lines and other notation are excluded).
+      // Retained as score metadata for diagnostics; paper layout uses
+      // the exact full-content bounds above.
       staffMaxY: staffBounds.maxY ?? bounds.maxY,
       staffMinY: staffBounds.minY ?? bounds.minY,
     };
@@ -239,12 +234,8 @@ export class SVGSceneParser {
     }
 
     // --- Ledger lines ---
-    // Tagged with `isLedger: true` so the page-margin sizer can
-    // exclude them when computing the visible staff Y-bounds.
-    // (Ledger lines for notes far above / below the staff would
-    // otherwise pull `staffMaxY` / `staffMinY` toward `contentMaxY`
-    // / `contentMinY` and defeat the whole point of the staff
-    // bounds existing — see `computePageMargins` in TitleBlock.)
+    // Tagged with `isLedger: true` so visible-staff diagnostics can
+    // distinguish them from the five structural staff lines.
     if (classList.includes('ledgerLines')) {
       const before = out.staffLines.length;
       this._collectStaffLinePaths(node, out.staffLines, scale);
@@ -916,8 +907,16 @@ export class SVGSceneParser {
       track(x + bb.maxX * pathScale, y - bb.minY * pathScale);
     };
 
-    // Notes: `x`/`y` is the SMuFL <use>'s absolute position — trustworthy.
-    for (const n of out.notes) track(n.x, n.y);
+    const glyphWorldScale = SceneConfig.scale * SceneConfig.glyphUseScale;
+    for (const n of out.notes) {
+      const bb = _pathBBox(n.glyphPath);
+      if (bb) {
+        track(n.x + bb.minX * glyphWorldScale, n.y + bb.minY * glyphWorldScale);
+        track(n.x + bb.maxX * glyphWorldScale, n.y + bb.maxY * glyphWorldScale);
+      } else {
+        track(n.x, n.y);
+      }
+    }
 
     for (const sl of out.staffLines) {
       if (sl.isLine) {
@@ -944,7 +943,6 @@ export class SVGSceneParser {
     // above the treble, system braces spanning all staves, etc.)
     // without polluting the bounds with the (0.5, -0.5) ancestor
     // translate carried by stem-like absolute-coord paths.
-    const glyphWorldScale = SceneConfig.scale * SceneConfig.glyphUseScale;
     for (const el of out.otherElements) {
       if (el.isLine) {
         track(el.x1, el.y1);
@@ -983,10 +981,8 @@ export class SVGSceneParser {
    *     above the treble, slurs / hairpins / dynamics — these are
    *     the very things `staffMaxY` / `staffMinY` exist to ignore).
    *
-   * The page-margin sizer in `TitleBlock.computePageMargins` reads
-   * these bounds so the title sits a constant gap above the actual
-   * 5-line staff regardless of how far the music's ledger lines or
-   * pedal markings extend.
+   * These bounds are retained as diagnostic metadata; paper sizing
+   * uses full rendered-content bounds.
    *
    * Returns `{ minY: null, maxY: null }` if no non-ledger staff
    * lines were collected (the parser handles unknown markup
@@ -1007,6 +1003,14 @@ export class SVGSceneParser {
         if (typeof sl.y2 === 'number') {
           if (sl.y2 < minY) minY = sl.y2;
           if (sl.y2 > maxY) maxY = sl.y2;
+        }
+      } else if (sl.d) {
+        const bb = _pathBBox(sl.d);
+        if (bb) {
+          const pathMinY = sl.y - bb.maxY * SceneConfig.scale;
+          const pathMaxY = sl.y - bb.minY * SceneConfig.scale;
+          if (pathMinY < minY) minY = pathMinY;
+          if (pathMaxY > maxY) maxY = pathMaxY;
         }
       } else if (typeof sl.y === 'number') {
         if (sl.y < minY) minY = sl.y;
@@ -1030,10 +1034,9 @@ export class SVGSceneParser {
  * would otherwise union a bunch of deltas with a couple of real
  * coordinates and return nonsense.
  *
- * Quadratic / cubic Béziers can curve outside the polygon of their
- * control points, so the box is a slight over-estimate of the
- * rendered outline; good enough to recover a notehead's horizontal
- * centre for light-ball placement.
+ * Quadratic / cubic Bézier extrema are solved analytically instead of
+ * treating control points as rendered points.  The latter greatly
+ * over-estimates long slurs and makes paper margins score-dependent.
  *
  * Cached by `d`-string so we pay the parse cost once per unique
  * glyph, not once per note instance (Sylvia Suite has 6 881 notes
@@ -1053,6 +1056,9 @@ function _pathBBox(d) {
   let x = 0, y = 0;
   let startX = 0, startY = 0;
   let cmd = '';
+  let previousCommand = '';
+  let cubicControlX = 0, cubicControlY = 0;
+  let quadraticControlX = 0, quadraticControlY = 0;
   // Gather the tokens once — the regex is the same format used by
   // SVG3DBuilder.tokenizePathD, but we don't bother importing that
   // to keep the parser module self-contained.
@@ -1067,6 +1073,26 @@ function _pathBBox(d) {
     if (px > maxX) maxX = px;
     if (py < minY) minY = py;
     if (py > maxY) maxY = py;
+  };
+  const trackQuadratic = (x0, y0, cx, cy, x1, y1) => {
+    track(x0, y0);
+    track(x1, y1);
+    const tx = _quadraticExtremum(x0, cx, x1);
+    const ty = _quadraticExtremum(y0, cy, y1);
+    if (tx > 0 && tx < 1) track(_quadraticAt(x0, cx, x1, tx), _quadraticAt(y0, cy, y1, tx));
+    if (ty > 0 && ty < 1) track(_quadraticAt(x0, cx, x1, ty), _quadraticAt(y0, cy, y1, ty));
+  };
+  const trackCubic = (x0, y0, c1x, c1y, c2x, c2y, x1, y1) => {
+    track(x0, y0);
+    track(x1, y1);
+    const roots = _cubicExtrema(x0, c1x, c2x, x1);
+    roots.push(..._cubicExtrema(y0, c1y, c2y, y1));
+    for (const t of roots) {
+      if (t > 0 && t < 1) track(
+        _cubicAt(x0, c1x, c2x, x1, t),
+        _cubicAt(y0, c1y, c2y, y1, t),
+      );
+    }
   };
   let i = 0;
   while (i < toks.length) {
@@ -1098,30 +1124,42 @@ function _pathBBox(d) {
         break;
       }
       case 'C': {
+        const x0 = x, y0 = y;
         const c1x = rx(toks[i++]); const c1y = ry(toks[i++]);
         const c2x = rx(toks[i++]); const c2y = ry(toks[i++]);
         const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        track(c1x, c1y); track(c2x, c2y); track(nx, ny);
+        trackCubic(x0, y0, c1x, c1y, c2x, c2y, nx, ny);
+        cubicControlX = c2x; cubicControlY = c2y;
         x = nx; y = ny;
         break;
       }
       case 'S': {
+        const x0 = x, y0 = y;
+        const c1x = previousCommand === 'C' || previousCommand === 'S' ? 2 * x - cubicControlX : x;
+        const c1y = previousCommand === 'C' || previousCommand === 'S' ? 2 * y - cubicControlY : y;
         const c2x = rx(toks[i++]); const c2y = ry(toks[i++]);
         const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        track(c2x, c2y); track(nx, ny);
+        trackCubic(x0, y0, c1x, c1y, c2x, c2y, nx, ny);
+        cubicControlX = c2x; cubicControlY = c2y;
         x = nx; y = ny;
         break;
       }
       case 'Q': {
+        const x0 = x, y0 = y;
         const c1x = rx(toks[i++]); const c1y = ry(toks[i++]);
         const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        track(c1x, c1y); track(nx, ny);
+        trackQuadratic(x0, y0, c1x, c1y, nx, ny);
+        quadraticControlX = c1x; quadraticControlY = c1y;
         x = nx; y = ny;
         break;
       }
       case 'T': {
+        const x0 = x, y0 = y;
+        const cx = previousCommand === 'Q' || previousCommand === 'T' ? 2 * x - quadraticControlX : x;
+        const cy = previousCommand === 'Q' || previousCommand === 'T' ? 2 * y - quadraticControlY : y;
         const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        track(nx, ny);
+        trackQuadratic(x0, y0, cx, cy, nx, ny);
+        quadraticControlX = cx; quadraticControlY = cy;
         x = nx; y = ny;
         break;
       }
@@ -1142,9 +1180,43 @@ function _pathBBox(d) {
       default:
         i++;
     }
+    previousCommand = up;
   }
   if (minX === Infinity) { _bboxCache.set(d, null); return null; }
   const box = { minX, maxX, minY, maxY };
   _bboxCache.set(d, box);
   return box;
+}
+
+function _quadraticAt(p0, p1, p2, t) {
+  const mt = 1 - t;
+  return mt * mt * p0 + 2 * mt * t * p1 + t * t * p2;
+}
+
+function _quadraticExtremum(p0, p1, p2) {
+  const denominator = p0 - 2 * p1 + p2;
+  return Math.abs(denominator) < 1e-12 ? -1 : (p0 - p1) / denominator;
+}
+
+function _cubicAt(p0, p1, p2, p3, t) {
+  const mt = 1 - t;
+  return mt * mt * mt * p0
+    + 3 * mt * mt * t * p1
+    + 3 * mt * t * t * p2
+    + t * t * t * p3;
+}
+
+function _cubicExtrema(p0, p1, p2, p3) {
+  const a = -p0 + 3 * p1 - 3 * p2 + p3;
+  const b = 3 * p0 - 6 * p1 + 3 * p2;
+  const c = -3 * p0 + 3 * p1;
+  const qa = 3 * a;
+  const qb = 2 * b;
+  if (Math.abs(qa) < 1e-12) {
+    return Math.abs(qb) < 1e-12 ? [] : [-c / qb];
+  }
+  const discriminant = qb * qb - 4 * qa * c;
+  if (discriminant < 0) return [];
+  const root = Math.sqrt(discriminant);
+  return [(-qb + root) / (2 * qa), (-qb - root) / (2 * qa)];
 }
