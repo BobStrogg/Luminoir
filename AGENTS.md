@@ -303,6 +303,11 @@ world units) determines how far behind the playhead notes keep their emissive.
 **Renderer badge** is inside the Settings panel (not a top-bar overlay).  It was moved
 there so the gear icon isn't pushed off-screen on narrow mobile viewports.
 
+**Phone top row**: keep Settings at the normal top-right position in portrait.  A previous
+`orientation: portrait` rule forced it to `top: 92px` even when the 288px controls bar left
+ample room on 375–430px iPhones.  At ≤350px, shrink only the score label to 120px; all tap
+targets then remain on one row without overlap even at 320px.
+
 ---
 
 ## Known gotchas
