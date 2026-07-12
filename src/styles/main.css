@@ -833,22 +833,12 @@ html, body {
   }
 }
 
-/* Phone-portrait specific override.
- *
- * In portrait the controls bar wraps to two rows (≈ 74 px tall), so
- * the gear button at the default `top: 12 px` would sit underneath
- * the bar's right edge and become unclickable.  We push it down past
- * the wrapped bar so it lives in its own clear strip below the
- * controls.  In landscape the bar fits in one row and the gear
- * stays in the original top corner alongside it. */
-@media (max-width: 600px) and (orientation: portrait) {
-  #btn-settings {
-    top: 92px;
-  }
-  #fps-badge {
-    top: 124px;
-  }
-  .settings-popover {
-    top: 130px;
+/* Very narrow phones still fit every top control in one row when the
+ * score label gives up 30 px.  This keeps the Settings button in the
+ * top-right even on a 320 px-wide iPhone without shrinking tap targets. */
+@media (max-width: 350px) {
+  #score-select {
+    min-width: 120px;
+    max-width: 120px;
   }
 }
