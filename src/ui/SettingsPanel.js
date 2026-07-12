@@ -336,7 +336,7 @@ export class SettingsPanel {
     /** Small dot that fills with colour proportional to GPU pressure. */
     const pressureDot = document.createElement('span');
     pressureDot.className = 'settings-aq-pressure';
-    pressureDot.title = 'GPU pressure (0 = none, full = lights dimmed)';
+    pressureDot.title = 'GPU pressure (0 = none, full = reduced light and shadow load)';
 
     aqCheck.addEventListener('change', () => {
       this._app.render.updateConfig({ autoDegrade: aqCheck.checked });
@@ -349,7 +349,7 @@ export class SettingsPanel {
 
     const aqDesc = document.createElement('div');
     aqDesc.className = 'settings-desc';
-    aqDesc.textContent = 'Several optimisations are always active: distance-based detail reduction, glyph culling when zoomed out, frame-skip when the GPU is behind, and a shared point-light pool. This toggle adds smooth light-ball dimming when sustained GPU pressure is detected, recovering automatically when load eases. Shadow quality and render resolution are set once at startup from a quick GPU probe and never change mid-session. Disable this toggle to lock lights at full brightness for benchmarking.';
+    aqDesc.textContent = 'Several optimisations are always active: off-screen score culling where supported, distance-based detail reduction, a shared point-light pool, and shadow refresh throttling. Safari, mobile, and Tesla also measure each score while its loading screen is visible so dense notation can start at a sustainable quality. During playback this toggle responds only when performance falls below 60 fps, smoothly reducing light and shadow work without reallocating the renderer. Disable it to turn off pressure-driven changes for benchmarking.';
     aqRow.appendChild(aqDesc);
 
     sectionEl.appendChild(aqRow);

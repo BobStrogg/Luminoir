@@ -103,12 +103,6 @@ export class LuminoirApp {
     // both learn about it.
     this.midiPlayer.onPlaybackComplete = () => this.stop();
 
-    // Lightweight main-thread ticker that polls the MIDI player for
-    // end-of-playback + feeds the optional UI time callback.  All the
-    // heavy animation / rendering happens in the worker, but we still
-    // need a place to notice "playback reached the end".
-    this._startMainTicker();
-
     // iOS Safari refuses to produce audio from any AudioContext that
     // wasn't instantiated inside a user-gesture handler, so we defer
     // creation until the first tap anywhere on the page.  MIDIPlayer
@@ -342,6 +336,11 @@ export class LuminoirApp {
     if (this._isPlaying) return;
     await this.midiPlayer.play();
     this._isPlaying = true;
+    // Lightweight main-thread ticker that polls the MIDI player for
+    // end-of-playback + feeds the optional UI time callback.  All the
+    // heavy animation / rendering happens in the worker, but we still
+    // need a place to notice "playback reached the end".
+    this._startMainTicker();
     // The worker tracks music time locally from this anchor.
     this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
     if (this.onStateChange) this.onStateChange(true);
@@ -396,12 +395,16 @@ export class LuminoirApp {
   /* ------------------------------------------------------------------ */
 
   _startMainTicker() {
+    if (this._tickTimer) return;
     const tick = () => {
-      this._tickRAF = requestAnimationFrame(tick);
-      if (!this._isPlaying) return;
+      if (!this._isPlaying) {
+        this._tickTimer = 0;
+        return;
+      }
       const t = this.midiPlayer.currentTime;
       if (this.onTimeUpdate) this.onTimeUpdate(t);
       this.midiPlayer.checkComplete();
+      this._tickTimer = setTimeout(tick, 100);
     };
     tick();
   }
@@ -495,7 +498,7 @@ export class LuminoirApp {
   }
 
   dispose() {
-    if (this._tickRAF) cancelAnimationFrame(this._tickRAF);
+    if (this._tickTimer) clearTimeout(this._tickTimer);
     this.render.dispose();
     this.midiPlayer.dispose();
     this.scoreClient.dispose();
