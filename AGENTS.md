@@ -231,14 +231,15 @@ Worker-side settings that are NOT in the registry (design-time tunables):
   control points.
 - Note bounds include the complete notehead glyph, not only its anchor.  Full content bounds
   therefore enclose every mesh emitted by the builder.
-- `computePageMargins()` uses a fixed `MIN_PAGE_PADDING` (0.30 wu) for all three visible
-  gaps: paper top→title, title→highest notation, and lowest notation→paper bottom.  Do not
-  turn notation overhang into extra exterior padding; that counts the same extent twice.
+- `computePageMargins()` uses a fixed `MIN_PAGE_PADDING` (0.45 wu, matching horizontal
+  paper margin) for all three visible gaps: paper top→title, title→highest notation, and
+  lowest notation→paper bottom.  Do not turn notation overhang into extra exterior padding;
+  that counts the same extent twice.
 - `SVG3DBuilder._measureTitleLayout()` measures the actual Optimer glyph geometry and uses
   those same bounds for paper sizing and title baselines.  Canvas/Georgia font metrics are
   only a fallback when the 3D font has not loaded.
-- Reference results: Albatross paper height ≈4.09 wu; Clair de Lune ≈6.71 wu; every built-in
-  score has 0.30 wu visible top/title/bottom gaps.
+- Reference results: Albatross paper height ≈4.54 wu; Clair de Lune ≈7.16 wu; every built-in
+  score has 0.45 wu visible top/title/bottom gaps.
 
 ---
 
