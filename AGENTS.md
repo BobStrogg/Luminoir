@@ -75,10 +75,14 @@ must be pushed via `RenderClient.updateConfig({ 'dot.path': value })`.
 
 ## Dual-renderer strategy
 
-1. Try `WebGPURenderer` (three/webgpu) first — better on Chrome/Edge/Safari TP.
-2. Smoke-test with `_verifyWebGPURenders()` (clear 2×2 RT to magenta, read back).
-   - Tesla browser: `init()` resolves but nothing reaches the canvas → demote to WebGL.
-3. Fall back to legacy `THREE.WebGLRenderer`.
+1. Try `WebGPURenderer` (three/webgpu) first — better on Chrome/Edge/current Safari.
+2. If construction or `init()` throws, fall back to legacy `THREE.WebGLRenderer`.
+
+Do not reintroduce the old `_verifyWebGPURenders()` render-target readback.  It produced
+false negatives on working WebGPU contexts and could taint the device after a validation
+error, leaving neither WebGPU nor WebGL usable.  Tesla normally exposes no WebGPU and
+therefore takes the legacy WebGL path naturally; `/Tesla|TESLA_AUTO/` applies its
+constrained quality profile there.
 
 **Do NOT use WebGPURenderer's built-in WebGL2 backend** (`forceWebGL` constructor
 option).  Its `InstanceNode` packs matrices into a UBO capped at 256 entries
@@ -118,40 +122,39 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 
 **GPU quality system** (two phases, in `renderWorker.js`):
 
-**Phase 1 — load-time probe** (`_probeGpuCost` + `_applyLoadTimeQuality`, called once in `handleInit`):
-- Renders the empty scene 7 times **with a forced shadow pass per frame** and a
+**Phase 1 — hidden load-time probes** (`_probeGpuCost` + `_applyLoadTimeQuality` / `_refineSceneQuality`):
+- Init renders the empty scene 5 times **with a forced shadow pass per frame** and a
   **GPU-completion fence per frame** (`_gpuSync`: WebGPU `queue.onSubmittedWorkDone()`,
-  WebGL 1×1 `readPixels`); returns the **minimum** sample.
-- CRITICAL: the GPU fence is what makes the probe meaningful on Chromium — bare
-  `renderer.render()` only measures CPU submit time (~0.25 ms on any machine), which
-  used to route every Chromium browser into the top tier regardless of GPU speed.
-  The minimum (not median) is used because early samples are inflated by idle GPU
-  clock ramp-up, which flipped borderline machines between tiers across reloads.
-- Picks the highest shadow-map resolution that fits within half the frame budget.
-- Sets shadow mapSize, DPR cap, and PCF type **once** — never changes during the session.
-  (`handleResize` must respect `_chosenDprCap` — it used to hardcode `min(dpr, 2)` and
-  silently undo the probe's choice on the first window resize.)
-- Mobile always uses 2048² PCF, DPR 1.5 regardless of probe result.
-- Probe thresholds (desktop, GPU-synced): < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096² PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
+  WebGL 1×1 `readPixels`); it returns the **minimum** sample.
+- CRITICAL: the GPU fence makes the probe meaningful on Chromium — bare
+  `renderer.render()` only measures CPU submit time (~0.25 ms), which previously routed
+  every Chromium browser into the top tier regardless of GPU speed.
+- Initial desktop thresholds: < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096²
+  PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
+- Mobile and Tesla are constrained profiles: no MSAA, 2048² PCF, DPR 1.5. Safari,
+  mobile, and Tesla cap the pooled point-light shader loop at four lights.
+- Safari, mobile, and Tesla run a second 3-frame **median** probe with the real score
+  while the loading overlay remains visible.  If a forced full frame exceeds 14 ms it
+  can only step down (6144→4096→2048, plus 1024/DPR 1.25 on constrained devices).
+- Shadow map/DPR/PCF may change only while `_compiling` keeps the loading overlay up;
+  they never change during playback. `handleResize` must continue respecting
+  `_chosenDprCap`.
 
 **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
-- A 0→1 float driven by p95 rAF interval vs calibrated baseline (30-tick **p95** window).
-- CRITICAL: baseline and signal must be the SAME statistic (p95 vs p95).  The old p10
-  baseline sat below healthy p95 vsync jitter, so pressure ratcheted to 1.0 within
-  seconds of starting any playback — even at a rock-solid 120 fps — and permanently
-  dimmed the lights.
-- Rises toward 1 over ~1 s of sustained overrun (p95 ≥ baseline × 1.3).
-- Falls toward 0 over ~3 s of headroom (p95 ≤ baseline × 1.15).
+- A 0→1 float driven by the recent p95 rAF interval against a fixed 16.67 ms (60 fps)
+  target.  This avoids degrading a healthy 120 Hz session merely because an occasional
+  frame takes two display refreshes.
+- The p95 ring is sorted at 4 Hz, not every rAF tick; pressure itself still eases every
+  frame.  The 30-tick p95 calibration remains diagnostic only.
+- Rises toward 1 after sustained p95 ≥ 19.17 ms and falls with p95 ≤ 17.5 ms.
 - Two actuators:
-  1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`) — cosmetic dim.
-  2. **Shadow-update throttle** (`_updateKeyLight`): under pressure, shadow-map re-renders
-     are spaced out up to `pressure × 150 ms` apart.  This is the actuator that actually
-     recovers GPU time (the shadow pass re-renders nearly every frame during playback
-     because the playhead crosses a texel almost every tick).  Visually free: translating
-     a DirectionalLight never moves the shadows, it only slides the coverage frustum
-     (half-width 20 wu vs ≈ 0.5 wu/s playhead motion).
-- Controlled by `autoDegrade` flag (`updateConfig({ autoDegrade: bool })`); disabling restores full intensity immediately.
-- Settings panel shows a pressure dot (green → amber → red) instead of a tier label.
+  1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
+  2. **Shadow-update throttle** (`_updateKeyLight`): static directional-shadow coverage
+     refreshes at most 30 Hz at zero pressure and stretches toward 150 ms (~7 Hz) at
+     full pressure.  Translating the DirectionalLight never changes shadow direction;
+     it only slides the 40 wu-wide coverage frustum, so this is visually stable.
+- Controlled by `autoDegrade`; disabling restores full intensity immediately.
+- Settings shows a pressure dot (green → amber → red).
 
 **Runtime LOD** (`_applyLodVisibility` in `renderWorker.js` + bucket tags from `SVG3DBuilder`):
 - Implements `LOD_DISTANT_ELEMENTS` / `DISTANCE_CLIP_GLYPHS` / `LOD_DISTANCE_THRESHOLD`
@@ -168,7 +171,16 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - Mesh `.visible` toggling does NOT recompile WebGPU pipelines (unlike light `.visible`)
   and all pipelines are pre-warmed by `precompilePipelines` regardless of visibility.
 
-**Key design rule**: shadow map size, DPR, and PCF type must NEVER be changed at runtime. Doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame. They are load-time only.
+**Horizontal bucket chunking** (`CHUNK_BUCKETS_BY_X`):
+- Enabled at worker init for legacy WebGL (Tesla's expected renderer) and Safari WebGPU;
+  disabled for Chromium WebGPU because some drivers pop `InstancedMesh` chunks at
+  oblique camera angles.
+- Splits each glyph/line bucket into at most 30 X chunks, allowing both the scene camera
+  and directional shadow camera to reject the rest of a long score.
+- Jupiter WebGL measurement: ~2.5 M → ~459 k submitted triangles at the playhead;
+  frame p95 improved from ~12.7 ms to ~9.2 ms on the reference Chromium run.
+
+**Key design rule**: shadow map size, DPR, and PCF type must NEVER be changed during playback. Doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame. They may change while `_compiling` keeps the score-loading overlay visible.
 
 ---
 

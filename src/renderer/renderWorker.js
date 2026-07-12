@@ -28,41 +28,33 @@ import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
 /**
  * Two-phase GPU quality system.
  *
- * **Phase 1 — load-time probe** (`_probeGpuCost`, called once during
- * `handleInit`):
- *   Renders the empty scene (paper + lights, no score geometry) several
- *   times and measures wall-clock time.  From that cost it picks the
- *   highest shadow-map resolution that keeps a single frame under the
- *   target budget, then sets shadow mapSize, DPR, and PCF type once.
- *   These settings never change again during the session — no mid-session
- *   dispose, no resolution pop, no shadow-map flicker.
- *
- *   The probe runs in parallel with the Verovio WASM parse of the first
- *   score, so it adds zero latency to the perceived load time.
+ * **Phase 1 — load-time probe** (`_probeGpuCost`, called during init and
+ * score loading):
+ *   The init probe renders the empty scene several times to choose the
+ *   maximum shadow-map resolution, DPR, and PCF type the GPU can support.
+ *   Safari, mobile, and Tesla then run a second probe with the real score
+ *   while the loading overlay is still visible.  That probe may only
+ *   downshift quality, so dense geometry is measured without causing a
+ *   mid-playback resolution pop or shadow-map flicker.
  *
  * **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
- *   A 0→1 float that rises when frames are over-budget and falls when
- *   there is headroom.  It is used only to smoothly scale
- *   `SceneConfig.lightBall.intensity` (the point-light contribution of
- *   the bouncing balls).  `LightBallController.update()` reads that
- *   field every frame, so the change takes effect on the very next tick
- *   with no visual artifact — the lights gently dim under pressure and
- *   recover when the load eases.
+ *   A 0→1 float that rises only when recent p95 frame time exceeds
+ *   the 60 fps target.  It smoothly scales light-ball intensity and
+ *   spaces out static directional-shadow refreshes from 30 Hz toward
+ *   ~7 Hz.  Neither actuator reallocates GPU resources.
  *
- *   Changing light intensity is the only runtime-safe knob: shadow map
- *   size, DPR, and PCF type all require a dispose / reallocate that
- *   causes a blank or flickery frame, so they are load-time only.
+ *   Shadow map size, DPR, and PCF type require a dispose / reallocate,
+ *   so those settings only change behind the score-loading overlay.
  *
  * Calibration:
  *   The baseline rAF interval is measured from the first 30 play-session
- *   ticks (≈ 250 ms at 120 Hz) using the p95 percentile — the *same*
- *   statistic the runtime signal uses, so healthy-vs-degraded comparisons
- *   are like-for-like and thresholds adapt automatically to 60/90/120 Hz
- *   and ProMotion displays.
+ *   ticks for diagnostics.  Runtime pressure itself targets a fixed
+ *   16.67 ms frame budget so a 120 Hz display does not degrade quality
+ *   merely because an occasional frame takes two refresh intervals.
  */
 
 /** Baseline rAF interval (ms) learned from the first play session.
- *  Set once by `_calibrate()`; used by the runtime pressure logic. */
+ *  Set once by `_calibrate()` and exposed for diagnostics. */
 let _baselineMs = 16.67;
 let _calibrated = false;
 let _calibCount = 0;
@@ -71,21 +63,10 @@ const _calibBuf  = new Float64Array(_CALIB_TICKS);
 const _calibSort = new Float64Array(_CALIB_TICKS);
 
 /** Feed one rAF interval sample.  Locks `_baselineMs` after
- *  `_CALIB_TICKS` samples using the **p95** of the collected window.
- *
- *  The percentile choice matters: the runtime pressure signal compares
- *  the *p95* of recent play frames against this baseline, so the
- *  baseline must be the same statistic measured under healthy
- *  conditions.  The previous p10 baseline (the *fastest* frames)
- *  guaranteed a mismatch — at 120 Hz, healthy vsync jitter puts p95 at
- *  ≈ 9.5–10.3 ms while p10 reads ≈ 7.9 ms, so p95 never dropped below
- *  the release threshold (p10 × 1.15 ≈ 9.1 ms) and pressure ratcheted
- *  to 1.0 within seconds of starting *any* playback, permanently
- *  dimming the lights even at a rock-solid 120 fps.
- *
- *  p95 of a 30-sample window (index 28) is also robust to a single
- *  outlier — e.g. the one-off soundfont-load stall right at play
- *  start lands at index 29 and doesn't skew the baseline. */
+ *  `_CALIB_TICKS` samples using the p95 of the collected window.  The
+ *  value is diagnostic; runtime pressure uses a fixed 60 fps target.
+ *  Keeping p95 here makes the diagnostic directly comparable with the
+ *  live p95 signal and ignores one isolated maximum-value stall. */
 function _calibrate(frameMs) {
   if (_calibrated || frameMs <= 0 || frameMs >= 2000) return;
   _calibBuf[_calibCount++] = frameMs;
@@ -107,6 +88,8 @@ function _resetCalibration() {
   _calibBuf.fill(0);
   _baselineMs = 16.67;
   _calibrated = false;
+  _lastAqSampleMs = 0;
+  _latestAqP95 = 0;
 }
 
 /**
@@ -123,8 +106,16 @@ let _autoDimEnabled = true;
  *  via `probe()` so the dev overlay / Playwright tests can verify the
  *  quality selection matches the hardware. */
 let _probeMsMeasured = -1;
+let _sceneProbeMsMeasured = -1;
 let _chosenShadowMapSize = 0;
 let _chosenDprCap = 0;
+let _baseDevicePixelRatio = 1;
+let _maxShadowMapSize = 0;
+let _maxDprCap = 0;
+let _maxSoftPcf = false;
+let _sceneGpuBudgetMs = 14;
+let _runSceneProbe = false;
+let _allowVeryLowQuality = false;
 
 /**
  * Update `_runtimePressure` and apply it to light intensity.
@@ -135,8 +126,9 @@ let _chosenDprCap = 0;
 function _updateRuntimePressure(dt, frameP95) {
   if (!_autoDimEnabled || !_calibrated) return;
 
-  const highMs = _baselineMs * 1.3;  // > 30 % over budget → build pressure
-  const lowMs  = _baselineMs * 1.15; // comfortably under → release pressure
+  const targetMs = 1000 / 60;
+  const highMs = targetMs * 1.15;
+  const lowMs  = targetMs * 1.05;
 
   if (frameP95 >= highMs) {
     // Rise toward 1 over ~1 s of sustained overrun.
@@ -185,47 +177,40 @@ async function _gpuSync() {
 }
 
 /**
- * Probe GPU rendering cost with the empty scene (lights, paper, no
- * score geometry) by rendering it `count` times and returning the
- * best-case wall-clock time per frame in milliseconds — *including*
- * GPU execution time (see `_gpuSync`) and *including* a full
- * shadow-map pass per frame.
+ * Probe GPU rendering cost with the current scene by rendering it
+ * `count` times and returning wall-clock milliseconds — including GPU
+ * execution time (`_gpuSync`) and a full shadow-map pass per frame.
  *
  * The shadow pass must be forced explicitly: `_updateKeyLight` switches
  * the key light to manual shadow updates (`shadow.autoUpdate = false`)
  * during `setupLighting`, so without `needsUpdate = true` per frame the
- * probe would measure frames with no shadow render at all — and the
- * shadow pass is precisely the dominant cost the probe exists to
- * measure (during playback the playhead crosses a shadow texel almost
- * every frame, so the real render loop re-renders the map nearly every
- * frame).
+ * probe would measure frames with no shadow render at all.  Forcing it
+ * measures the worst frame in the 30 Hz shadow-refresh cadence.
  *
- * Called once during `handleInit`, before `startRenderLoop`, while the
- * score worker is busy parsing the first score's Verovio WASM.  On a
- * fast machine this takes 20–60 ms and is invisible to the user.
- *
- * Returns the **minimum** sample rather than the median: the probe
- * classifies *capability* ("can this GPU sustain the top tier?"), and
- * the minimum is the GPU's demonstrated best case.  Early probe frames
- * run while the GPU is still ramping up from idle clocks, which
- * inflates the median enough to flip borderline machines between
- * tiers from one reload to the next; the min is stable because a
- * genuinely slow GPU's best case is still slow.
+ * Init uses the minimum sample to classify peak hardware capability;
+ * the optional score-aware pass uses the median to make a conservative
+ * downshift decision after real geometry is present.
  */
-async function _probeGpuCost(count = 7) {
+async function _probeGpuCost(count = 7, median = false) {
   if (!renderer || !scene || !camera) return 0;
   // Warm-up render — don't measure: first call often stalls on driver
   // JIT / shader cache miss regardless of scene complexity.
   renderer.render(scene, camera);
   await _gpuSync();
   let best = Infinity;
+  const samples = median ? new Float64Array(count) : null;
   for (let i = 0; i < count; i++) {
     if (_keyLight) _keyLight.shadow.needsUpdate = true;
     const t0 = performance.now();
     renderer.render(scene, camera);
     await _gpuSync();
     const t = performance.now() - t0;
+    if (samples) samples[i] = t;
     if (t < best) best = t;
+  }
+  if (samples) {
+    samples.sort();
+    return samples[Math.floor(samples.length / 2)];
   }
   return Number.isFinite(best) ? best : 0;
 }
@@ -233,10 +218,6 @@ async function _probeGpuCost(count = 7) {
 /**
  * Choose and apply shadow-map size, DPR cap, and PCF type based on the
  * result of `_probeGpuCost()`.  Called once from `handleInit`.
- *
- * Target budget per probe frame = baseline / 2 (leave half the frame
- * time for geometry + shading once a score is loaded).  For a 120 Hz
- * display the budget is ~4 ms; for 60 Hz ~8 ms.
  *
  * Probe cost reference, GPU-synced via `_gpuSync` (empty scene with a
  * forced 6144² PCFSoft shadow pass at DPR ≤ 2 — see `_probeGpuCost`):
@@ -247,26 +228,36 @@ async function _probeGpuCost(count = 7) {
  * only and read ~0.25 ms on every Chromium machine, which routed all
  * of them into the top tier regardless of actual GPU speed.)
  */
-function _applyLoadTimeQuality(probeMs, baseDpr, isMobile) {
+function _applyLoadTimeQuality(probeMs, baseDpr, isConstrained) {
+  let mapSize;
+  let softPcf;
+  let dprCap;
   // On mobile the rAF rate halves permanently the first time a frame
   // exceeds budget, so we are extremely conservative.
-  if (isMobile) {
-    _setShadowQuality(2048, false, baseDpr, 1.5);
-    return;
-  }
-  // For desktop, pick the highest quality that fits half the frame budget.
-  // Probe was done on empty scene; real scene costs more, so the half-
-  // budget target provides headroom for geometry + shading.
-  if (probeMs < 2) {
+  if (isConstrained) {
+    mapSize = 2048;
+    softPcf = false;
+    dprCap = 1.5;
+  } else if (probeMs < 2) {
     // Very fast GPU (M3/M4, dedicated GPU) — full quality.
-    _setShadowQuality(6144, true, baseDpr, 2.0);
+    mapSize = 6144;
+    softPcf = true;
+    dprCap = 2.0;
   } else if (probeMs < 5) {
     // Typical Apple Silicon or recent integrated GPU.
-    _setShadowQuality(4096, true, baseDpr, 1.75);
+    mapSize = 4096;
+    softPcf = true;
+    dprCap = 1.75;
   } else {
     // Slower integrated GPU — drop to 2048 with plain PCF.
-    _setShadowQuality(2048, false, baseDpr, 1.5);
+    mapSize = 2048;
+    softPcf = false;
+    dprCap = 1.5;
   }
+  _maxShadowMapSize = mapSize;
+  _maxSoftPcf = softPcf;
+  _maxDprCap = dprCap;
+  _setShadowQuality(mapSize, softPcf, baseDpr, dprCap);
 }
 
 /** Apply shadow quality and DPR settings.  Must be called before
@@ -287,15 +278,45 @@ function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
       _keyLight.shadow.map = null;
     }
     _keyLight.shadow.autoUpdate = true;
-    _lastKeyLightSnapped.x = null;
-    _lastKeyLightSnapped.z = null;
     const shadowCam = _keyLight.shadow.camera;
     _keyLightTexelSize.set(
       (shadowCam.right - shadowCam.left) / mapSize,
       (shadowCam.top - shadowCam.bottom) / mapSize,
     );
   }
+  _lastKeyLightSnapped.x = null;
+  _lastKeyLightSnapped.z = null;
+  _lastShadowUpdateMs = 0;
   _markDirty();
+}
+
+function _stepDownQuality() {
+  if (_chosenShadowMapSize > 4096) {
+    _setShadowQuality(4096, true, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.75));
+    return true;
+  }
+  if (_chosenShadowMapSize > 2048) {
+    _setShadowQuality(2048, false, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.5));
+    return true;
+  }
+  if (_allowVeryLowQuality && _chosenShadowMapSize > 1024) {
+    _setShadowQuality(1024, false, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.25));
+    return true;
+  }
+  return false;
+}
+
+async function _refineSceneQuality() {
+  _setShadowQuality(_maxShadowMapSize, _maxSoftPcf, _baseDevicePixelRatio, _maxDprCap);
+  if (!_runSceneProbe) {
+    _sceneProbeMsMeasured = -1;
+    return;
+  }
+  let measured = await _probeGpuCost(3, true);
+  while (measured > _sceneGpuBudgetMs && _stepDownQuality()) {
+    measured = await _probeGpuCost(3, true);
+  }
+  _sceneProbeMsMeasured = measured;
 }
 
 /* ------------------------------------------------------------------ */
@@ -398,9 +419,23 @@ function post(msg) { self.postMessage(msg); }
  *  device-pixel-ratio cap so iOS Safari's "frame went over 16.67 ms →
  *  rAF clamps to 30 Hz and stays there" behaviour doesn't trigger
  *  during dense passages of large scores like Jupiter. */
+function _workerUserAgent() {
+  return (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
+}
+
 function _isMobileUA() {
-  const ua = (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
-  return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
+  return /iPhone|iPad|iPod|Android|Mobile/i.test(_workerUserAgent());
+}
+
+function _isSafariUA() {
+  const ua = _workerUserAgent();
+  return /AppleWebKit/i.test(ua)
+    && /Safari/i.test(ua)
+    && !/(Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android)/i.test(ua);
+}
+
+function _isTeslaUA() {
+  return /Tesla|TESLA_AUTO/i.test(_workerUserAgent());
 }
 
 async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL }) {
@@ -409,6 +444,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // rAF rate the moment a frame goes over.  Trim shadow / DPR /
   // antialias here so dense passages stay under 16.67 ms.
   const isMobile = _isMobileUA();
+  const isSafari = _isSafariUA();
+  const isTesla = _isTeslaUA();
+  const isConstrained = isMobile || isTesla;
 
   // Dual-renderer: try `WebGPURenderer` first (for Chrome/Edge on
   // secure contexts), fall back to the legacy `THREE.WebGLRenderer`
@@ -432,11 +470,11 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
   // iOS.  Desktop keeps the antialias for crisp notation edges.
-  const wantAntialias = !isMobile;
+  const wantAntialias = !isMobile && !isTesla;
   if (!forceWebGL) {
     try {
       const { WebGPURenderer } = await import('three/webgpu');
-      renderer = new WebGPURenderer({ canvas, antialias: wantAntialias });
+      renderer = new WebGPURenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
       await renderer.init();
       usingWebGPU = true;
     } catch (e) {
@@ -445,7 +483,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   }
   if (!renderer) {
     try {
-      renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias });
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
     } catch (e) {
       post({
         type: 'renderer_error',
@@ -460,6 +498,8 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // `onBeforeCompile` GLSL hook; the WebGPU path uses TSL
   // `emissiveNode` on a `MeshStandardNodeMaterial`.
   setRendererKind(usingWebGPU ? 'webgpu' : 'webgl');
+  OPTIMIZATIONS.CHUNK_BUCKETS_BY_X = !usingWebGPU || isSafari;
+  OPTIMIZATIONS.MAX_POINT_LIGHTS = (isConstrained || isSafari) ? 4 : 8;
   builder = new SVG3DBuilder();
   // Apply tone mapping + sRGB output on every renderer path.  The
   // played-note material pushes its emissive into HDR territory
@@ -540,9 +580,13 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Awaited here (the GPU-sync fences are async), while the score worker is
   // busy with Verovio WASM, so it adds no perceptible latency to load time.
   const baseDpr  = devicePixelRatio || 1;
+  _baseDevicePixelRatio = baseDpr;
+  _runSceneProbe = isMobile || isSafari || isTesla;
+  _allowVeryLowQuality = isConstrained;
+  _sceneGpuBudgetMs = 14;
   const probeMs  = await _probeGpuCost(5);
   _probeMsMeasured = probeMs;
-  _applyLoadTimeQuality(probeMs, baseDpr, isMobile);
+  _applyLoadTimeQuality(probeMs, baseDpr, isConstrained);
 
   cameraCtrl = new CameraController(camera, controls);
 
@@ -591,8 +635,8 @@ function setupLighting(scene, isMobile) {
   //     pixel-aligned across frames — without that, a high-res map
   //     still produces a "crawling" shadow edge as the camera pans.
   //
-  // On mobile the shadow map is rendered every frame by the
-  // notation depth pass, so its size dominates fragment cost.
+  // On mobile the shadow map is the dominant cost on each scheduled
+  // notation depth pass, even with the 30 Hz refresh cap.
   // 6144² is ~38 M fragments per frame, which by itself blows past
   // an iPhone GPU's 16.67 ms budget once any other notation is in
   // view; clamp to 2048 (≈ 4 M fragments, 9× cheaper) so dense
@@ -669,12 +713,12 @@ const _lastKeyLightSnapped = { x: null, z: null };
 /** `performance.now()` of the last shadow-map re-render triggered by
  *  `_updateKeyLight`.  Used by the pressure-driven shadow throttle. */
 let _lastShadowUpdateMs = 0;
+let _shadowUpdates = 0;
+let _shadowThrottled = 0;
 
-/** Maximum extra delay (ms) between shadow re-renders at full runtime
- *  pressure.  Scales linearly with `_runtimePressure`, so 0 pressure
- *  keeps today's behaviour (re-render whenever the snapped position
- *  changes — nearly every frame during playback) and full pressure
- *  caps the shadow pass at ~7 Hz.
+/** Delay (ms) between shadow re-renders.  At 0 pressure the static
+ *  shadow coverage refreshes at no more than 30 Hz; full pressure
+ *  stretches that interval to 150 ms, or roughly 7 Hz.
  *
  *  Why this is visually free: the key light is a **DirectionalLight**
  *  — translating it never moves the shadows themselves (the cast
@@ -686,6 +730,7 @@ let _lastShadowUpdateMs = 0;
  *  passes recovers *most* of the over-budget GPU time — this is the
  *  actuator that actually restores a consistent frame rate when the
  *  pressure system fires. */
+const _SHADOW_UPDATE_MIN_MS = 1000 / 30;
 const _SHADOW_THROTTLE_MAX_MS = 150;
 
 /** Slide the key directional light and its target to the given world
@@ -738,13 +783,15 @@ function _updateKeyLight(x, z) {
   // coverage frustum, never the shadows themselves).  The position
   // intentionally stays *unsnapped-pending* — we return before writing
   // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
-  if (_runtimePressure > 0 && _lastShadowUpdateMs > 0) {
-    const now = performance.now();
-    if (now - _lastShadowUpdateMs < _runtimePressure * _SHADOW_THROTTLE_MAX_MS) return;
-    _lastShadowUpdateMs = now;
-  } else {
-    _lastShadowUpdateMs = performance.now();
+  const now = performance.now();
+  const shadowInterval = _SHADOW_UPDATE_MIN_MS
+    + _runtimePressure * (_SHADOW_THROTTLE_MAX_MS - _SHADOW_UPDATE_MIN_MS);
+  if (_lastShadowUpdateMs > 0 && now - _lastShadowUpdateMs < shadowInterval) {
+    _shadowThrottled++;
+    return;
   }
+  _lastShadowUpdateMs = now;
+  _shadowUpdates++;
 
   _lastKeyLightSnapped.x = xs;
   _lastKeyLightSnapped.z = zs;
@@ -1024,6 +1071,11 @@ function handleBuildScene({ parsed }) {
   // `renderer.render()` while it's true, so there's no risk of a
   // transient frame with half-built state or missing lights.
   _compiling = true;
+  _lastShadowUpdateMs = 0;
+  _shadowUpdates = 0;
+  _shadowThrottled = 0;
+  _lastKeyLightSnapped.x = null;
+  _lastKeyLightSnapped.z = null;
 
   // Remove previous content.  We don't dispose the InstancedMesh
   // geometries / materials because they're cached inside the builder
@@ -1238,15 +1290,21 @@ function handleSetTimeline({ timeline, contentMinY, contentMaxY, firstNote }) {
     const { root, parsed } = _pendingPrecompile;
     _pendingPrecompile = null;
     if (OPTIMIZATIONS.PRECOMPILE_PIPELINES) {
-      precompilePipelines(root, parsed);
+      _refineSceneQuality()
+        .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
+        .then(() => precompilePipelines(root, parsed));
     } else {
       // Precompile disabled — release the render gate set in
       // handleBuildScene so the main loop can draw the new scene.
-      _compiling = false;
-      _markDirty();
-      // Arm sceneReady so the next render notifies the main thread,
-      // matching the behaviour of the precompile path.
-      _postSceneReadyAfterRender = true;
+      _refineSceneQuality()
+        .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
+        .finally(() => {
+          _compiling = false;
+          _markDirty();
+          // Arm sceneReady so the next render notifies the main thread,
+          // matching the behaviour of the precompile path.
+          _postSceneReadyAfterRender = true;
+        });
     }
   }
 }
@@ -1401,8 +1459,11 @@ let _playFrameMsFilled = 0;
  *  that were triggering minor GC pauses every frame and causing the
  *  rAF interval to jitter (manifesting as inconsistent 45-60 fps on
  *  ProMotion hardware despite <4 ms GPU render time). */
-const _aqScratch = new Float64Array(120);    // AQ p95 — written every rAF
+const _aqScratch = new Float64Array(120);    // AQ p95 — sampled at 4 Hz
 const _statsScratch = new Float64Array(120); // _postStats p95 — written every 500 ms
+const _AQ_SAMPLE_INTERVAL_MS = 250;
+let _lastAqSampleMs = 0;
+let _latestAqP95 = 0;
 
 /** Set to `true` while we're pre-compiling pipelines for a freshly-
  *  built scene.  We pause normal rendering during that window so a
@@ -1564,24 +1625,23 @@ function startRenderLoop() {
     // Also feeds the calibration window while playing.
     //
     // Unlike the old tier system this does NOT change shadow map size,
-    // DPR, or PCF type at runtime — those are set once by the load-time
-    // probe and never touched again, eliminating all mid-session flicker.
-    // The only runtime adjustment is smoothly scaling light-ball intensity
-    // via SceneConfig.lightBall.intensity, which LightBallController reads
-    // every frame with no reallocation.
+    // DPR, or PCF type during playback.  Runtime pressure only scales
+    // light-ball intensity and increases the shadow refresh interval;
+    // neither path reallocates GPU resources.
     if (_playFrameMsFilled > 0) {
       // Calibration: only feeds play-session rAF intervals.
       if (clock.state === 'playing') _calibrate(frameMs);
-      // Compute p95 over the play-frame ring — same logic as before,
-      // no heap allocation.
-      const wantAq = Math.min(_playFrameMsFilled, 60);
-      for (let i = 0; i < wantAq; i++) {
-        const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
-        _aqScratch[i] = _playFrameMsRing[idx];
+      if (now - _lastAqSampleMs >= _AQ_SAMPLE_INTERVAL_MS) {
+        const wantAq = Math.min(_playFrameMsFilled, 60);
+        for (let i = 0; i < wantAq; i++) {
+          const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
+          _aqScratch[i] = _playFrameMsRing[idx];
+        }
+        _aqScratch.subarray(0, wantAq).sort();
+        _latestAqP95 = _aqScratch[Math.min(wantAq - 1, Math.floor(wantAq * 0.95))];
+        _lastAqSampleMs = now;
       }
-      _aqScratch.subarray(0, wantAq).sort();
-      const aqP95 = _aqScratch[Math.min(wantAq - 1, Math.floor(wantAq * 0.95))];
-      _updateRuntimePressure(dt, aqP95);
+      if (_latestAqP95 > 0) _updateRuntimePressure(dt, _latestAqP95);
     }
 
     // --- Stats heartbeat ---------------------------------------------
@@ -1766,6 +1826,13 @@ function handleDispose() {
   _staffColors.clear();
   _dirtyInstanceMeshes.clear();
   _lastFraming = null;
+  _pendingPrecompile = null;
+  _postSceneReadyAfterRender = false;
+  _lastShadowUpdateMs = 0;
+  _shadowUpdates = 0;
+  _shadowThrottled = 0;
+  _lastKeyLightSnapped.x = null;
+  _lastKeyLightSnapped.z = null;
   _lodMeshes.length = 0;
   _lodLastDistance = -1;
 }
@@ -1812,6 +1879,7 @@ function handleProbe({ id }) {
     if (n.isDirectionalLight) directionalLightCount++;
     if (n.isAmbientLight) ambientLightCount++;
   });
+  const renderInfo = renderer?.info?.render || {};
   self.postMessage({
     type: 'probe',
     id,
@@ -1864,15 +1932,21 @@ function handleProbe({ id }) {
         pointLights: pointLightCount,
         directionalLights: directionalLightCount,
         ambientLights: ambientLightCount,
+        drawCalls: renderInfo.calls || 0,
+        triangles: renderInfo.triangles || 0,
       },
       quality: {
         probeMs: _probeMsMeasured,
+        sceneProbeMs: _sceneProbeMsMeasured,
         shadowMapSize: _chosenShadowMapSize,
         dprCap: _chosenDprCap,
         pixelRatio: renderer && renderer.getPixelRatio ? renderer.getPixelRatio() : 0,
         pressure: _runtimePressure,
         baselineMs: _baselineMs,
         calibrated: _calibrated,
+        chunking: OPTIMIZATIONS.CHUNK_BUCKETS_BY_X,
+        shadowUpdates: _shadowUpdates,
+        shadowThrottled: _shadowThrottled,
       },
       lod: {
         managed: _lodMeshes.length,
