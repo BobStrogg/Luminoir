@@ -12,6 +12,14 @@
  * or userland work can never drop a rendered frame.
  */
 import * as THREE from 'three';
+import { WebGPURenderer, PostProcessing } from 'three/webgpu';
+import { pass, renderOutput } from 'three/tsl';
+import { fxaa } from 'three/examples/jsm/tsl/display/FXAANode.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { SVG3DBuilder, prefetchTitleFont } from '../rendering/SVG3DBuilder.js';
@@ -146,6 +154,7 @@ function _updateRuntimePressure(dt, frameP95) {
   // SceneConfig.lightBall.intensity every update() call, so writing
   // here takes effect on the very next frame with no artifacts.
   SceneConfig.lightBall.intensity = _baseLightIntensity * (1 - _runtimePressure * 0.85);
+  _updateFxaaPressure();
 }
 
 /**
@@ -176,6 +185,82 @@ async function _gpuSync() {
   }
 }
 
+function _measureMsaaSamples(usingWebGPU) {
+  if (usingWebGPU) {
+    return Math.max(1, Number(renderer?.samples) || 1);
+  }
+  const gl = typeof renderer?.getContext === 'function' ? renderer.getContext() : null;
+  const attributes = typeof renderer?.getContextAttributes === 'function'
+    ? renderer.getContextAttributes()
+    : null;
+  if (!attributes?.antialias || !gl?.getParameter) return 1;
+  return Math.max(1, Number(gl.getParameter(gl.SAMPLES)) || 1);
+}
+
+function _renderSceneFrame() {
+  if (_fxaaAvailable && !_fxaaSuppressed) {
+    if (_postProcessing) return _postProcessing.render();
+    if (_effectComposer) return _effectComposer.render();
+  }
+  return renderer.render(scene, camera);
+}
+
+function _resizeAntiAliasing(width, height) {
+  if (!_effectComposer) return;
+  _effectComposer.setPixelRatio(renderer.getPixelRatio());
+  _effectComposer.setSize(width, height);
+  if (_fxaaPass?.material?.uniforms?.resolution) {
+    renderer.getDrawingBufferSize(_aaBufferSize);
+    _fxaaPass.material.uniforms.resolution.value.set(
+      1 / Math.max(1, _aaBufferSize.x),
+      1 / Math.max(1, _aaBufferSize.y),
+    );
+  }
+}
+
+async function _setupAntiAliasing(usingWebGPU, width, height) {
+  _msaaSamples = _measureMsaaSamples(usingWebGPU);
+  if (_msaaSamples > 1) {
+    _aaMode = `${_msaaSamples}x MSAA`;
+    return;
+  }
+
+  try {
+    if (usingWebGPU) {
+      const scenePass = pass(scene, camera);
+      const outputPass = renderOutput(scenePass, renderer.toneMapping, renderer.outputColorSpace);
+      _postProcessing = new PostProcessing(renderer);
+      _postProcessing.outputColorTransform = false;
+      _postProcessing.outputNode = fxaa(outputPass);
+    } else {
+      _effectComposer = new EffectComposer(renderer);
+      _effectComposer.addPass(new RenderPass(scene, camera));
+      _effectComposer.addPass(new OutputPass());
+      _fxaaPass = new ShaderPass(FXAAShader);
+      _effectComposer.addPass(_fxaaPass);
+      _resizeAntiAliasing(width, height);
+    }
+    _fxaaAvailable = true;
+    _aaMode = 'FXAA';
+  } catch (error) {
+    _postProcessing = null;
+    if (_effectComposer) _effectComposer.dispose();
+    _effectComposer = null;
+    _fxaaPass = null;
+    _aaMode = 'None';
+    console.warn('[Luminoir] FXAA setup failed; continuing without post-process AA:', error);
+  }
+}
+
+function _updateFxaaPressure() {
+  if (!_fxaaAvailable) return;
+  if (_runtimePressure >= 0.7) {
+    _fxaaSuppressed = true;
+  } else if (_runtimePressure <= 0.25) {
+    _fxaaSuppressed = false;
+  }
+}
+
 /**
  * Probe GPU rendering cost with the current scene by rendering it
  * `count` times and returning wall-clock milliseconds — including GPU
@@ -195,14 +280,14 @@ async function _probeGpuCost(count = 7, median = false) {
   if (!renderer || !scene || !camera) return 0;
   // Warm-up render — don't measure: first call often stalls on driver
   // JIT / shader cache miss regardless of scene complexity.
-  renderer.render(scene, camera);
+  _renderSceneFrame();
   await _gpuSync();
   let best = Infinity;
   const samples = median ? new Float64Array(count) : null;
   for (let i = 0; i < count; i++) {
     if (_keyLight) _keyLight.shadow.needsUpdate = true;
     const t0 = performance.now();
-    renderer.render(scene, camera);
+    _renderSceneFrame();
     await _gpuSync();
     const t = performance.now() - t0;
     if (samples) samples[i] = t;
@@ -270,6 +355,10 @@ function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
     ? THREE.PCFSoftShadowMap
     : THREE.PCFShadowMap;
   renderer.setPixelRatio(Math.min(baseDpr, dprCap));
+  if (_effectComposer) {
+    renderer.getSize(_aaBufferSize);
+    _resizeAntiAliasing(_aaBufferSize.x, _aaBufferSize.y);
+  }
   if (_keyLight.shadow.mapSize.width !== mapSize) {
     _keyLight.shadow.mapSize.width  = mapSize;
     _keyLight.shadow.mapSize.height = mapSize;
@@ -325,6 +414,14 @@ async function _refineSceneQuality() {
 
 /** @type {THREE.WebGLRenderer | import('three/webgpu').WebGPURenderer | null} */
 let renderer = null;
+let _postProcessing = null;
+let _effectComposer = null;
+let _fxaaPass = null;
+let _fxaaAvailable = false;
+let _fxaaSuppressed = false;
+let _msaaSamples = 1;
+let _aaMode = 'None';
+const _aaBufferSize = new THREE.Vector2();
 /** @type {THREE.Scene} */
 const scene = new THREE.Scene();
 /**
@@ -473,7 +570,6 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   const wantAntialias = !isMobile && !isTesla;
   if (!forceWebGL) {
     try {
-      const { WebGPURenderer } = await import('three/webgpu');
       renderer = new WebGPURenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
       await renderer.init();
       usingWebGPU = true;
@@ -574,6 +670,8 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Save base light intensity so the runtime pressure system can scale it.
   _baseLightIntensity = SceneConfig.lightBall.intensity;
 
+  await _setupAntiAliasing(usingWebGPU, width, height);
+
   // Load-time GPU probe — renders the empty scene (lights + paper, no score
   // geometry) and uses the measured cost to select the highest shadow-map
   // resolution the GPU can sustain within half the per-frame budget.
@@ -605,7 +703,12 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // module-level variable that `_addTitle` reads synchronously.
   prefetchTitleFont();
 
-  post({ type: 'ready', renderer: usingWebGPU ? 'WebGPU' : 'WebGL' });
+  post({
+    type: 'ready',
+    renderer: usingWebGPU ? 'WebGPU' : 'WebGL',
+    antiAliasing: _aaMode,
+    msaaSamples: _msaaSamples,
+  });
 
   startRenderLoop();
 }
@@ -923,6 +1026,7 @@ function handleResize({ width, height, devicePixelRatio, rect }) {
   const dprCap = _chosenDprCap > 0 ? _chosenDprCap : 2;
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false);
+  _resizeAntiAliasing(width, height);
   _viewportHeightCss = height;
   _lodLastDistance = -1; // viewport changed → pixel sizes changed → re-evaluate LOD
   if (elementProxy) elementProxy.setRect(rect);
@@ -1219,7 +1323,7 @@ function precompilePipelines(root, parsed) {
     // to the first note.
     const afterCompile = () => {
       try {
-        renderer.render(scene, camera);
+        _renderSceneFrame();
       } catch { /* swallow */ }
       restore();
     };
@@ -1658,7 +1762,7 @@ function startRenderLoop() {
     if (shouldRender) {
       if (_keyLight?.shadow?.needsUpdate) frameFlags |= _FRAME_SHADOW;
       const t0 = performance.now();
-      renderer.render(scene, camera);
+      _renderSceneFrame();
       _lastRenderMs = performance.now() - t0;
       _framesSinceRender = 0;
       _renderMsRing[_renderMsIdx] = _lastRenderMs;
@@ -1799,6 +1903,9 @@ function _postStats() {
     gpuPressure: _runtimePressure,
     aqBaselineMs: _baselineMs,
     aqCalibrated: _calibrated,
+    antiAliasing: _aaMode,
+    msaaSamples: _msaaSamples,
+    fxaaSuppressed: _fxaaSuppressed,
   });
 }
 
@@ -1844,10 +1951,12 @@ function handleUpdateConfig({ updates }) {
       _resetCalibration();
       _runtimePressure = 0;
       SceneConfig.lightBall.intensity = _baseLightIntensity;
+      _updateFxaaPressure();
     } else if (!_autoDimEnabled) {
       // Disabling: restore full intensity so lights snap back.
       _runtimePressure = 0;
       SceneConfig.lightBall.intensity = _baseLightIntensity;
+      _updateFxaaPressure();
     }
   }
   let cameraDirty = false;
@@ -1885,6 +1994,14 @@ function handleDispose() {
   rafId = 0;
   if (lightBalls) { lightBalls.dispose(); lightBalls = null; }
   if (controls)   { controls.dispose();   controls = null; }
+  if (_effectComposer) _effectComposer.dispose();
+  _postProcessing = null;
+  _effectComposer = null;
+  _fxaaPass = null;
+  _fxaaAvailable = false;
+  _fxaaSuppressed = false;
+  _msaaSamples = 1;
+  _aaMode = 'None';
   if (renderer)   { renderer.dispose();   renderer = null; }
   // Clear per-scene colouring state so a subsequent `init` starts clean.
   _noteMeshMap = null;
@@ -1986,6 +2103,11 @@ function handleProbe({ id }) {
         activityCount: cameraCtrl._staffActivity.size,
       } : null,
       clockState: clock.state,
+      antiAliasing: {
+        mode: _aaMode,
+        msaaSamples: _msaaSamples,
+        fxaaSuppressed: _fxaaSuppressed,
+      },
       render: {
         samples: _renderMsFilled,
         mean: _renderMsFilled ? (rSum / _renderMsFilled) : 0,
