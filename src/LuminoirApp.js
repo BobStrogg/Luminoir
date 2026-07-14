@@ -59,6 +59,8 @@ export class LuminoirApp {
    */
   _currentTitle = null;
   _currentComposer = null;
+  _wakeLock = null;
+  _wakeLockRequest = null;
 
   /** Callbacks for UI */
   onStateChange = null; // (isPlaying: boolean) => void
@@ -131,6 +133,9 @@ export class LuminoirApp {
       if (document.visibilityState === 'visible' && this._isPlaying) {
         this.midiPlayer.reschedule();
         this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+        this._requestWakeLock();
+      } else if (document.visibilityState === 'hidden') {
+        this._releaseWakeLock();
       }
     });
 
@@ -337,6 +342,41 @@ export class LuminoirApp {
     });
   }
 
+  async _requestWakeLock() {
+    if (typeof navigator === 'undefined' || !navigator.wakeLock?.request) return;
+    if (this._wakeLock && !this._wakeLock.released) return;
+    if (this._wakeLockRequest) return;
+    let request;
+    try {
+      request = navigator.wakeLock.request('screen');
+    } catch {
+      return;
+    }
+    this._wakeLockRequest = request;
+    try {
+      const sentinel = await request;
+      if (this._wakeLockRequest !== request || (!this._isPlaying && !this._playPending)) {
+        await sentinel.release().catch(() => {});
+        return;
+      }
+      this._wakeLock = sentinel;
+      sentinel.addEventListener('release', () => {
+        if (this._wakeLock === sentinel) this._wakeLock = null;
+      });
+    } catch {
+      return;
+    } finally {
+      if (this._wakeLockRequest === request) this._wakeLockRequest = null;
+    }
+  }
+
+  _releaseWakeLock() {
+    this._wakeLockRequest = null;
+    const sentinel = this._wakeLock;
+    this._wakeLock = null;
+    if (sentinel) sentinel.release().catch(() => {});
+  }
+
   /* ------------------------------------------------------------------ */
   /*  Playback                                                           */
   /* ------------------------------------------------------------------ */
@@ -345,16 +385,19 @@ export class LuminoirApp {
     if (this._isPlaying || this._playPending || this._isScoreLoading || !this._hasScoreLoaded) return;
     const requestId = ++this._playRequestId;
     this._playPending = true;
+    this._requestWakeLock();
     try {
       await this.midiPlayer.play();
     } catch (err) {
       this._playPending = false;
+      this._releaseWakeLock();
       if (requestId === this._playRequestId) throw err;
       return;
     }
     if (requestId !== this._playRequestId || this._isScoreLoading || !this._hasScoreLoaded) {
       this.midiPlayer.stop();
       this._playPending = false;
+      this._releaseWakeLock();
       return;
     }
     this._playPending = false;
@@ -372,6 +415,7 @@ export class LuminoirApp {
   pause() {
     if (!this._isPlaying) return;
     this._isPlaying = false;
+    this._releaseWakeLock();
     const t = this.midiPlayer.currentTime;
     this.midiPlayer.pause();
     this.render.setClock('paused', t, this.midiPlayer.tempoScale);
@@ -386,6 +430,8 @@ export class LuminoirApp {
   stop() {
     this._playRequestId++;
     this._isPlaying = false;
+    this._playPending = false;
+    this._releaseWakeLock();
     this.midiPlayer.stop();
     this.render.setClock('stopped', 0, this.midiPlayer.tempoScale);
     if (this.onStateChange) this.onStateChange(false);

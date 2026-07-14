@@ -21,6 +21,8 @@ export class RenderClient {
   _canvas = null;
   /** @type {'WebGPU'|'WebGL'|'unknown'} */
   _rendererKind = 'unknown';
+  _antiAliasing = 'unknown';
+  _msaaSamples = 0;
   _readyResolve = null;
   _readyReject = null;
   _onResize = null;
@@ -31,6 +33,8 @@ export class RenderClient {
   onStats = null;
   /** Exposed so LuminoirApp can log renderer kind on startup. */
   get rendererKind() { return this._rendererKind; }
+  get antiAliasing() { return this._antiAliasing; }
+  get msaaSamples() { return this._msaaSamples; }
 
   /**
    * Transfer the canvas to a worker, spin up the render loop.
@@ -91,6 +95,8 @@ export class RenderClient {
     switch (msg.type) {
       case 'ready':
         this._rendererKind = msg.renderer;
+        this._antiAliasing = msg.antiAliasing || 'unknown';
+        this._msaaSamples = Number(msg.msaaSamples) || 0;
         if (this._readyResolve) { this._readyResolve(); this._readyResolve = null; }
         this._readyReject = null;
         break;

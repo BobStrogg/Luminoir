@@ -272,7 +272,10 @@ export class SettingsPanel {
 
     const activeLabel = document.createElement('span');
     activeLabel.className = 'settings-renderer-active';
-    activeLabel.textContent = current;
+    const antiAliasing = this._app?.render?.antiAliasing;
+    activeLabel.textContent = antiAliasing && antiAliasing !== 'unknown'
+      ? `${current} · ${antiAliasing}`
+      : current;
     row.appendChild(activeLabel);
 
     // Always show the switch button — if the worker could start WebGPU

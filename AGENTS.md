@@ -11,7 +11,7 @@ pnpm install          # install deps
 pnpm dev              # dev server → http://localhost:5173
 pnpm dev:lan          # dev server → https://<lan-host>:5173 (mkcert cert, for LAN access)
 pnpm build            # production build → dist/
-pnpm test             # Playwright e2e tests (requires running dev server)
+# No `test` script is currently defined; use the testing-luminoir Playwright scenarios
 ```
 
 `package.json` `packageManager` field pins the exact pnpm version.  If `corepack enable`
@@ -133,6 +133,10 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
   PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
 - Mobile and Tesla are constrained profiles: no MSAA, 2048² PCF, DPR 1.5. Safari,
   mobile, and Tesla cap the pooled point-light shader loop at four lights.
+- The effective anti-aliasing mode is reported in the renderer diagnostics: desktop
+  WebGPU/WebGL normally use the measured 4× default-framebuffer MSAA; no-MSAA mobile/Tesla
+  profiles use the FXAA post-pass. FXAA is suppressed above runtime pressure 0.7 and
+  restored below 0.25 so it cannot worsen a sustained slowdown.
 - Safari, mobile, and Tesla run a second 3-frame **median** probe with the real score
   while the loading overlay remains visible.  If a forced full frame exceeds 14 ms it
   can only step down (6144→4096→2048, plus 1024/DPR 1.25 on constrained devices).
@@ -220,6 +224,9 @@ Worker-side settings that are NOT in the registry (design-time tunables):
 - `stop()` only resets the worker clock to music time 0.  Do not call `snapCameraTo` there:
   the existing critically-damped camera spring then animates naturally back to the first
   note for both explicit Stop and `MIDIPlayer.onPlaybackComplete`.
+- Playback requests the Screen Wake Lock API when supported, releases it on pause/stop,
+  and re-requests it when a visible page resumes. Older iOS Safari versions do not expose
+  this API, so there is no reliable web-only fallback that can guarantee the screen stays on.
 
 ---
 
