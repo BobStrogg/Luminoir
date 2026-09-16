@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { SceneConfig } from '../rendering/SceneConfig.js';
+import { smoothDamp } from './smoothDamp.js';
 
 /**
  * Smooth camera that follows the light balls by updating the
@@ -53,8 +54,7 @@ export class CameraController {
   // Critically-damped spring state for the look-ahead target.  The camera
   // position rides at a fixed chase offset behind this target, so a single
   // spring gives us continuous velocity and acceleration for both.
-  _lookSpringX = 0;
-  _lookSpringVelX = 0;
+  _lookSpring = { x: 0, v: 0 };
   _lookSpringReady = false;
 
   // World-space offset from the look-ahead target to the camera's "chase"
@@ -346,8 +346,8 @@ export class CameraController {
     const desiredZ = this._lookTarget.z;
 
     if (!this._lookSpringReady) {
-      this._lookSpringX = desiredLookX;
-      this._lookSpringVelX = 0;
+      this._lookSpring.x = desiredLookX;
+      this._lookSpring.v = 0;
       this._lookSpringReady = true;
     }
 
@@ -356,13 +356,7 @@ export class CameraController {
     // driving position via `sphericalDelta` lets user drag and the
     // auto-return spring share the same state.
     const smoothTime = SceneConfig.camera.smoothTime ?? 3.0;
-    const omega = 2 / smoothTime;
-    const xw = omega * h;
-    const exp = 1 / (1 + xw + 0.48 * xw * xw + 0.235 * xw * xw * xw);
-    const lookChange = this._lookSpringX - desiredLookX;
-    const lookTemp = (this._lookSpringVelX + omega * lookChange) * h;
-    this._lookSpringVelX = (this._lookSpringVelX - omega * lookTemp) * exp;
-    this._lookSpringX = desiredLookX + (lookChange + lookTemp) * exp;
+    smoothDamp(this._lookSpring, desiredLookX, smoothTime, h);
 
     // The orbit target follows the music.  Read the current camera offset
     // (which may have been updated by OrbitControls user events since the
@@ -371,7 +365,7 @@ export class CameraController {
     this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
     this._currentSpherical.setFromVector3(this._scratchOffset);
 
-    this._controls.target.set(this._lookSpringX, desiredY, desiredZ);
+    this._controls.target.set(this._lookSpring.x, desiredY, desiredZ);
 
     // Recalculate the chase pose in case orientation changed.
     this._computeChase();
@@ -650,8 +644,8 @@ export class CameraController {
 
     // Reset the look-ahead spring so it doesn't lurch back to the previous
     // smoothed position on the next update().
-    this._lookSpringX = this._lookTarget.x;
-    this._lookSpringVelX = 0;
+    this._lookSpring.x = this._lookTarget.x;
+    this._lookSpring.v = 0;
     this._lookSpringReady = true;
 
     // Smart camera: phase is rewound so the first few seconds after load

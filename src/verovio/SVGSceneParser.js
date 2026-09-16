@@ -1,4 +1,5 @@
 import { SceneConfig } from '../rendering/SceneConfig.js';
+import { pathBBox } from './svgPathBounds.js';
 
 /**
  * Parses Verovio SVG output into structured scene data for 3D
@@ -422,7 +423,7 @@ export class SVGSceneParser {
     // should on the page.
     let cxOffset = 0;
     if (pathData) {
-      const bbox = _pathBBox(pathData);
+      const bbox = pathBBox(pathData);
       if (bbox) {
         cxOffset = ((bbox.minX + bbox.maxX) * 0.5)
           * scale
@@ -901,7 +902,7 @@ export class SVGSceneParser {
     // markers hanging off the bottom of an off-centred page.
     const pathScale = SceneConfig.scale;
     const trackPath = (d, x, y) => {
-      const bb = _pathBBox(d);
+      const bb = pathBBox(d);
       if (!bb) { track(x, y); return; }
       track(x + bb.minX * pathScale, y - bb.maxY * pathScale);
       track(x + bb.maxX * pathScale, y - bb.minY * pathScale);
@@ -909,7 +910,7 @@ export class SVGSceneParser {
 
     const glyphWorldScale = SceneConfig.scale * SceneConfig.glyphUseScale;
     for (const n of out.notes) {
-      const bb = _pathBBox(n.glyphPath);
+      const bb = pathBBox(n.glyphPath);
       if (bb) {
         track(n.x + bb.minX * glyphWorldScale, n.y + bb.minY * glyphWorldScale);
         track(n.x + bb.maxX * glyphWorldScale, n.y + bb.maxY * glyphWorldScale);
@@ -951,7 +952,7 @@ export class SVGSceneParser {
         // Glyph paths use uniform positive-Y scaling (no Y flip):
         //   world = (el.x + glyph.x × glyphWorldScale,
         //            el.y + glyph.y × glyphWorldScale)
-        const bb = _pathBBox(el.glyphPath);
+        const bb = pathBBox(el.glyphPath);
         if (bb) {
           track(el.x + bb.minX * glyphWorldScale, el.y + bb.minY * glyphWorldScale);
           track(el.x + bb.maxX * glyphWorldScale, el.y + bb.maxY * glyphWorldScale);
@@ -1005,7 +1006,7 @@ export class SVGSceneParser {
           if (sl.y2 > maxY) maxY = sl.y2;
         }
       } else if (sl.d) {
-        const bb = _pathBBox(sl.d);
+        const bb = pathBBox(sl.d);
         if (bb) {
           const pathMinY = sl.y - bb.maxY * SceneConfig.scale;
           const pathMaxY = sl.y - bb.minY * SceneConfig.scale;
@@ -1020,203 +1021,4 @@ export class SVGSceneParser {
     if (minY === Infinity) return { minY: null, maxY: null };
     return { minY, maxY };
   }
-}
-
-/* --------------------------------------------------------------- */
-/*  Glyph-path bbox helper                                          */
-/* --------------------------------------------------------------- */
-
-/**
- * Approximate bounding box of a path-d string in local glyph
- * coordinates.  Tracks current-position / relative-vs-absolute
- * commands so relative path strings (lower-case `c`, `l`, `m`, …)
- * produce the correct absolute extents — a regex over raw numbers
- * would otherwise union a bunch of deltas with a couple of real
- * coordinates and return nonsense.
- *
- * Quadratic / cubic Bézier extrema are solved analytically instead of
- * treating control points as rendered points.  The latter greatly
- * over-estimates long slurs and makes paper margins score-dependent.
- *
- * Cached by `d`-string so we pay the parse cost once per unique
- * glyph, not once per note instance (Sylvia Suite has 6 881 notes
- * and only 7 unique notehead glyphs).
- *
- * @param {string} d
- * @returns {{minX:number,maxX:number,minY:number,maxY:number}|null}
- */
-const _bboxCache = new Map();
-const _pathTokRe = /([MmLlHhVvCcSsQqTtAaZz])|(-?\d*\.?\d+(?:[eE][+-]?\d+)?)/g;
-function _pathBBox(d) {
-  if (!d) return null;
-  const cached = _bboxCache.get(d);
-  if (cached !== undefined) return cached;
-  let minX = Infinity, maxX = -Infinity;
-  let minY = Infinity, maxY = -Infinity;
-  let x = 0, y = 0;
-  let startX = 0, startY = 0;
-  let cmd = '';
-  let previousCommand = '';
-  let cubicControlX = 0, cubicControlY = 0;
-  let quadraticControlX = 0, quadraticControlY = 0;
-  // Gather the tokens once — the regex is the same format used by
-  // SVG3DBuilder.tokenizePathD, but we don't bother importing that
-  // to keep the parser module self-contained.
-  const toks = [];
-  let m;
-  while ((m = _pathTokRe.exec(d)) !== null) {
-    if (m[1]) toks.push(m[1]);
-    else if (m[2]) toks.push(parseFloat(m[2]));
-  }
-  const track = (px, py) => {
-    if (px < minX) minX = px;
-    if (px > maxX) maxX = px;
-    if (py < minY) minY = py;
-    if (py > maxY) maxY = py;
-  };
-  const trackQuadratic = (x0, y0, cx, cy, x1, y1) => {
-    track(x0, y0);
-    track(x1, y1);
-    const tx = _quadraticExtremum(x0, cx, x1);
-    const ty = _quadraticExtremum(y0, cy, y1);
-    if (tx > 0 && tx < 1) track(_quadraticAt(x0, cx, x1, tx), _quadraticAt(y0, cy, y1, tx));
-    if (ty > 0 && ty < 1) track(_quadraticAt(x0, cx, x1, ty), _quadraticAt(y0, cy, y1, ty));
-  };
-  const trackCubic = (x0, y0, c1x, c1y, c2x, c2y, x1, y1) => {
-    track(x0, y0);
-    track(x1, y1);
-    const roots = _cubicExtrema(x0, c1x, c2x, x1);
-    roots.push(..._cubicExtrema(y0, c1y, c2y, y1));
-    for (const t of roots) {
-      if (t > 0 && t < 1) track(
-        _cubicAt(x0, c1x, c2x, x1, t),
-        _cubicAt(y0, c1y, c2y, y1, t),
-      );
-    }
-  };
-  let i = 0;
-  while (i < toks.length) {
-    const t = toks[i];
-    if (typeof t === 'string') { cmd = t; i++; }
-    const rel = cmd >= 'a' && cmd <= 'z';
-    const up = cmd.toUpperCase();
-    const rx = (v) => (rel ? x + v : v);
-    const ry = (v) => (rel ? y + v : v);
-    switch (up) {
-      case 'M': {
-        const nx = rx(toks[i++]);
-        const ny = ry(toks[i++]);
-        x = nx; y = ny; startX = nx; startY = ny;
-        track(x, y);
-        cmd = rel ? 'l' : 'L'; // subsequent pairs are implicit lineTo's
-        break;
-      }
-      case 'L': {
-        x = rx(toks[i++]); y = ry(toks[i++]); track(x, y);
-        break;
-      }
-      case 'H': {
-        x = rx(toks[i++]); track(x, y);
-        break;
-      }
-      case 'V': {
-        y = ry(toks[i++]); track(x, y);
-        break;
-      }
-      case 'C': {
-        const x0 = x, y0 = y;
-        const c1x = rx(toks[i++]); const c1y = ry(toks[i++]);
-        const c2x = rx(toks[i++]); const c2y = ry(toks[i++]);
-        const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        trackCubic(x0, y0, c1x, c1y, c2x, c2y, nx, ny);
-        cubicControlX = c2x; cubicControlY = c2y;
-        x = nx; y = ny;
-        break;
-      }
-      case 'S': {
-        const x0 = x, y0 = y;
-        const c1x = previousCommand === 'C' || previousCommand === 'S' ? 2 * x - cubicControlX : x;
-        const c1y = previousCommand === 'C' || previousCommand === 'S' ? 2 * y - cubicControlY : y;
-        const c2x = rx(toks[i++]); const c2y = ry(toks[i++]);
-        const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        trackCubic(x0, y0, c1x, c1y, c2x, c2y, nx, ny);
-        cubicControlX = c2x; cubicControlY = c2y;
-        x = nx; y = ny;
-        break;
-      }
-      case 'Q': {
-        const x0 = x, y0 = y;
-        const c1x = rx(toks[i++]); const c1y = ry(toks[i++]);
-        const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        trackQuadratic(x0, y0, c1x, c1y, nx, ny);
-        quadraticControlX = c1x; quadraticControlY = c1y;
-        x = nx; y = ny;
-        break;
-      }
-      case 'T': {
-        const x0 = x, y0 = y;
-        const cx = previousCommand === 'Q' || previousCommand === 'T' ? 2 * x - quadraticControlX : x;
-        const cy = previousCommand === 'Q' || previousCommand === 'T' ? 2 * y - quadraticControlY : y;
-        const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        trackQuadratic(x0, y0, cx, cy, nx, ny);
-        quadraticControlX = cx; quadraticControlY = cy;
-        x = nx; y = ny;
-        break;
-      }
-      case 'A': {
-        // rx ry x-axis-rotation large-arc sweep x y — we just track
-        // the endpoint and skip the flags / radii (arcs are very
-        // rare in music glyphs).
-        i += 5;
-        const nx = rx(toks[i++]); const ny = ry(toks[i++]);
-        track(nx, ny);
-        x = nx; y = ny;
-        break;
-      }
-      case 'Z': {
-        x = startX; y = startY;
-        break;
-      }
-      default:
-        i++;
-    }
-    previousCommand = up;
-  }
-  if (minX === Infinity) { _bboxCache.set(d, null); return null; }
-  const box = { minX, maxX, minY, maxY };
-  _bboxCache.set(d, box);
-  return box;
-}
-
-function _quadraticAt(p0, p1, p2, t) {
-  const mt = 1 - t;
-  return mt * mt * p0 + 2 * mt * t * p1 + t * t * p2;
-}
-
-function _quadraticExtremum(p0, p1, p2) {
-  const denominator = p0 - 2 * p1 + p2;
-  return Math.abs(denominator) < 1e-12 ? -1 : (p0 - p1) / denominator;
-}
-
-function _cubicAt(p0, p1, p2, p3, t) {
-  const mt = 1 - t;
-  return mt * mt * mt * p0
-    + 3 * mt * mt * t * p1
-    + 3 * mt * t * t * p2
-    + t * t * t * p3;
-}
-
-function _cubicExtrema(p0, p1, p2, p3) {
-  const a = -p0 + 3 * p1 - 3 * p2 + p3;
-  const b = 3 * p0 - 6 * p1 + 3 * p2;
-  const c = -3 * p0 + 3 * p1;
-  const qa = 3 * a;
-  const qb = 2 * b;
-  if (Math.abs(qa) < 1e-12) {
-    return Math.abs(qb) < 1e-12 ? [] : [-c / qb];
-  }
-  const discriminant = qb * qb - 4 * qa * c;
-  if (discriminant < 0) return [];
-  const root = Math.sqrt(discriminant);
-  return [(-qb + root) / (2 * qa), (-qb - root) / (2 * qa)];
 }

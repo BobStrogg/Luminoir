@@ -1,11 +1,3 @@
-function isSafariBrowser() {
-  if (typeof navigator === 'undefined') return false;
-  const ua = navigator.userAgent || '';
-  return /AppleWebKit/i.test(ua)
-    && /Safari/i.test(ua)
-    && !/(Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android)/i.test(ua);
-}
-
 // Static Safari offset disabled — the -500ms guess caused more harm than good;
 // proper clock-slave sync will replace it.
 const DEFAULT_AUDIO_VISUAL_OFFSET_MS = 0;

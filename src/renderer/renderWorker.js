@@ -28,6 +28,16 @@ import { LightBallController } from '../animation/LightBallController.js';
 import { CameraController } from '../animation/CameraController.js';
 import { ElementProxy } from './ElementProxy.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
+import { RingBuffer } from './worker/RingBuffer.js';
+import {
+  chooseLoadTimeQuality,
+  nextQualityStep,
+  advancePressure,
+  lightIntensityForPressure,
+  shadowIntervalMs,
+  fxaaSuppressedFor,
+} from './worker/qualityPolicy.js';
+import { assignStaffColorIndices } from '../animation/staffColors.js';
 
 /* ------------------------------------------------------------------ */
 /*  GPU quality — load-time probe + runtime pressure                  */
@@ -134,26 +144,12 @@ let _allowVeryLowQuality = false;
 function _updateRuntimePressure(dt, frameP95) {
   if (!_autoDimEnabled || !_calibrated) return;
 
-  const targetMs = 1000 / 60;
-  const highMs = targetMs * 1.15;
-  const lowMs  = targetMs * 1.05;
-
-  if (frameP95 >= highMs) {
-    // Rise toward 1 over ~1 s of sustained overrun.
-    _runtimePressure = Math.min(1, _runtimePressure + dt);
-  } else if (frameP95 <= lowMs) {
-    // Fall back toward 0 over ~3 s of sustained headroom.
-    _runtimePressure = Math.max(0, _runtimePressure - dt / 3);
-  } else {
-    // In-budget but not strongly under — decay slowly so a mix of
-    // good/bad frames doesn't cause visible light flutter.
-    _runtimePressure = Math.max(0, _runtimePressure - dt * 0.15);
-  }
+  _runtimePressure = advancePressure(_runtimePressure, dt, frameP95);
 
   // Apply to light intensity.  LightBallController reads
   // SceneConfig.lightBall.intensity every update() call, so writing
   // here takes effect on the very next frame with no artifacts.
-  SceneConfig.lightBall.intensity = _baseLightIntensity * (1 - _runtimePressure * 0.85);
+  SceneConfig.lightBall.intensity = lightIntensityForPressure(_baseLightIntensity, _runtimePressure);
   _updateFxaaPressure();
 }
 
@@ -254,11 +250,7 @@ async function _setupAntiAliasing(usingWebGPU, width, height) {
 
 function _updateFxaaPressure() {
   if (!_fxaaAvailable) return;
-  if (_runtimePressure >= 0.7) {
-    _fxaaSuppressed = true;
-  } else if (_runtimePressure <= 0.25) {
-    _fxaaSuppressed = false;
-  }
+  _fxaaSuppressed = fxaaSuppressedFor(_fxaaSuppressed, _runtimePressure);
 }
 
 /**
@@ -314,31 +306,7 @@ async function _probeGpuCost(count = 7, median = false) {
  * of them into the top tier regardless of actual GPU speed.)
  */
 function _applyLoadTimeQuality(probeMs, baseDpr, isConstrained) {
-  let mapSize;
-  let softPcf;
-  let dprCap;
-  // On mobile the rAF rate halves permanently the first time a frame
-  // exceeds budget, so we are extremely conservative.
-  if (isConstrained) {
-    mapSize = 2048;
-    softPcf = false;
-    dprCap = 1.5;
-  } else if (probeMs < 2) {
-    // Very fast GPU (M3/M4, dedicated GPU) — full quality.
-    mapSize = 6144;
-    softPcf = true;
-    dprCap = 2.0;
-  } else if (probeMs < 5) {
-    // Typical Apple Silicon or recent integrated GPU.
-    mapSize = 4096;
-    softPcf = true;
-    dprCap = 1.75;
-  } else {
-    // Slower integrated GPU — drop to 2048 with plain PCF.
-    mapSize = 2048;
-    softPcf = false;
-    dprCap = 1.5;
-  }
+  const { mapSize, softPcf, dprCap } = chooseLoadTimeQuality(probeMs, isConstrained);
   _maxShadowMapSize = mapSize;
   _maxSoftPcf = softPcf;
   _maxDprCap = dprCap;
@@ -380,19 +348,13 @@ function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
 }
 
 function _stepDownQuality() {
-  if (_chosenShadowMapSize > 4096) {
-    _setShadowQuality(4096, true, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.75));
-    return true;
-  }
-  if (_chosenShadowMapSize > 2048) {
-    _setShadowQuality(2048, false, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.5));
-    return true;
-  }
-  if (_allowVeryLowQuality && _chosenShadowMapSize > 1024) {
-    _setShadowQuality(1024, false, _baseDevicePixelRatio, Math.min(_maxDprCap, 1.25));
-    return true;
-  }
-  return false;
+  const step = nextQualityStep(_chosenShadowMapSize, {
+    maxDprCap: _maxDprCap,
+    allowVeryLowQuality: _allowVeryLowQuality,
+  });
+  if (!step) return false;
+  _setShadowQuality(step.mapSize, step.softPcf, _baseDevicePixelRatio, step.dprCap);
+  return true;
 }
 
 async function _refineSceneQuality() {
@@ -580,7 +542,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
       renderer = new WebGPURenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
       await renderer.init();
       usingWebGPU = true;
-    } catch (e) {
+    } catch {
       renderer = null;
     }
   }
@@ -698,8 +660,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // so the first frame after init doesn't record a bogus giant jump.
   _prevCameraPos.copy(camera.position);
   _prevCameraDelta = 0;
-  _cameraDeltaIdx = 0;
-  _cameraDeltaFilled = 0;
+  _cameraDeltaRing.reset();
   _cameraDeltaRing.fill(0);
 
   // Smart camera coordination — the controller's auto-orbit needs
@@ -906,8 +867,8 @@ function _updateKeyLight(x, z, frameNow = performance.now()) {
   // intentionally stays *unsnapped-pending* — we return before writing
   // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
   const now = frameNow;
-  const shadowInterval = _SHADOW_UPDATE_MIN_MS
-    + _runtimePressure * (_SHADOW_THROTTLE_MAX_MS - _SHADOW_UPDATE_MIN_MS);
+  const shadowInterval = shadowIntervalMs(
+    _runtimePressure, _SHADOW_UPDATE_MIN_MS, _SHADOW_THROTTLE_MAX_MS);
   if (_lastShadowUpdateMs > 0 && now - _lastShadowUpdateMs < shadowInterval) {
     _shadowThrottled++;
     return;
@@ -1287,7 +1248,7 @@ function handleBuildScene({ parsed }) {
  * (WebGPU) or falls back to a synchronous `renderer.compile` on
  * WebGL.
  */
-function precompilePipelines(root, parsed) {
+function precompilePipelines(root, _parsed) {
   if (!renderer || !scene || !camera) return;
   /** @type {{ mesh: any, prev: boolean }[]} */
   const frustumToggled = [];
@@ -1407,16 +1368,11 @@ function handleSetTimeline({ timeline, contentMinY, contentMaxY, firstNote }) {
   // emissive contribution in the same hue so the darker colour
   // reads as a soft inner glow rather than a matte fill.
   _staffColors.clear();
-  const seenStaves = new Set();
   const palette = SceneConfig.lightBall.colors;
   const darkness = SceneConfig.playedNote.darkness;
-  let colorIdx = 0;
-  for (const e of timeline) {
-    if (seenStaves.has(e.staff)) continue;
-    seenStaves.add(e.staff);
-    const c = palette[colorIdx % palette.length];
-    _staffColors.set(e.staff, new THREE.Color(c.r * darkness, c.g * darkness, c.b * darkness));
-    colorIdx++;
+  for (const [staff, idx] of assignStaffColorIndices(timeline)) {
+    const c = palette[idx % palette.length];
+    _staffColors.set(staff, new THREE.Color(c.r * darkness, c.g * darkness, c.b * darkness));
   }
   // Store timeline + reset the played cursor so a new score starts
   // fresh.  We don't pre-apply default colours here because every
@@ -1520,10 +1476,8 @@ function handleClock({ state, musicTime, tempoScale }) {
     _resetCalibration();
     // Also flush the play-frame ring so old intervals from before this
     // play session don't distort the p95 pressure signal.
-    _playFrameMsIdx = 0;
-    _playFrameMsFilled = 0;
-    _frameMsIdx = 0;
-    _frameMsFilled = 0;
+    _playFrameMsRing.reset();
+    _frameMsRing.reset();
     _frameMsRing.fill(0);
     _lastFrameFlags = 0;
     _lastFrameCpuMs = 0;
@@ -1581,9 +1535,7 @@ let _lastRenderMs = 0;
 let _framesSinceRender = 0;
 /** Rolling buffer of recent per-frame render-submit timings (ms) so
  *  `probe` can report histograms without us keeping stats forever. */
-const _renderMsRing = new Float64Array(120);
-let _renderMsIdx = 0;
-let _renderMsFilled = 0;
+const _renderMsRing = new RingBuffer(120);
 let _rendersSkipped = 0;
 /** Wall-clock rAF-to-rAF interval in ms — this is the true "how long
  *  is a frame actually taking" metric, including GPU execution time
@@ -1592,7 +1544,7 @@ let _rendersSkipped = 0;
  *  submit time is <5 ms.
  *  Written on *every* rAF tick (playing + idle) — used by `probe()`
  *  for the full frame-time histogram in the developer overlay. */
-const _frameMsRing = new Float64Array(120);
+const _frameMsRing = new RingBuffer(120);
 const _FRAME_SHADOW = 1;
 const _FRAME_COLORS = 2;
 const _FRAME_STATS = 4;
@@ -1639,16 +1591,12 @@ function _resetJitterTotals() {
     bucket.over33 = 0;
   }
 }
-let _frameMsIdx = 0;
-let _frameMsFilled = 0;
 /** Subset of `_frameMsRing` — only records intervals from ticks that
  *  occur while `clock.state === 'playing'`.  The AQ p95 window reads
  *  from this ring instead of `_frameMsRing` so that idle frames
  *  (camera settled, music paused) don't dilute the pressure signal
  *  and cause the AQ system to see artificially low percentiles. */
-const _playFrameMsRing = new Float64Array(120);
-let _playFrameMsIdx = 0;
-let _playFrameMsFilled = 0;
+const _playFrameMsRing = new RingBuffer(120);
 /** Pre-allocated scratch buffers for in-place sorting inside the hot
  *  rAF loop and the 500 ms stats heartbeat.  Using typed arrays and
  *  sorting them in-place avoids the `new Array` + `push` allocations
@@ -1704,9 +1652,7 @@ let _dtSmoothed = 0;
 /** Camera-position history for a per-frame `cameraJitter` probe metric. */
 const _prevCameraPos = new THREE.Vector3();
 let _prevCameraDelta = 0;
-const _cameraDeltaRing = new Float64Array(120);
-let _cameraDeltaIdx = 0;
-let _cameraDeltaFilled = 0;
+const _cameraDeltaRing = new RingBuffer(120);
 
 function startRenderLoop() {
   lastFrameTime = performance.now();
@@ -1721,16 +1667,12 @@ function startRenderLoop() {
     // Record actual rAF interval so `probe()` can distinguish
     // submit-time from real GPU-bound frame time.
     if (frameMs > 0 && frameMs < 2000) {
-      _frameMsRing[_frameMsIdx] = frameMs;
+      _frameMsRing.push(frameMs);
       if (clock.state === 'playing') _recordJitterSample(frameMs, _lastFrameCpuMs, _lastFrameFlags);
-      _frameMsIdx = (_frameMsIdx + 1) % _frameMsRing.length;
-      if (_frameMsFilled < _frameMsRing.length) _frameMsFilled++;
       // Separate ring for AQ: only record play-session frames so that
       // long idle intervals don't make the p95 look deceptively low.
       if (clock.state === 'playing') {
-        _playFrameMsRing[_playFrameMsIdx] = frameMs;
-        _playFrameMsIdx = (_playFrameMsIdx + 1) % _playFrameMsRing.length;
-        if (_playFrameMsFilled < _playFrameMsRing.length) _playFrameMsFilled++;
+        _playFrameMsRing.push(frameMs);
       }
 
       // Smooth rAF jitter out of the integration dt that drives camera
@@ -1782,9 +1724,7 @@ function startRenderLoop() {
       _prevCameraPos.copy(camera.position);
       const deltaDelta = Math.abs(delta - _prevCameraDelta);
       _prevCameraDelta = delta;
-      _cameraDeltaRing[_cameraDeltaIdx] = deltaDelta;
-      _cameraDeltaIdx = (_cameraDeltaIdx + 1) % _cameraDeltaRing.length;
-      if (_cameraDeltaFilled < _cameraDeltaRing.length) _cameraDeltaFilled++;
+      _cameraDeltaRing.push(deltaDelta);
     }
 
     // Slide the key light's shadow camera to straddle whatever the
@@ -1841,9 +1781,7 @@ function startRenderLoop() {
       _renderSceneFrame();
       _lastRenderMs = performance.now() - t0;
       _framesSinceRender = 0;
-      _renderMsRing[_renderMsIdx] = _lastRenderMs;
-      _renderMsIdx = (_renderMsIdx + 1) % _renderMsRing.length;
-      if (_renderMsFilled < _renderMsRing.length) _renderMsFilled++;
+      _renderMsRing.push(_lastRenderMs);
       _dirty = false;
 
       // Tell the main thread the new score is now on screen so it
@@ -1872,17 +1810,12 @@ function startRenderLoop() {
     // DPR, or PCF type during playback.  Runtime pressure only scales
     // light-ball intensity and increases the shadow refresh interval;
     // neither path reallocates GPU resources.
-    if (_playFrameMsFilled > 0) {
+    if (_playFrameMsRing.filled > 0) {
       // Calibration: only feeds play-session rAF intervals.
       if (clock.state === 'playing') _calibrate(frameMs);
       if (now - _lastAqSampleMs >= _AQ_SAMPLE_INTERVAL_MS) {
-        const wantAq = Math.min(_playFrameMsFilled, 60);
-        for (let i = 0; i < wantAq; i++) {
-          const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
-          _aqScratch[i] = _playFrameMsRing[idx];
-        }
-        _aqScratch.subarray(0, wantAq).sort();
-        _latestAqP95 = _aqScratch[Math.min(wantAq - 1, Math.floor(wantAq * 0.95))];
+        const wantAq = Math.min(_playFrameMsRing.filled, 60);
+        _latestAqP95 = _playFrameMsRing.percentile(0.95, wantAq, _aqScratch);
         _lastAqSampleMs = now;
       }
       if (_latestAqP95 > 0) _updateRuntimePressure(dt, _latestAqP95);
@@ -1917,52 +1850,31 @@ let _lastStatsPostMs = 0;
  *  intervals) so we don't have to touch the ring buffers' tail. */
 function _postStats() {
   // Recent-window samples: the last min(samples, ~60 frames worth)
-  // give the freshest readout.  Walk the ring backwards from
-  // _frameMsIdx until we've collected up to 60 entries or used the
-  // whole filled portion.
-  const fLen = _frameMsFilled;
+  // give the freshest readout — the ring's most-recent 60 entries.
+  const fLen = _frameMsRing.filled;
   if (fLen === 0) return;
   const want = Math.min(fLen, 60);
-  let fSum = 0;
-  let fMax = 0;
-  for (let i = 0; i < want; i++) {
-    const idx = (_frameMsIdx - 1 - i + _frameMsRing.length) % _frameMsRing.length;
-    const v = _frameMsRing[idx];
-    fSum += v;
-    if (v > fMax) fMax = v;
-  }
-  const fMean = fSum / want;
+  const fMean = _frameMsRing.mean(want);
+  const fMax = _frameMsRing.max(want);
   const fps = fMean > 0 ? (1000 / fMean) : 0;
 
   // Render-submit window (only render frames count; idle frames
   // skip the renderer call so we don't want to dilute the average
   // with zeros).
-  const rLen = _renderMsFilled;
-  let rSum = 0, rMax = 0, rP95 = 0;
+  const rLen = _renderMsRing.filled;
+  let rMean = 0, rMax = 0, rP95 = 0;
   if (rLen > 0) {
     const rWant = Math.min(rLen, 60);
-    for (let i = 0; i < rWant; i++) {
-      const idx = (_renderMsIdx - 1 - i + _renderMsRing.length) % _renderMsRing.length;
-      const v = _renderMsRing[idx];
-      _statsScratch[i] = v;
-      rSum += v;
-      if (v > rMax) rMax = v;
-    }
-    _statsScratch.subarray(0, rWant).sort();
-    rP95 = _statsScratch[Math.min(rWant - 1, Math.floor(rWant * 0.95))];
+    rMean = _renderMsRing.mean(rWant);
+    rMax = _renderMsRing.max(rWant);
+    rP95 = _renderMsRing.percentile(0.95, rWant, _statsScratch);
   }
-  const rMean = rLen > 0 ? rSum / Math.min(rLen, 60) : 0;
 
   // Compute play-frame p95 for the pressure diagnostic.
   let playP95 = 0;
-  if (_playFrameMsFilled > 0) {
-    const pWant = Math.min(_playFrameMsFilled, 60);
-    for (let i = 0; i < pWant; i++) {
-      const idx = (_playFrameMsIdx - 1 - i + _playFrameMsRing.length) % _playFrameMsRing.length;
-      _statsScratch[i] = _playFrameMsRing[idx];
-    }
-    _statsScratch.subarray(0, pWant).sort();
-    playP95 = _statsScratch[Math.min(pWant - 1, Math.floor(pWant * 0.95))];
+  if (_playFrameMsRing.filled > 0) {
+    const pWant = Math.min(_playFrameMsRing.filled, 60);
+    playP95 = _playFrameMsRing.percentile(0.95, pWant, _statsScratch);
   }
 
   post({
@@ -2103,45 +2015,23 @@ function handleDispose() {
  *  forwarded pointer events are actually driving OrbitControls). */
 function handleProbe({ id }) {
   // Render-time histogram across the ring buffer
-  let rSum = 0, rMax = 0;
-  const rSamples = [];
-  for (let i = 0; i < _renderMsFilled; i++) {
-    const v = _renderMsRing[i];
-    rSamples.push(v);
-    rSum += v;
-    if (v > rMax) rMax = v;
-  }
-  rSamples.sort((a, b) => a - b);
-  const p = (q) => rSamples[Math.min(rSamples.length - 1, Math.floor(rSamples.length * q))];
+  const rMax = _renderMsRing.max(_renderMsRing.filled);
+  const p = (q) => _renderMsRing.percentile(q, _renderMsRing.filled, _statsScratch);
 
   // Actual rAF-to-rAF frame time.  This is what the user perceives —
   // includes GPU execution time that `renderer.render`'s submit-time
   // doesn't capture.
-  let fSum = 0, fMax = 0;
-  const fSamples = [];
-  for (let i = 0; i < _frameMsFilled; i++) {
-    const v = _frameMsRing[i];
-    fSamples.push(v);
-    fSum += v;
-    if (v > fMax) fMax = v;
-  }
-  fSamples.sort((a, b) => a - b);
-  const fp = (q) => fSamples[Math.min(fSamples.length - 1, Math.floor(fSamples.length * q))];
+  let fMax = 0;
+  _frameMsRing.forEach((v) => { if (v > fMax) fMax = v; });
+  const fp = (q) => _frameMsRing.percentile(q, _frameMsRing.filled, _statsScratch);
 
   // Camera-position second-difference (jitter) samples.  This measures
   // how much the camera's per-frame movement *changes*, not how much it
   // moves, so it isolates the high-frequency jitter from the underlying
   // smooth tracking motion.
-  let cSum = 0, cMax = 0;
-  const cSamples = [];
-  for (let i = 0; i < _cameraDeltaFilled; i++) {
-    const v = _cameraDeltaRing[i];
-    cSamples.push(v);
-    cSum += v;
-    if (v > cMax) cMax = v;
-  }
-  cSamples.sort((a, b) => a - b);
-  const cp = (q) => cSamples[Math.min(cSamples.length - 1, Math.floor(cSamples.length * q))];
+  let cMax = 0;
+  _cameraDeltaRing.forEach((v) => { if (v > cMax) cMax = v; });
+  const cp = (q) => _cameraDeltaRing.percentile(q, _cameraDeltaRing.filled, _statsScratch);
 
   const summarizeBucket = (bucket) => ({
     count: bucket.count,
@@ -2202,22 +2092,22 @@ function handleProbe({ id }) {
         fxaaSuppressed: _fxaaSuppressed,
       },
       render: {
-        samples: _renderMsFilled,
-        mean: _renderMsFilled ? (rSum / _renderMsFilled) : 0,
-        p50: _renderMsFilled ? p(0.5) : 0,
-        p95: _renderMsFilled ? p(0.95) : 0,
-        p99: _renderMsFilled ? p(0.99) : 0,
+        samples: _renderMsRing.filled,
+        mean: _renderMsRing.mean(_renderMsRing.filled),
+        p50: _renderMsRing.filled ? p(0.5) : 0,
+        p95: _renderMsRing.filled ? p(0.95) : 0,
+        p99: _renderMsRing.filled ? p(0.99) : 0,
         max: rMax,
         skipped: _rendersSkipped,
         compiling: _compiling,
         dirty: _dirty,
       },
       frame: {
-        samples: _frameMsFilled,
-        mean: _frameMsFilled ? (fSum / _frameMsFilled) : 0,
-        p50: _frameMsFilled ? fp(0.5) : 0,
-        p95: _frameMsFilled ? fp(0.95) : 0,
-        p99: _frameMsFilled ? fp(0.99) : 0,
+        samples: _frameMsRing.filled,
+        mean: _frameMsRing.mean(_frameMsRing.filled),
+        p50: _frameMsRing.filled ? fp(0.5) : 0,
+        p95: _frameMsRing.filled ? fp(0.95) : 0,
+        p99: _frameMsRing.filled ? fp(0.99) : 0,
         max: fMax,
       },
       jitter: {
@@ -2229,11 +2119,11 @@ function handleProbe({ id }) {
         afterBudgetSkip: summarizeBucket(_jitterTotals.afterBudgetSkip),
       },
       cameraJitter: {
-        samples: _cameraDeltaFilled,
-        mean: _cameraDeltaFilled ? (cSum / _cameraDeltaFilled) : 0,
-        p50: _cameraDeltaFilled ? cp(0.5) : 0,
-        p95: _cameraDeltaFilled ? cp(0.95) : 0,
-        p99: _cameraDeltaFilled ? cp(0.99) : 0,
+        samples: _cameraDeltaRing.filled,
+        mean: _cameraDeltaRing.mean(_cameraDeltaRing.filled),
+        p50: _cameraDeltaRing.filled ? cp(0.5) : 0,
+        p95: _cameraDeltaRing.filled ? cp(0.95) : 0,
+        p99: _cameraDeltaRing.filled ? cp(0.99) : 0,
         max: cMax,
       },
       scene: {
