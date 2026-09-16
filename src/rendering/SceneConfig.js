@@ -55,6 +55,15 @@ export const SceneConfig = {
    */
   playbackSpeed: 1.0,
 
+  /**
+   * EMA alpha for smoothing the per-frame `dt` that drives camera and
+   * light-ball animation.  0.0 = raw rAF interval, 1.0 = instantaneous,
+   * 0.2 = gentle low-pass that irons out rAF jitter without drifting
+   * on sustained frame drops.
+   */
+  dtSmoothAlpha: 0.2,
+
+
   // Verovio renders SMuFL glyph references as <use width="480"/> pulling from
   // a <symbol viewBox="0 0 1000 1000">, so the glyph's raw path coords must
   // be multiplied by 480/1000 = 0.48 to match the on-page size.  Without this
@@ -318,10 +327,21 @@ export const SceneConfig = {
    *             pronounced forward perspective.
    *
    *   • `lookAheadSeconds` — how far ahead of the current audio time
-   *     the camera looks while its position still follows the current
-   *     playhead.  The original SceneKit demo used 1.5 beats of
-   *     look-ahead; 0.5 s is the same ballpark at moderate tempos
-   *     without pushing the active notes too far behind centre.
+   *     the camera's *look target* is set.  Because the look-spring
+   *     has a `smoothTime` of lag, the actual on-screen look-ahead is
+   *     roughly `lookAheadSeconds - smoothTime`.  At the default
+   *     2.5 s with `smoothTime = 3.0 s` the view sits ~0.5 s behind
+   *     the playhead, which keeps the playhead in the forward part of
+   *     the screen while the very loose spring smooths tempo changes.
+   *
+   *   • `smoothTime` — the `SmoothDamp` time-constant for the camera
+   *     look-ahead spring.  A larger value gives a looser, stretchier
+   *     "tow rope" feel; the camera position rides at the same chase
+   *     offset behind the target, so it stays near the playhead while
+   *     still smoothing velocity changes.
+   *
+   *   • `returnTime` — seconds over which the camera returns to its
+   *     chase pose after the user stops interacting with it.
    *
    *   • `contentHeadroom`  — multiplier on the score's vertical
    *     spread when computing the auto-fit camera distance.  Lower
@@ -341,7 +361,9 @@ export const SceneConfig = {
     defaultDistance: 1.8,
     pitchDegrees: 45,
     chaseRatio: 1.0,
-    lookAheadSeconds: 0.5,
+    lookAheadSeconds: 2.5,
+    smoothTime: 3.0,
+    returnTime: 2.0,
     contentHeadroom: 0.55,
   },
 
@@ -393,9 +415,8 @@ export const SceneConfig = {
    *     blends in/out with a half-sine so the transition is
    *     untreasured.
    *   • `resumeAfterUserMs`  — quiet period after the user
-   *     releases the mouse before the orbit resumes.  Smooth
-   *     enough that releasing the drag feels intentional, not
-   *     "fighting the camera".
+   *     releases the mouse before the orbit / auto-return resumes.
+   *     A few seconds feels intentional, not "fighting the camera".
    */
   smartCamera: {
     enabled: true,
@@ -406,7 +427,7 @@ export const SceneConfig = {
     biasStrength: 0.3,
     topDownChance: 0,
     topDownDuration: 4.0,
-    resumeAfterUserMs: 1500,
+    resumeAfterUserMs: 3000,
   },
 
   /**
@@ -462,6 +483,7 @@ export const SceneConfig = {
    * texels) but risks clipping shadows from off-screen notes.
    */
   shadow: {
+    enabled: true,
     mapSize: 6144,
     frustumHalfWidth: 20,
     frustumHalfHeight: 15,

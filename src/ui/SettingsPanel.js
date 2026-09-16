@@ -1,4 +1,5 @@
 import { SETTINGS, applyToSceneConfig, readFromSceneConfig } from './settingsRegistry.js';
+import { SceneConfig } from '../rendering/SceneConfig.js';
 import { loadStoredSettings, saveStoredSettings, clearStoredSettings } from './SettingsPersistence.js';
 
 /**
@@ -375,6 +376,38 @@ export class SettingsPanel {
         }
       };
     }
+
+    // --- Shadow toggle (debug/benchmark) -------------------------------
+    // Shadow casting is the single biggest GPU cost on many scores.
+    // A quick toggle lets us confirm whether the camera jitter is the
+    // shadow-map re-render or something else.
+    const shadowRow = document.createElement('div');
+    shadowRow.className = 'settings-row';
+    const shadowLabel = document.createElement('label');
+    shadowLabel.className = 'settings-label';
+    shadowLabel.textContent = 'Cast shadows';
+    const shadowCtrl = document.createElement('div');
+    shadowCtrl.className = 'settings-control-checkbox';
+    const shadowCheck = document.createElement('input');
+    shadowCheck.type = 'checkbox';
+    shadowCheck.id = 'setting_shadow_enabled';
+    shadowCheck.checked = !!SceneConfig.shadow.enabled;
+    shadowLabel.htmlFor = 'setting_shadow_enabled';
+    shadowCheck.addEventListener('change', () => {
+      SceneConfig.shadow.enabled = shadowCheck.checked;
+      if (this._app && this._app.render) {
+        this._app.render.updateConfig({ 'shadow.enabled': shadowCheck.checked });
+      }
+    });
+    shadowCtrl.appendChild(shadowCheck);
+    shadowRow.appendChild(shadowLabel);
+    shadowRow.appendChild(shadowCtrl);
+    sectionEl.appendChild(shadowRow);
+
+    const shadowDesc = document.createElement('div');
+    shadowDesc.className = 'settings-desc';
+    shadowDesc.textContent = 'Renders the shadow map from the key light. Disabling it removes the largest single GPU cost and is the fastest way to confirm whether camera jitter is coming from the shadow pass.';
+    sectionEl.appendChild(shadowDesc);
 
     return sectionEl;
   }

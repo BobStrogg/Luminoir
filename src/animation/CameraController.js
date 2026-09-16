@@ -50,15 +50,32 @@ export class CameraController {
   _contentCenterZ = 0;
   _contentDistance = null;
 
-  // Critically-damped spring state for the X follow.  Using an explicit
-  // 2nd-order system gives us continuous velocity AND acceleration, so
-  // the camera never jerks even when the time-track has a velocity kink.
-  _springX = 0;
-  _springVelX = 0;
-  _springReady = false;
+  // Critically-damped spring state for the look-ahead target.  The camera
+  // position rides at a fixed chase offset behind this target, so a single
+  // spring gives us continuous velocity and acceleration for both.
   _lookSpringX = 0;
   _lookSpringVelX = 0;
   _lookSpringReady = false;
+
+  // World-space offset from the look-ahead target to the camera's "chase"
+  // pose.  Set by _computeChase() and used by both the base orbit and the
+  // smart-camera overlay.
+  _chase = new THREE.Vector3(-0.5, 1.5, 2.5);
+  _baseSpherical = new THREE.Spherical();
+
+  // The live camera-target spherical offset.  Kept in sync with
+  // `controls.spherical` so user drags and auto-return are stateless.
+  _currentSpherical = new THREE.Spherical();
+
+  // Desired spherical offset computed by the smart-camera overlay.
+  _desiredSpherical = new THREE.Spherical();
+  _desiredSphericalActive = false;
+  _desiredOffset = new THREE.Vector3();
+
+  // Scratch spherical / vector used to rebuild `camera.position` from
+  // `target` + offset while applying the auto-return spring.
+  _nextSpherical = new THREE.Spherical();
+  _scratchOffset = new THREE.Vector3();
 
   /**
    * Piecewise-linear time→x mapping derived from the note timeline.
@@ -91,16 +108,7 @@ export class CameraController {
   /** Performance.now() timestamp at which we may resume the auto orbit
    *  after a user-drag release.  0 means "no pending resume". */
   _smartResumeAt = 0;
-  /**
-   * The user-controlled "rest pose" — the camera-target offset we
-   * apply smart camera deltas on top of.  Captured whenever smart
-   * camera is NOT actively writing to camera.position (initial pose,
-   * during user drag, while smart camera is off) so the next time it
-   * resumes, the orbit centres on the user's preferred view rather
-   * than snapping back to snapToTarget()'s default.
-   * @type {{ x: number, y: number, z: number } | null}
-   */
-  _restOffset = null;
+
   /**
    * Per-staff exponentially-decaying activity counter.  Notes fire
    * `recordBeatGroupHit(staff, chordSize)` each time the playhead
@@ -123,10 +131,11 @@ export class CameraController {
    *  offsets so that sudden note-density spikes don't jerk the phase
    *  speed (and therefore the camera speed) abruptly. */
   _easedActivityMul = 1.0;
-  /** True while we want to rebuild `_restOffset` on the next frame —
-   *  set after snapToTarget() so the new chase pose becomes the
-   *  smart-camera baseline. */
-  _restOffsetStale = true;
+  /** Last `performance.now()` timestamp the smart camera phase was
+   *  advanced.  `0` means it is paused (user interaction, cooldown,
+   *  or disabled), so the phase does not accumulate wall-clock time
+   *  while inactive. */
+  _lastSmartPhaseUpdate = 0;
 
   /**
    * @param {THREE.PerspectiveCamera} camera
@@ -135,6 +144,10 @@ export class CameraController {
   constructor(camera, controls) {
     this.camera = camera;
     this._controls = controls;
+    // We drive camera position manually and only let `controls.update()`
+    // apply the user's rotate gesture and clamp the orbit, so damping and
+    // auto-return don't fight.
+    controls.enableDamping = false;
   }
 
   set enabled(v) {
@@ -183,6 +196,35 @@ export class CameraController {
     const headroom = cfg.contentHeadroom ?? 1.25;
     const minDistanceForHeight = (spread * headroom) / (2 * Math.tan(halfFov));
     this._contentDistance = Math.max(cfg.defaultDistance, minDistanceForHeight);
+    this._computeChase();
+  }
+
+  /**
+   * Compute the world-space chase offset from the camera target.  This
+   * is the "resting" pose the camera returns to when the user is not
+   * interacting.  It depends on the score framing (`_contentDistance`)
+   * and the current aspect ratio (portrait gets a steeper pitch and a
+   * smaller chase offset).
+   */
+  _computeChase() {
+    const cfg = SceneConfig.camera;
+    const distance = this._contentDistance || cfg.defaultDistance;
+
+    const aspect = this.camera.aspect ?? 1;
+    const portraitFactor = Math.max(0, Math.min(1, (1 - aspect) * 2));
+    const portraitPitch = 65;
+    const portraitChase = 0.25;
+    const basePitchDeg = cfg.pitchDegrees ?? 30;
+    const baseChase = cfg.chaseRatio ?? 0.25;
+    const effectivePitch = basePitchDeg + (portraitPitch - basePitchDeg) * portraitFactor;
+    const effectiveChase = baseChase + (portraitChase - baseChase) * portraitFactor;
+
+    const pitchRad = (effectivePitch * Math.PI) / 180;
+    const heightRatio = Math.tan(pitchRad);
+    const chaseX = -Math.min(distance * effectiveChase, 3.0);
+
+    this._chase.set(chaseX, distance * heightRatio, distance);
+    this._baseSpherical.setFromVector3(this._chase);
   }
 
   /**
@@ -287,78 +329,94 @@ export class CameraController {
 
   /**
    * Called every frame.
-   * Smoothly translates the OrbitControls target toward the desired
-   * follow-point, AND applies the same translation to the camera so
-   * that the relative viewpoint (the user's rotate/zoom) is preserved.
+   * Smoothly translates the OrbitControls target along the note rail;
+   * the camera is kept at the same spherical offset so it follows the
+   * target.  User drag updates that offset directly, and after a cool
+   * down period the auto-return spring pulls it back to the chase pose.
    * @param {number} dt – delta time in seconds
    */
-  update(dt) {
+  update(dt, now = performance.now()) {
     if (!this._enabled || !this._controls) return;
     // Clamp crazy dt so a dropped frame can't kick the spring into a
     // multi-unit jump.
     const h = Math.min(Math.max(dt, 0.0001), 0.1);
 
-    const desiredX = this._target.x;
     const desiredLookX = this._lookTarget.x;
-    const desiredY = this._target.y;
-    const desiredZ = this._target.z;
+    const desiredY = this._lookTarget.y;
+    const desiredZ = this._lookTarget.z;
 
-    if (!this._springReady) {
-      this._springX = desiredX;
-      this._springVelX = 0;
-      this._springReady = true;
-    }
     if (!this._lookSpringReady) {
       this._lookSpringX = desiredLookX;
       this._lookSpringVelX = 0;
       this._lookSpringReady = true;
     }
 
-    // Critically-damped spring using the closed-form approximation
-    // from Game Programming Gems 4 §1.10 (same algorithm as Unity's
-    // SmoothDamp).  Unlike a naive Euler integration this is stable
-    // for any dt and preserves position + velocity continuity even
-    // when the browser drops a frame and hands us a spike in `dt`.
-    // smoothTime ≈ the time it takes for ~63 % of the gap to close.
-    //
-    // 1.25 s gives the camera a deliberately stretchy "tow rope" feel
-    // — when the music speeds up the camera doesn't snap forward,
-    // it leans into the new tempo and gradually catches up; when the
-    // music suddenly slows or stops, the camera coasts to a halt
-    // instead of stopping abruptly.  Earlier values (0.25 s, 0.5 s)
-    // produced perceptible kinks on every velocity change in the
-    // piecewise-linear track and the camera felt twitchy on rapid
-    // chord changes.  The small look-ahead target keeps upcoming notes
-    // visible even with this slower follow spring.  The steady-state
-    // lag at velocity v is v × smoothTime (e.g. at 1 unit/s playback
-    // the camera trails by 1.25 units).
-    const smoothTime = 1.25;
+    // Critically-damped spring for the look-ahead target.  The camera
+    // position is an OrbitControls spherical offset around this target;
+    // driving position via `sphericalDelta` lets user drag and the
+    // auto-return spring share the same state.
+    const smoothTime = SceneConfig.camera.smoothTime ?? 3.0;
     const omega = 2 / smoothTime;
     const xw = omega * h;
     const exp = 1 / (1 + xw + 0.48 * xw * xw + 0.235 * xw * xw * xw);
-    const change = this._springX - desiredX;
-    const temp = (this._springVelX + omega * change) * h;
-    this._springVelX = (this._springVelX - omega * temp) * exp;
-    const prevSpringX = this._springX;
-    this._springX = desiredX + (change + temp) * exp;
     const lookChange = this._lookSpringX - desiredLookX;
     const lookTemp = (this._lookSpringVelX + omega * lookChange) * h;
     this._lookSpringVelX = (this._lookSpringVelX - omega * lookTemp) * exp;
     this._lookSpringX = desiredLookX + (lookChange + lookTemp) * exp;
 
-    // Move the camera along the current-note rail while the OrbitControls
-    // target eases toward the look-ahead rail.  Doing the camera translate
-    // by hand avoids two `Vector3.clone()` allocations per frame — every
-    // avoided GC trigger is one fewer source of camera stutter.
-    this._controls.target.set(this._lookSpringX, desiredY, desiredZ);
-    this.camera.position.x += this._springX - prevSpringX;
+    // The orbit target follows the music.  Read the current camera offset
+    // (which may have been updated by OrbitControls user events since the
+    // last frame) before moving the target, then rebuild position and let
+    // `controls.update` add the user's drag, clamp, and sync.
+    this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
+    this._currentSpherical.setFromVector3(this._scratchOffset);
 
-    // Smart-camera orbital overlay — gentle yaw/pitch/zoom variation
-    // applied ON TOP of the user's current orbit pose so the scene
-    // doesn't feel static during long passages.  Mouse-drag still
-    // wins (see `_userInteracting`); on release we wait
-    // `resumeAfterUserMs` so the camera doesn't fight a moving hand.
-    this._updateSmartCamera(h);
+    this._controls.target.set(this._lookSpringX, desiredY, desiredZ);
+
+    // Recalculate the chase pose in case orientation changed.
+    this._computeChase();
+
+    // Let the smart camera propose its desired spherical offset.
+    this._desiredSphericalActive = false;
+    this._updateSmartCamera(h, now);
+
+    // Start from the camera's current offset around the target.
+    this._nextSpherical.copy(this._currentSpherical);
+
+    // Auto-return: after the user releases and the cooldown has passed,
+    // pull the spherical offset toward the chase pose (or the chase pose
+    // plus the smart camera overlay, if enabled).
+    const inCooldown = this._smartResumeAt > 0 && now < this._smartResumeAt;
+    const returnActive = !this._userInteracting && !inCooldown;
+    if (returnActive) {
+      const returnTime = SceneConfig.camera.returnTime ?? 2.0;
+      const k = 1 - Math.exp(-h / returnTime);
+      const desiredSpherical = this._desiredSphericalActive
+        ? this._desiredSpherical
+        : this._baseSpherical;
+      const current = this._currentSpherical;
+
+      this._nextSpherical.theta += this._wrapAngle(desiredSpherical.theta - current.theta) * k;
+      this._nextSpherical.phi += (desiredSpherical.phi - current.phi) * k;
+      this._nextSpherical.radius += (desiredSpherical.radius - current.radius) * k;
+    }
+
+    // Rebuild camera position from target + desired offset.  OrbitControls
+    // will then apply the user's `_sphericalDelta` and clamp, writing the
+    // final camera position and re-syncing `camera.position`.
+    this._scratchOffset.setFromSpherical(this._nextSpherical);
+    this.camera.position.copy(this._controls.target).add(this._scratchOffset);
+
+    this._controls.update();
+
+    // Capture the final clamped spherical offset for next frame.
+    this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
+    this._currentSpherical.setFromVector3(this._scratchOffset);
+  }
+
+  /** Wrap an angle to (-π, π]. */
+  _wrapAngle(theta) {
+    return Math.atan2(Math.sin(theta), Math.cos(theta));
   }
 
   /* ------------------------------------------------------------------ */
@@ -403,10 +461,6 @@ export class CameraController {
   setUserInteracting(active) {
     if (active) {
       this._userInteracting = true;
-      // The user might have moved the camera away from where smart
-      // camera left off — mark the rest pose stale so we re-anchor
-      // off whatever they end up at.
-      this._restOffsetStale = true;
     } else {
       this._userInteracting = false;
       // Reset the eased smart-camera offsets to neutral so the
@@ -418,7 +472,7 @@ export class CameraController {
       this._smartPitch = 0;
       this._smartRadiusFactor = 1.0;
       const cfg = SceneConfig.smartCamera;
-      const delay = cfg ? (cfg.resumeAfterUserMs ?? 1500) : 1500;
+      const delay = cfg ? (cfg.resumeAfterUserMs ?? 3000) : 3000;
       this._smartResumeAt = performance.now() + delay;
     }
   }
@@ -458,53 +512,33 @@ export class CameraController {
   }
 
   /**
-   * Compute and apply the per-frame smart-camera orbital overlay.
+   * Compute the per-frame smart-camera orbital overlay.
    *
-   * Called once per `update()`.  Captures the user's "rest pose"
-   * (camera position relative to the orbit target) whenever the
-   * smart camera is NOT writing — so when it later resumes, the
-   * sinusoidal yaw/pitch oscillates around wherever the user has
-   * the camera, not around `snapToTarget`'s default.
+   * Called once per `update()`.  When active, it writes a desired
+   * spherical offset (chase base + sinusoidal yaw/pitch/radius) to
+   * `this._desiredSpherical`; `update()`'s auto-return spring pulls
+   * the camera toward it.  When inactive, the desired spherical is
+   * simply the chase base.
    *
    * @param {number} h – clamped delta time in seconds
    */
-  _updateSmartCamera(h) {
+  _updateSmartCamera(h, now) {
     const cfg = SceneConfig.smartCamera;
     if (!cfg) return;
 
-    const tx = this._controls.target.x;
-    const ty = this._controls.target.y;
-    const tz = this._controls.target.z;
-
-    // Decide whether smart camera will write to camera.position this
-    // frame.  Three reasons not to: feature off, user dragging, or
-    // we're in the post-release cool-down window.
-    const now = performance.now();
+    // Decide whether the smart camera is allowed to influence the
+    // desired spherical offset this frame.  Three reasons not to:
+    // feature off, user dragging, or we're in the post-release cool-down.
     const inCooldown = this._smartResumeAt > 0 && now < this._smartResumeAt;
     const active = cfg.enabled && !this._userInteracting && !inCooldown;
 
-    // Capture / refresh rest pose whenever smart camera is NOT
-    // overriding camera.position.  This way, if the user drags to a
-    // new angle, the smart camera resumes its orbit centred on
-    // whatever they ended up at.
     if (!active) {
-      this._restOffset = {
-        x: this.camera.position.x - tx,
-        y: this.camera.position.y - ty,
-        z: this.camera.position.z - tz,
-      };
-      this._restOffsetStale = false;
+      this._desiredSphericalActive = false;
+      this._lastSmartPhaseUpdate = 0;
       return;
     }
 
-    if (this._restOffsetStale || !this._restOffset) {
-      this._restOffset = {
-        x: this.camera.position.x - tx,
-        y: this.camera.position.y - ty,
-        z: this.camera.position.z - tz,
-      };
-      this._restOffsetStale = false;
-    }
+    this._desiredSphericalActive = true;
 
     // Activity-driven multipliers.  More notes per second → faster
     // sweep + slightly bigger amplitude.  Hard cap at 2× so frantic
@@ -516,7 +550,14 @@ export class CameraController {
     const actEase = 1 - Math.exp(-h / 2.0);
     this._easedActivityMul += (rawActivityMul - this._easedActivityMul) * actEase;
 
-    this._smartPhase += h * (cfg.orbitSpeed ?? 0.15) * this._easedActivityMul;
+    // Drive the smart-camera phase from wall-clock time rather than the
+    // smoothed integration dt.  This makes the orbit independent of rAF
+    // interval jitter and dt smoothing lag, so the camera glides rather
+    // than pulsing when the frame cadence wobbles.
+    if (this._lastSmartPhaseUpdate <= 0) this._lastSmartPhaseUpdate = now;
+    const phaseDt = Math.min(Math.max((now - this._lastSmartPhaseUpdate) / 1000, 0), 0.1);
+    this._lastSmartPhaseUpdate = now;
+    this._smartPhase += phaseDt * (cfg.orbitSpeed ?? 0.15) * this._easedActivityMul;
 
     // Two superimposed sinusoids on yaw so the motion never traces
     // out an obvious back-and-forth period — the secondary harmonic
@@ -550,34 +591,23 @@ export class CameraController {
 
     // Critically-damped easing of the live offsets toward their
     // sinusoidal targets.  The 2.0 s time-constant keeps every
-    // camera movement gradual — all automatic motion ramps in/out
-    // slowly enough that the user never perceives a discrete step.
+    // camera movement gradual.
     const ease = 1 - Math.exp(-h / 2.0);
     this._smartYaw += (desiredYaw - this._smartYaw) * ease;
     this._smartPitch += (desiredPitch - this._smartPitch) * ease;
     this._smartRadiusFactor += (desiredRadiusFactor - this._smartRadiusFactor) * ease;
 
-    // Convert the rest offset to spherical, apply our deltas, convert
-    // back, and write the result to camera.position.  OrbitControls'
-    // own update() (called from the worker each frame) just reads
-    // this and recomputes its internal spherical state so user input
-    // remains correct on the next interaction.
-    const r = this._restOffset;
-    const baseRadius = Math.hypot(r.x, r.y, r.z);
-    if (baseRadius < 1e-4) return; // pathological — skip
-    const baseYaw = Math.atan2(r.x, r.z);   // 0 = +Z, π/2 = +X
-    const basePitch = Math.asin(Math.max(-1, Math.min(1, r.y / baseRadius)));
+    // Compute desired spherical offset from the chase base + smart deltas.
+    const base = this._chase;
+    const baseRadius = base.length();
+    if (baseRadius < 1e-4) {
+      this._desiredSphericalActive = false;
+      return;
+    }
+    const baseYaw = Math.atan2(base.x, base.z);   // 0 = +Z, π/2 = +X
+    const basePitch = Math.asin(Math.max(-1, Math.min(1, base.y / baseRadius)));
 
     const newYaw = baseYaw + this._smartYaw;
-    // The smart camera's pitch deviation from the user's rest pose
-    // is at most ±orbitStrength×0.3 ≈ ±0.045 rad — far too small
-    // to flip the camera below the ground plane on its own.  Any
-    // heavier clamping (the old hard-clamp at halfFov + 0.02, or
-    // the soft-clamp that replaced it) forces the camera away from
-    // the user's chosen angle when the smart orbit resumes, which
-    // is the primary source of the "jump" the user reported.  We
-    // only guard against the pathological case of going to or past
-    // the ground plane (pitch ≤ 0).
     const newPitch = Math.max(0.01, basePitch + this._smartPitch);
     const newRadius = baseRadius * this._smartRadiusFactor;
 
@@ -586,11 +616,12 @@ export class CameraController {
     const cosY = Math.cos(newYaw);
     const sinY = Math.sin(newYaw);
 
-    this.camera.position.set(
-      tx + newRadius * cosP * sinY,
-      ty + newRadius * sinP,
-      tz + newRadius * cosP * cosY,
+    this._desiredOffset.set(
+      newRadius * cosP * sinY,
+      newRadius * sinP,
+      newRadius * cosP * cosY,
     );
+    this._desiredSpherical.setFromVector3(this._desiredOffset);
   }
 
   /**
@@ -615,25 +646,16 @@ export class CameraController {
       this._contentCenterZ,
     );
 
-    const cfg = SceneConfig.camera;
-    const distance = this._contentDistance || cfg.defaultDistance;
-
     this._controls.target.set(this._lookTarget.x, this._lookTarget.y, this._lookTarget.z);
 
-    // Reset the spring so it doesn't lurch back to the previous
+    // Reset the look-ahead spring so it doesn't lurch back to the previous
     // smoothed position on the next update().
-    this._springX = this._target.x;
-    this._springVelX = 0;
-    this._springReady = true;
     this._lookSpringX = this._lookTarget.x;
     this._lookSpringVelX = 0;
     this._lookSpringReady = true;
 
-    // Smart camera: snapping invalidates whatever rest pose the
-    // overlay had been orbiting around, so flag it for recapture
-    // on the next update().  Phase is also rewound so the first
-    // few seconds after load look the same regardless of when the
-    // user jumped to a new score.
+    // Smart camera: phase is rewound so the first few seconds after load
+    // look the same regardless of when the user jumped to a new score.
     this._smartPhase = 0;
     this._smartYaw = 0;
     this._smartPitch = 0;
@@ -641,63 +663,14 @@ export class CameraController {
     this._easedActivityMul = 1.0;
     this._staffActivity.clear();
     this._topDownEndAt = 0;
-    this._restOffsetStale = true;
 
-    // Camera position relative to the orbit target:
-    //   • Along world X — a chase-cam offset that slides the camera
-    //     to the LEFT of the playhead (negative X) so the playhead
-    //     appears in the right portion of the screen and there's
-    //     room ahead of it for upcoming notes.  The fraction of the
-    //     auto-fit distance to chase by is configured via
-    //     `cfg.chaseRatio` — 0.6 was an earlier reference where the
-    //     chase offset rotated the music X-axis on screen so notes
-    //     appear to flow in from the top-right; 0.25
-    //     keeps music X nearly parallel to screen X.  See the
-    //     `chaseRatio` notes in `SceneConfig.camera`.
-    //
-    //     Capped at ≈ 3.0 world units in absolute terms so wide
-    //     orchestral scores like Sylvia Suite (auto-fit
-    //     `_contentDistance` ≈ 28) don't end up with the camera 17
-    //     units off-axis from the staff cluster — at the start of
-    //     such a song there's no music to the left of the playhead,
-    //     and a 17-unit chase would push the entire score into the
-    //     right half of the screen with the left half showing
-    //     empty void.  Medium and small scores (Perfect: ≈ 1.9,
-    //     Twinkle: ≈ 1.1) stay below the cap so the chaseRatio
-    //     setting still has its full intended effect there.
-    //   • +distance × tan(pitchDegrees) along world Y — above the
-    //     paper, giving a `pitchDegrees`-pitch-down view of the
-    //     floor in the YZ plane.  Combined with the X chase, the
-    //     actual 3D pitch (angle from horizontal to camera→target)
-    //     ends up shallower than `pitchDegrees` alone.
-    //   • +distance along world Z — toward the camera's "front" of
-    //     the music (positive Z is in front of the staff cluster
-    //     after the contentRoot rotation).
-    // In portrait orientation (aspect < 1) the horizontal FOV is narrow,
-    // so the diagonal "music flowing in from the top-right" view wastes
-    // screen width.  Steeper pitch + smaller chase keeps more notes
-    // visible in the tight horizontal span.  The blend factor ramps
-    // linearly between landscape (aspect >= 1 → factor = 0) and tall
-    // portrait (aspect ≈ 0.5 → factor ≈ 1), so intermediate sizes
-    // transition smoothly.
-    const aspect = this.camera.aspect ?? 1;
-    const portraitFactor = Math.max(0, Math.min(1, (1 - aspect) * 2));
-    const portraitPitch = 65;  // degrees — near-overhead in deep portrait
-    const portraitChase = 0.25;
-    const basePitchDeg = cfg.pitchDegrees ?? 30;
-    const baseChase = cfg.chaseRatio ?? 0.25;
-    const effectivePitch = basePitchDeg + (portraitPitch - basePitchDeg) * portraitFactor;
-    const effectiveChase = baseChase + (portraitChase - baseChase) * portraitFactor;
-
-    const pitchRad = (effectivePitch * Math.PI) / 180;
-    const heightRatio = Math.tan(pitchRad);
-    const chaseRatio = effectiveChase;
-    const chaseX = -Math.min(distance * chaseRatio, 3.0);
-    this.camera.position.set(
-      this._target.x + chaseX,
-      distance * heightRatio,
-      this._target.z + distance,
-    );
+    // Recompute chase offset from current framing and place the camera
+    // at target + chase.  `controls.update()` will sync its internal
+    // spherical with that offset, which we then store as the current spherical.
+    this._computeChase();
+    this.camera.position.copy(this._controls.target).add(this._chase);
     this._controls.update();
+    this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
+    this._currentSpherical.setFromVector3(this._scratchOffset);
   }
 }

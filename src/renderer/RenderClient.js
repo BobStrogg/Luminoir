@@ -14,6 +14,8 @@
  *   3. sends parsed score data (a serialisable JSON blob produced by
  *      `SVGSceneParser`) whenever a new score loads.
  */
+import { SceneConfig } from '../rendering/SceneConfig.js';
+
 export class RenderClient {
   /** @type {Worker|null} */
   _worker = null;
@@ -70,6 +72,11 @@ export class RenderClient {
       devicePixelRatio,
       rect: rectFor(canvas),
       forceWebGL,
+      shadowEnabled: SceneConfig.shadow.enabled,
+      dtSmoothAlpha: SceneConfig.dtSmoothAlpha,
+      smartCameraEnabled: SceneConfig.smartCamera.enabled,
+      lookAheadSeconds: SceneConfig.camera.lookAheadSeconds,
+      smoothTime: SceneConfig.camera.smoothTime,
     }, [offscreen]);
 
     // Handle window resize on main, forward to worker.

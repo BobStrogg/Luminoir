@@ -535,7 +535,14 @@ function _isTeslaUA() {
   return /Tesla|TESLA_AUTO/i.test(_workerUserAgent());
 }
 
-async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL }) {
+async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
+  // SceneConfig is mirrored in the worker; set the runtime flags
+  // from the main thread before the renderer is configured.
+  SceneConfig.shadow.enabled = shadowEnabled !== false;
+  if (typeof dtSmoothAlpha === 'number') SceneConfig.dtSmoothAlpha = dtSmoothAlpha;
+  if (typeof smartCameraEnabled === 'boolean') SceneConfig.smartCamera.enabled = smartCameraEnabled;
+  if (typeof lookAheadSeconds === 'number') SceneConfig.camera.lookAheadSeconds = lookAheadSeconds;
+  if (typeof smoothTime === 'number') SceneConfig.camera.smoothTime = smoothTime;
   // Mobile devices (iOS Safari especially) sit right on the edge of
   // the per-frame budget at desktop quality, and the OS halves the
   // rAF rate the moment a frame goes over.  Trim shadow / DPR /
@@ -631,7 +638,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // On mobile we step down to plain `PCFShadowMap`; the soft variant
   // averages a multi-tap kernel per fragment and is one of the
   // largest single contributors to fragment cost in the shadow pass.
-  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.enabled = SceneConfig.shadow.enabled;
   renderer.shadowMap.type = isMobile
     ? THREE.PCFShadowMap
     : THREE.PCFSoftShadowMap;
@@ -652,15 +659,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   elementProxy = new ElementProxy();
   elementProxy.setRect(rect);
   controls = new OrbitControls(camera, elementProxy);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.12;
+  controls.enableDamping = false;  // CameraController drives via sphericalDelta
   controls.enablePan = false;
   controls.minDistance = 0.3;
   controls.maxDistance = 100;
   controls.target.set(0, 0, 0);
-  // Any user-driven motion or damping-settle frame fires `change`;
-  // wire it to the idle-render gate so we re-submit the GPU pass
-  // exactly when something visible has updated.
+  // Any user-driven motion fires `change`; wire it to the idle-render
+  // gate so we re-submit the GPU pass exactly when something visible
+  // has updated.
   controls.addEventListener('change', _markDirty);
 
   scene.background = new THREE.Color(SceneConfig.backgroundColor);
@@ -687,6 +693,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   _applyLoadTimeQuality(probeMs, baseDpr, isConstrained);
 
   cameraCtrl = new CameraController(camera, controls);
+
+  // Seed the camera-position history used by the cameraJitter probe metric
+  // so the first frame after init doesn't record a bogus giant jump.
+  _prevCameraPos.copy(camera.position);
+  _prevCameraDelta = 0;
+  _cameraDeltaIdx = 0;
+  _cameraDeltaFilled = 0;
+  _cameraDeltaRing.fill(0);
 
   // Smart camera coordination — the controller's auto-orbit needs
   // to know when the user is actively dragging (so it can yield)
@@ -746,7 +760,6 @@ function setupLighting(scene, isMobile) {
   // passages of Jupiter etc. don't trigger iOS Safari's rAF clamp.
   const sCfg = SceneConfig.shadow;
   const mapSize = isMobile ? Math.min(sCfg.mapSize, 2048) : sCfg.mapSize;
-  key.castShadow = true;
   key.shadow.mapSize.width = mapSize;
   key.shadow.mapSize.height = mapSize;
   const shadowCam = key.shadow.camera;
@@ -774,6 +787,10 @@ function setupLighting(scene, isMobile) {
   // mutate `target.position` from the render loop.
   scene.add(key.target);
   _keyLight = key;
+  // Apply the master shadow toggle once the light exists.  This sets
+  // `renderer.shadowMap.enabled` and `key.castShadow` consistently
+  // and seeds the first shadow render if shadows are on.
+  _applyShadowEnabled();
   // Seed an initial pose so the first-frame render produces a valid
   // shadow map even before any camera updates have occurred.  Values
   // are overwritten every frame in `startRenderLoop()`.
@@ -854,7 +871,7 @@ const _SHADOW_THROTTLE_MAX_MS = 150;
  *  The texel size used here is computed in `setupLighting` from the
  *  resolution and frustum dimensions in `SceneConfig.shadow`. */
 function _updateKeyLight(x, z, frameNow = performance.now()) {
-  if (!_keyLight) return;
+  if (!_keyLight || !SceneConfig.shadow.enabled) return;
   const tx = _keyLightTexelSize.x;
   const tz = _keyLightTexelSize.y;
   const xs = Math.round(x / tx) * tx;
@@ -915,6 +932,24 @@ function _updateKeyLight(x, z, frameNow = performance.now()) {
   // Request a shadow map re-render for this frame now that the light
   // has moved to a new texel-grid position.
   _keyLight.shadow.needsUpdate = true;
+}
+
+/** Apply the `SceneConfig.shadow.enabled` flag at runtime.  Called
+ *  from `setupLighting` and `handleUpdateConfig` so toggling shadows
+ *  off/on takes effect on the next frame (with a one-time material
+ *  recompile cost). */
+function _applyShadowEnabled() {
+  if (!renderer || !_keyLight) return;
+  const enabled = SceneConfig.shadow.enabled;
+  renderer.shadowMap.enabled = enabled;
+  _keyLight.castShadow = enabled;
+  _keyLight.shadow.needsUpdate = false;
+  if (enabled) {
+    _keyLight.shadow.needsUpdate = true;
+    _lastKeyLightSnapped.x = null;
+    _lastKeyLightSnapped.z = null;
+    _lastShadowUpdateMs = 0;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1662,13 +1697,24 @@ let _dirty = true;
 
 function _markDirty() { _dirty = true; }
 
+/** Smoothed `dt` used for camera / light-ball integration so rAF
+ *  jitter doesn't feed directly into the springs and smart-camera phase. */
+let _dtSmoothed = 0;
+
+/** Camera-position history for a per-frame `cameraJitter` probe metric. */
+const _prevCameraPos = new THREE.Vector3();
+let _prevCameraDelta = 0;
+const _cameraDeltaRing = new Float64Array(120);
+let _cameraDeltaIdx = 0;
+let _cameraDeltaFilled = 0;
+
 function startRenderLoop() {
   lastFrameTime = performance.now();
   const loop = (frameNow) => {
     rafId = requestAnimationFrame(loop);
     const now = Number.isFinite(frameNow) ? frameNow : performance.now();
     const cpuStart = performance.now();
-    const dt = Math.min(Math.max((now - lastFrameTime) / 1000, 0), 0.1);
+    const rawDt = Math.min(Math.max((now - lastFrameTime) / 1000, 0), 0.1);
     const frameMs = now - lastFrameTime;
     lastFrameTime = now;
 
@@ -1686,7 +1732,21 @@ function startRenderLoop() {
         _playFrameMsIdx = (_playFrameMsIdx + 1) % _playFrameMsRing.length;
         if (_playFrameMsFilled < _playFrameMsRing.length) _playFrameMsFilled++;
       }
+
+      // Smooth rAF jitter out of the integration dt that drives camera
+      // motion.  Alpha 0.2 keeps the signal responsive while suppressing
+      // the ±0.5 ms vsync noise we see on Safari.
+      const alpha = Math.max(0, Math.min(1, SceneConfig.dtSmoothAlpha ?? 0.2));
+      if (alpha <= 0 || _dtSmoothed === 0) {
+        _dtSmoothed = rawDt;
+      } else {
+        _dtSmoothed = _dtSmoothed * (1 - alpha) + rawDt * alpha;
+      }
+      // Enforce a non-zero minimum so the integration formulas never
+      // see an exact zero dt on the first frame or a long pause.
+      if (_dtSmoothed < 0.0001) _dtSmoothed = 0.0001;
     }
+    const dt = _dtSmoothed;
 
     let frameFlags = 0;
 
@@ -1708,9 +1768,25 @@ function startRenderLoop() {
         _camTarget.set(xTime, 0, 0);
         cameraCtrl.setTarget(_camTarget, xLook ?? xTime);
       }
-      cameraCtrl.update(dt);
+      cameraCtrl.update(dt, now);
     }
-    controls.update();
+
+    // Capture camera-position change for the `cameraJitter` probe metric.
+    // Variation here (not absolute motion) is the best proxy we have
+    // for visible camera jitter caused by rAF dt noise.
+    if (camera && clock.state === 'playing') {
+      const dx = camera.position.x - _prevCameraPos.x;
+      const dy = camera.position.y - _prevCameraPos.y;
+      const dz = camera.position.z - _prevCameraPos.z;
+      const delta = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      _prevCameraPos.copy(camera.position);
+      const deltaDelta = Math.abs(delta - _prevCameraDelta);
+      _prevCameraDelta = delta;
+      _cameraDeltaRing[_cameraDeltaIdx] = deltaDelta;
+      _cameraDeltaIdx = (_cameraDeltaIdx + 1) % _cameraDeltaRing.length;
+      if (_cameraDeltaFilled < _cameraDeltaRing.length) _cameraDeltaFilled++;
+    }
+
     // Slide the key light's shadow camera to straddle whatever the
     // scene camera is currently looking at.  The orbit controls'
     // target tracks the music during playback and the user's pan
@@ -1979,6 +2055,7 @@ function handleUpdateConfig({ updates }) {
         || path === 'camera.chaseRatio') {
       cameraDirty = true;
     }
+    if (path === 'shadow.enabled') _applyShadowEnabled();
   }
   if (cameraDirty && cameraCtrl && _lastFraming) {
     cameraCtrl.configureForScore(_lastFraming.contentMinY, _lastFraming.contentMaxY);
@@ -2050,6 +2127,22 @@ function handleProbe({ id }) {
   }
   fSamples.sort((a, b) => a - b);
   const fp = (q) => fSamples[Math.min(fSamples.length - 1, Math.floor(fSamples.length * q))];
+
+  // Camera-position second-difference (jitter) samples.  This measures
+  // how much the camera's per-frame movement *changes*, not how much it
+  // moves, so it isolates the high-frequency jitter from the underlying
+  // smooth tracking motion.
+  let cSum = 0, cMax = 0;
+  const cSamples = [];
+  for (let i = 0; i < _cameraDeltaFilled; i++) {
+    const v = _cameraDeltaRing[i];
+    cSamples.push(v);
+    cSum += v;
+    if (v > cMax) cMax = v;
+  }
+  cSamples.sort((a, b) => a - b);
+  const cp = (q) => cSamples[Math.min(cSamples.length - 1, Math.floor(cSamples.length * q))];
+
   const summarizeBucket = (bucket) => ({
     count: bucket.count,
     mean: bucket.count ? bucket.sum / bucket.count : 0,
@@ -2134,6 +2227,14 @@ function handleProbe({ id }) {
         afterColorUpload: summarizeBucket(_jitterTotals.afterColorUpload),
         afterStats: summarizeBucket(_jitterTotals.afterStats),
         afterBudgetSkip: summarizeBucket(_jitterTotals.afterBudgetSkip),
+      },
+      cameraJitter: {
+        samples: _cameraDeltaFilled,
+        mean: _cameraDeltaFilled ? (cSum / _cameraDeltaFilled) : 0,
+        p50: _cameraDeltaFilled ? cp(0.5) : 0,
+        p95: _cameraDeltaFilled ? cp(0.95) : 0,
+        p99: _cameraDeltaFilled ? cp(0.99) : 0,
+        max: cMax,
       },
       scene: {
         meshCount, instancedMeshCount, totalInstances, spriteCount,
