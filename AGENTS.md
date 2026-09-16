@@ -11,8 +11,15 @@ pnpm install          # install deps
 pnpm dev              # dev server → http://localhost:5173
 pnpm dev:lan          # dev server → https://<lan-host>:5173 (mkcert cert, for LAN access)
 pnpm build            # production build → dist/
-# No `test` script is currently defined; use the testing-luminoir Playwright scenarios
+pnpm test             # Vitest unit tests (test/**, pure logic only — no browser)
+pnpm lint             # ESLint (flat config, eslint.config.js)
+# Browser behaviour: use the testing-luminoir Playwright scenarios
 ```
+
+Run `pnpm lint && pnpm test && pnpm build` before every commit.  Unit tests cover the
+pure modules (pathD, svgPathBounds, svgPrimitives, sceneBounds, qualityPolicy, RingBuffer,
+staffColors, smoothDamp, chordGroups, midiParse); add a test whenever you extract or
+change one of these.
 
 `package.json` `packageManager` field pins the exact pnpm version.  If `corepack enable`
 fails (signature validation errors), use `npm install -g pnpm@<version>` directly.
@@ -57,14 +64,24 @@ The `.certs/` directory is `.gitignore`d — never committed.
 ```
 main thread                         render worker (OffscreenCanvas)
 ──────────────────────────────────  ──────────────────────────────
-LuminoirApp.js                      renderWorker.js
-  RenderClient.js  ──postMessage──▶   handleInit / handleBuildScene / …
-  MIDIPlayer.js    ──clock msg──────▶  startRenderLoop
-  SettingsPanel.js ──updateConfig──▶   handleUpdateConfig
-  Controls.js      (score picker, transport)
-  SVGSceneParser.js (Verovio → JSON)
-  scoreWorker.js (Verovio WASM, off-thread)
+LuminoirApp.js                      renderWorker.js  (message switch + init wiring)
+  RenderClient.js  ──postMessage──▶   worker/SceneHost.js      build/timeline/precompile
+  MIDIPlayer.js    ──clock msg──────▶  worker/RenderLoop.js     per-frame tick
+  SettingsPanel.js ──updateConfig──▶   worker/QualityController probes + runtime pressure
+  Controls.js      (score picker)      worker/KeyLightRig       shadow rig
+  SVGSceneParser.js (Verovio → JSON)   worker/LodGate, PlayedNoteColorizer,
+  scoreWorker.js (Verovio WASM)        PlaybackClock, FrameStats, AntiAliasing
 ```
+
+The worker subsystems share one plain `ctx` object (renderer, camera, controls, and the
+component instances) and read peers lazily — nothing under `worker/` imports
+`renderWorker.js`.  `RenderLoop._tick` runs, in order: `_advanceTiming → _animate →
+_updateWorld → _render → _updatePressure → _heartbeat`; keep new per-frame work inside
+one of those steps and allocation-free.
+
+Scene building: `SVG3DBuilder.build()` fills an `InstanceBucketer` (glyph + box buckets),
+then `InstancedChunkEmitter` emits the InstancedMeshes; `PaperAndTitle` adds the backdrop
+and extruded title; `LegacyMeshBuilder` is the `BUCKET_INSTANCES=false` bisect path.
 
 Key principle: **all Three.js state lives in the render worker**.  The main thread holds
 only the DOM canvas placeholder; it transfers `OffscreenCanvas` to the worker on init.
@@ -293,8 +310,12 @@ has changed.  During silence + static camera → GPU at ~0%.
 is called with all objects' `frustumCulled = false` and hidden objects temporarily made
 visible so every pipeline is compiled before first playback frame.
 
-**Budget-skip gate**: If the previous render call took > `RENDER_BUDGET_MS` (12 ms),
-skip one frame to let the GPU drain.  Skips at most 1 frame in a row.
+**Budget-skip gate**: If the previous render submit took longer than
+`renderBudgetMs()` — 75 % of the calibrated refresh interval (`quality.baselineMs`), or a
+fixed 12 ms before calibration — skip one frame to let the GPU drain.  Skips at most 1
+frame in a row.  The budget must stay relative to the display interval: an absolute
+12 ms on a 60 Hz device skipped frames that would have fit and forced a 30 Hz picture
+cadence under 60 Hz animation (visible judder).
 
 **Note-glow fade by distance** (`setPlayheadX`): `glowTrailLength` in SceneConfig (default 4.0
 world units) determines how far behind the playhead notes keep their emissive.
