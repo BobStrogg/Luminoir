@@ -68,6 +68,21 @@ export class LightBall {
   }
 
   /**
+   * Per-frame update: position + all three visual factors in one call
+   * so the hot loop triggers `_applyVisuals()` exactly once per ball
+   * per frame instead of once per setter.  The glow-visibility cutoff
+   * matches `setGlowMod` (effectively-off mods skip the draw call).
+   */
+  applyFrame(x, y, z, scale, intensity, glowMod) {
+    this.setPosition(x, y, z);
+    this._scale = scale;
+    this._intensity = intensity;
+    this._glowMod = glowMod;
+    this._glow.visible = this._mesh.visible && glowMod > 0.02;
+    this._applyVisuals();
+  }
+
+  /**
    * Multiplier on the glow sprite's size & opacity applied after
    * scale/intensity.  Controller sets this from camera distance so
    * distant-view glows can fade out without touching the sphere mesh.

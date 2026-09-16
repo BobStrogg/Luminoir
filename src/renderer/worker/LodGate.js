@@ -1,4 +1,5 @@
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
+import { lodDetailThreshold, lodSubPixelFactor } from './qualityPolicy.js';
 
 /**
  * Distance-driven visibility gating for the tagged buckets — this is
@@ -35,16 +36,24 @@ export class LodGate {
   /** Camera-to-target distance at the last LOD evaluation; -1 forces a
    *  re-evaluation (scene rebuild, resize, DPR change). */
   _lodLastDistance = -1;
+  /** Runtime pressure at the last LOD evaluation; a ≥ 0.05 change
+   *  re-evaluates even when the camera distance is unchanged. */
+  _lodLastPressure = 0;
+  /** Detail-hide distance (wu) used at the last evaluation — the
+   *  pressure-scaled value actually applied, exposed for probe. */
+  _effectiveThreshold = OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12;
 
   get managedCount() { return this._lodMeshes.length; }
   get hiddenCount() { return this._lodMeshes.reduce((n, m) => n + (m.visible ? 0 : 1), 0); }
   get lastDistance() { return this._lodLastDistance; }
+  get effectiveThreshold() { return this._effectiveThreshold; }
 
   /** Collect the LOD-managed meshes from a freshly-built scene root.
    *  Called from SceneHost.buildScene after the root is attached. */
   collect(root) {
     this._lodMeshes.length = 0;
     this._lodLastDistance = -1;
+    this._lodLastPressure = 0;
     if (!OPTIMIZATIONS.LOD_DISTANT_ELEMENTS && !OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS) return;
     root.traverse((n) => {
       if (n.isMesh && n.userData && (n.userData.lodSize > 0 || n.userData.lodDetail)) {
@@ -61,19 +70,23 @@ export class LodGate {
   clear() {
     this._lodMeshes.length = 0;
     this._lodLastDistance = -1;
+    this._lodLastPressure = 0;
   }
 
   /**
-   * Evaluate the LOD rules for the current camera distance.
+   * Evaluate the LOD rules for the current camera distance and
+   * runtime pressure.
    * @returns {boolean} true when at least one mesh's visibility
    *   toggled — the caller should mark the frame dirty.
    */
-  apply(camera, controls, pixelRatio, viewportHeightCss) {
+  apply(camera, controls, pixelRatio, viewportHeightCss, pressure = 0) {
     if (this._lodMeshes.length === 0 || !camera || !controls) return false;
     const d = camera.position.distanceTo(controls.target);
     if (this._lodLastDistance > 0
-        && Math.abs(d - this._lodLastDistance) < this._lodLastDistance * 0.01) return false;
+        && Math.abs(d - this._lodLastDistance) < this._lodLastDistance * 0.01
+        && Math.abs(pressure - this._lodLastPressure) < 0.05) return false;
     this._lodLastDistance = d;
+    this._lodLastPressure = pressure;
 
     // World units per *device* pixel at the orbit-target distance.
     const fovRad = (camera.fov * Math.PI) / 180;
@@ -82,7 +95,16 @@ export class LodGate {
 
     const detailRule = OPTIMIZATIONS.LOD_DISTANT_ELEMENTS;
     const clipRule = OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS;
-    const T = OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12;
+    // Runtime pressure is a fourth actuator: sustained overrun shrinks
+    // the detail-hide distance toward 30 % of base (≈ 3.6 wu) and
+    // raises the sub-pixel cutoff toward ~2 device px, shedding
+    // per-instance cost without any pipeline recompile.
+    const T = lodDetailThreshold(OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12, pressure);
+    const subPx = lodSubPixelFactor(pressure);
+    // Re-show hysteresis uses the same ratio as the constant version
+    // (detail: ×0.85 of the hide distance; sub-pixel: ×0.85/0.7).
+    const subPxReshow = subPx * (0.85 / 0.7);
+    this._effectiveThreshold = T;
 
     let toggled = false;
     for (let i = 0; i < this._lodMeshes.length; i++) {
@@ -91,12 +113,12 @@ export class LodGate {
       let wantVisible;
       if (mesh.visible) {
         const hideDetail = detailRule && ud.lodDetail && d > T;
-        const hideSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.7;
+        const hideSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * subPx;
         wantVisible = !(hideDetail || hideSubPixel);
       } else {
         // Re-show only once we're clearly back inside both thresholds.
         const stillDetailHidden = detailRule && ud.lodDetail && d > T * 0.85;
-        const stillSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.85;
+        const stillSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * subPxReshow;
         wantVisible = !(stillDetailHidden || stillSubPixel);
       }
       if (wantVisible !== mesh.visible) {

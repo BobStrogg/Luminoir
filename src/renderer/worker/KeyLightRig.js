@@ -23,10 +23,15 @@ const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
  *  covered region.  Unlike dimming lights, skipping 6144² shadow
  *  passes recovers *most* of the over-budget GPU time — this is the
  *  actuator that actually restores a consistent frame rate when the
- *  pressure system fires. */
+ *  pressure system fires.
+ *
+ *  Constrained platforms (mobile / Tesla legacy WebGL) get a deeper
+ *  400 ms floor: their shadow passes are disproportionately
+ *  expensive, so sustained pressure trades coverage lag harder. */
 const _SHADOW_RECENTER_DISTANCE = 2;
 const _SHADOW_UPDATE_MIN_MS = 1000 / 30;
-const _SHADOW_THROTTLE_MAX_MS = 150;
+const _SHADOW_THROTTLE_MAX_DESKTOP_MS = 150;
+const _SHADOW_THROTTLE_MAX_CONSTRAINED_MS = 400;
 
 /**
  * The shadow-casting key directional light plus its texel-snapping /
@@ -56,6 +61,10 @@ export class KeyLightRig {
   _shadowUpdates = 0;
   _shadowThrottled = 0;
 
+  /** Max recenter interval (ms) under full pressure — deeper on
+   *  constrained platforms where shadow passes cost the most. */
+  _shadowThrottleMaxMs = _SHADOW_THROTTLE_MAX_DESKTOP_MS;
+
   get light() { return this._keyLight; }
   get texelSize() { return this._keyLightTexelSize; }
   get shadowUpdates() { return this._shadowUpdates; }
@@ -78,7 +87,10 @@ export class KeyLightRig {
     this._shadowThrottled = 0;
   }
 
-  setupLighting(scene, isMobile, renderer) {
+  setupLighting(scene, isMobile, renderer, isConstrained = false) {
+    this._shadowThrottleMaxMs = isConstrained
+      ? _SHADOW_THROTTLE_MAX_CONSTRAINED_MS
+      : _SHADOW_THROTTLE_MAX_DESKTOP_MS;
     // Bright neutral ambient so the white-ish paper reads as actually
     // lit-from-everywhere — the dark-theme value of 0.6 was tuned for
     // a near-black page and looked flat against the cream background.
@@ -208,7 +220,7 @@ export class KeyLightRig {
     // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
     const now = frameNow;
     const shadowInterval = shadowIntervalMs(
-      pressure, _SHADOW_UPDATE_MIN_MS, _SHADOW_THROTTLE_MAX_MS);
+      pressure, _SHADOW_UPDATE_MIN_MS, this._shadowThrottleMaxMs);
     if (this._lastShadowUpdateMs > 0 && now - this._lastShadowUpdateMs < shadowInterval) {
       this._shadowThrottled++;
       return;

@@ -355,9 +355,8 @@ export class LightBallController {
         srcX = prev.notes[i].x;
         srcY = prev.notes[i].y;
       } else {
-        const c = centerOf(prev.notes);
-        srcX = c.x;
-        srcY = c.y;
+        srcX = prev.center.x;   // group centres are precomputed at build time
+        srcY = prev.center.y;
       }
 
       // Target position: use the matched note in the next group.
@@ -368,9 +367,8 @@ export class LightBallController {
         dstX = next.notes[j].x;
         dstY = next.notes[j].y;
       } else {
-        const c = centerOf(next.notes);
-        dstX = c.x;
-        dstY = c.y;
+        dstX = next.center.x;
+        dstY = next.center.y;
       }
 
       // Position interpolation with eased progress (smooth start/stop).
@@ -390,10 +388,6 @@ export class LightBallController {
       const visible = scaleFactor > 0.01;
       balls[i].setVisible(visible);
       if (visible) {
-        balls[i].setPosition(x, y, z);
-        balls[i].setScale(scaleFactor * pulse);
-        balls[i].setIntensity((0.7 + bounceAmt * 0.6) * pulse);
-
         // Modulate the per-ball glow sprite so every staff has a
         // visible halo at any zoom.  With perspective attenuation
         // on, the sprite naturally shrinks 1/d with distance — to
@@ -421,6 +415,7 @@ export class LightBallController {
         // drawing sub-pixel sprites that didn't make a visible
         // difference, but it also clipped the glow on legitimate
         // wide-shot views and is no longer applied.)
+        let glowMod = balls[i]._glowMod;
         if (camPos) {
           const dx = camPos.x - x;
           const dy = camPos.y - y;
@@ -439,9 +434,18 @@ export class LightBallController {
           // alpha (0.18 / 0.05) gives the user's preferred
           // "subtle close-up, visible on every Sylvia ball"
           // balance.
-          const mod = Math.max(0.25, d * 0.15);
-          balls[i].setGlowMod(mod);
+          glowMod = Math.max(0.25, d * 0.15);
         }
+
+        // One visual apply per ball per frame — `applyFrame` folds
+        // position + scale + intensity + glowMod into a single
+        // `_applyVisuals()` call.
+        balls[i].applyFrame(
+          x, y, z,
+          scaleFactor * pulse,
+          (0.7 + bounceAmt * 0.6) * pulse,
+          glowMod,
+        );
 
         // Contribute to the pooled light assigned to this staff.
         // Pool lights follow the centroid of every visible ball from
