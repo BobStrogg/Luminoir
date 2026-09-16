@@ -151,12 +151,17 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - The p95 ring is sorted at 4 Hz, not every rAF tick; pressure itself still eases every
   frame.  The 30-tick p95 calibration remains diagnostic only.
 - Rises toward 1 after sustained p95 ≥ 19.17 ms and falls with p95 ≤ 17.5 ms.
-- Two actuators:
+- Four actuators:
   1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
   2. **Shadow-update throttle** (`_updateKeyLight`): static directional-shadow coverage
      refreshes at most 30 Hz at zero pressure and stretches toward 150 ms (~7 Hz) at
-     full pressure.  Translating the DirectionalLight never changes shadow direction;
-     it only slides the 40 wu-wide coverage frustum, so this is visually stable.
+     full pressure — 400 ms on constrained platforms.  Translating the DirectionalLight
+     never changes shadow direction; it only slides the 40 wu-wide coverage frustum,
+     so this is visually stable.
+  3. **LOD pressure actuator** (`LodGate.apply`): the detail-hide distance shrinks
+     toward 30 % of base (≈3.6 wu) and the sub-pixel cutoff rises from ~0.7 to ~2
+     device px at full pressure — real GPU savings with no pipeline recompiles.
+  4. **FXAA suppression** hysteresis (suppress ≥ 0.7, restore ≤ 0.25).
 - Controlled by `autoDegrade`; disabling restores full intensity immediately.
 - Settings shows a pressure dot (green → amber → red).
 
@@ -169,7 +174,8 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - Runtime: detail buckets hide beyond `LOD_DISTANCE_THRESHOLD` (12 wu, where they are
   ≈ 1 px); any tagged bucket hides when its footprint projects below ~0.7 device px.
   Both rules have 15–20 % hysteresis so the smart camera's ±6 % zoom oscillation can't
-  flicker them.  The pass runs only when camera distance changes > 1 %.
+  flicker them.  The pass runs when camera distance changes > 1 % or runtime pressure
+  shifts ≥ 0.05 — pressure scales both thresholds (see actuators above).
 - Staff lines, bar lines, beams, and noteheads are never distance-hidden (structure);
   noteheads only go sub-pixel past d ≈ 100 (controls maxDistance = 100).
 - Mesh `.visible` toggling does NOT recompile WebGPU pipelines (unlike light `.visible`)
@@ -202,6 +208,8 @@ so the first scene build already sees persisted preferences.
 Settings that bypass the registry (pure-worker state, not in SceneConfig):
 - `autoDegrade` — adaptive quality toggle, handled in `handleUpdateConfig` before the
   generic dot-path loop and then `continue`d so it never touches SceneConfig.
+- `debugPressure` — debug-only pressure override (number|null) forcing `quality.pressure`
+  for actuator probing; skipped by the dot-path loop.
 
 Worker-side settings that are NOT in the registry (design-time tunables):
 - Shadow quality: `SceneConfig.shadow.*` — mapSize, frustumHalfWidth, bias, normalBias, radius.

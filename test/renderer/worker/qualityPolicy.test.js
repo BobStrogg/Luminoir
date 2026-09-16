@@ -6,6 +6,9 @@ import {
   lightIntensityForPressure,
   shadowIntervalMs,
   fxaaSuppressedFor,
+  lodDetailThreshold,
+  lodSubPixelFactor,
+  renderBudgetMs,
 } from '../../../src/renderer/worker/qualityPolicy.js';
 
 describe('chooseLoadTimeQuality', () => {
@@ -89,5 +92,43 @@ describe('fxaaSuppressedFor', () => {
     expect(fxaaSuppressedFor(false, 0.5)).toBe(false);
     expect(fxaaSuppressedFor(true, 0.5)).toBe(true);
     expect(fxaaSuppressedFor(true, 0.25)).toBe(false);
+  });
+});
+
+describe('lodDetailThreshold', () => {
+  it('scales the base threshold down to 30 % at full pressure', () => {
+    expect(lodDetailThreshold(12, 0)).toBe(12);
+    expect(lodDetailThreshold(12, 0.5)).toBeCloseTo(12 * 0.65);
+    expect(lodDetailThreshold(12, 1)).toBeCloseTo(3.6);
+  });
+
+  it('clamps out-of-range pressure', () => {
+    expect(lodDetailThreshold(12, 2)).toBeCloseTo(3.6);
+    expect(lodDetailThreshold(12, -1)).toBe(12);
+  });
+});
+
+describe('lodSubPixelFactor', () => {
+  it('rises from 0.7 to 2.0 device px', () => {
+    expect(lodSubPixelFactor(0)).toBeCloseTo(0.7);
+    expect(lodSubPixelFactor(0.5)).toBeCloseTo(1.35);
+    expect(lodSubPixelFactor(1)).toBeCloseTo(2.0);
+  });
+
+  it('clamps out-of-range pressure', () => {
+    expect(lodSubPixelFactor(5)).toBeCloseTo(2.0);
+    expect(lodSubPixelFactor(-2)).toBeCloseTo(0.7);
+  });
+});
+
+describe('renderBudgetMs', () => {
+  it('returns the fixed fallback until calibrated', () => {
+    expect(renderBudgetMs(16.67, false)).toBe(12);
+    expect(renderBudgetMs(8.33, false, 10)).toBe(10);
+  });
+
+  it('returns 75 % of the calibrated baseline', () => {
+    expect(renderBudgetMs(16.67, true)).toBeCloseTo(12.5);
+    expect(renderBudgetMs(8.33, true)).toBeCloseTo(6.25);
   });
 });

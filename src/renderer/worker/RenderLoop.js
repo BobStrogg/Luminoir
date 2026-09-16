@@ -3,6 +3,7 @@ import { SceneConfig } from '../../rendering/SceneConfig.js';
 import { setPlayheadX } from '../../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
 import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './FrameStats.js';
+import { renderBudgetMs } from './qualityPolicy.js';
 
 /**
  * Frame-budget rendering.
@@ -19,6 +20,13 @@ import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './Fr
  * until a fence, so this under-counts GPU time on some drivers, but
  * it's enough to detect catastrophic rendering slowdowns (e.g.
  * `renderer.render()` taking > 12 ms is a clear signal to throttle).
+ *
+ * The budget is relative to the display's measured refresh interval
+ * once the baseline is calibrated (75 % of `quality.baselineMs`), not
+ * a fixed absolute value: on a 60 Hz device a 13 ms submit that would
+ * have fit the 16.67 ms interval must still render, otherwise the
+ * loop falls into a render/skip/render cadence that halves the picture
+ * rate while animation runs at full speed — visible judder.
  */
 const RENDER_BUDGET_MS = 12;
 
@@ -209,7 +217,8 @@ export class RenderLoop {
       const pixelRatio = renderer && typeof renderer.getPixelRatio === 'function'
         ? renderer.getPixelRatio()
         : 1;
-      if (lod.apply(camera, controls, pixelRatio, this._ctx.viewportHeightCss)) {
+      if (lod.apply(camera, controls, pixelRatio, this._ctx.viewportHeightCss,
+        quality.pressure)) {
         this.markDirty();
       }
     }
@@ -236,11 +245,12 @@ export class RenderLoop {
    * frame flags.
    */
   _render() {
-    const { host, clock, renderer, camera, keyLightRig, antiAliasing, frameStats, post } = this._ctx;
+    const { host, clock, renderer, camera, keyLightRig, antiAliasing, frameStats, quality, post } = this._ctx;
     let frameFlags = 0;
     if (clock.playing) this._dirty = true;
+    const budgetMs = renderBudgetMs(quality.baselineMs, quality.calibrated, RENDER_BUDGET_MS);
     const budgetGate = !OPTIMIZATIONS.RENDER_BUDGET_SKIP
-      || frameStats.lastRenderMs <= RENDER_BUDGET_MS
+      || frameStats.lastRenderMs <= budgetMs
       || frameStats.framesSinceRender >= 1;
     const shouldRender = !host.compiling && this._dirty && budgetGate;
     if (shouldRender) {

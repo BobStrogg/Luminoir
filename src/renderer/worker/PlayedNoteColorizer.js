@@ -112,6 +112,13 @@ export class PlayedNoteColorizer {
     if (!entry) return;
     if (entry.index >= 0 && entry.mesh && entry.mesh.isInstancedMesh) {
       entry.mesh.setColorAt(entry.index, color);
+      // Restrict the buffer upload to the touched instance range
+      // (itemSize 3 floats per colour).  Both WebGLAttributes and
+      // WebGPUAttributeUtils honour `updateRanges`; `needsUpdate` is
+      // still flagged once per mesh in `_flushDirtyMeshes`.
+      if (entry.mesh.instanceColor) {
+        entry.mesh.instanceColor.addUpdateRange(entry.index * 3, 3);
+      }
       this._dirtyInstanceMeshes.add(entry.mesh);
     } else if (entry.material && entry.material.color) {
       entry.material.color.copy(color);

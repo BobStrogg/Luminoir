@@ -115,3 +115,35 @@ export function fxaaSuppressedFor(prevSuppressed, pressure) {
   if (pressure <= 0.25) return false;
   return prevSuppressed;
 }
+
+const _clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+/**
+ * Pressure-driven LOD detail threshold: at zero pressure the
+ * configured base distance applies (stems/flags/ledger lines hide
+ * beyond ~12 wu); at full pressure it shrinks to 30 % of the base
+ * (≈ 3.6 wu) so only nearby detail survives.
+ */
+export function lodDetailThreshold(baseThreshold, pressure) {
+  return baseThreshold * (1 - 0.7 * _clamp01(pressure));
+}
+
+/**
+ * Pressure-driven sub-pixel culling factor: at zero pressure a
+ * glyph bucket hides once its footprint projects below ~0.7 device
+ * px; at full pressure the cutoff rises to ~2.0 device px.
+ */
+export function lodSubPixelFactor(pressure) {
+  return 0.7 + 1.3 * _clamp01(pressure);
+}
+
+/**
+ * Per-frame render-submit budget.  Fixed `fallbackMs` until the
+ * baseline is calibrated, then 75 % of the display's measured rAF
+ * interval so a submit that would have fit the refresh isn't
+ * needlessly skipped (a 13 ms submit on a 60 Hz device must render,
+ * not fall into a render/skip cadence that halves picture rate).
+ */
+export function renderBudgetMs(baselineMs, calibrated, fallbackMs = 12) {
+  return calibrated ? baselineMs * 0.75 : fallbackMs;
+}

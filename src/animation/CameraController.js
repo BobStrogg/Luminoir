@@ -123,6 +123,9 @@ export class CameraController {
   /** Reusable scratch Map for `_smartActivityWeights()` — pre-allocated
    *  once to avoid a `new Map()` GC allocation on every rAF tick. */
   _smartWeightsScratch = new Map();
+  /** Preallocated result object for `_smartActivityWeights()` — mutated
+   *  in place each frame so the smart-camera tick allocates nothing. */
+  _activitySummary = { weights: this._smartWeightsScratch, total: 0, dominantStaff: -1, dominance: 0 };
   /** Top-down dramatic-overhead state.  When `_topDownEndAt` is in
    *  the future, the smart-camera pitch is biased upward toward an
    *  overhead view that fades back out via a half-sine. */
@@ -501,8 +504,11 @@ export class CameraController {
         if (w > maxW) { maxW = w; dominantStaff = staff; }
       }
     }
-    const dominance = total > 0 ? maxW / total : 0;
-    return { weights: this._smartWeightsScratch, total, dominantStaff, dominance };
+    const sum = this._activitySummary;
+    sum.total = total;
+    sum.dominantStaff = dominantStaff;
+    sum.dominance = total > 0 ? maxW / total : 0;
+    return sum;
   }
 
   /**

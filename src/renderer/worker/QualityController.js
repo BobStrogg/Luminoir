@@ -21,9 +21,11 @@ import {
  *
  * **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
  *   A 0→1 float that rises only when recent p95 frame time exceeds
- *   the 60 fps target.  It smoothly scales light-ball intensity and
+ *   the 60 fps target.  It smoothly scales light-ball intensity,
  *   spaces out static directional-shadow refreshes from 30 Hz toward
- *   ~7 Hz.  Neither actuator reallocates GPU resources.
+ *   ~7 Hz (deeper on constrained devices), suppresses FXAA, and feeds
+ *   the LOD gate's pressure-scaled thresholds.  No actuator
+ *   reallocates GPU resources.
  *
  *   Shadow map size, DPR, and PCF type require a dispose / reallocate,
  *   so those settings only change behind the score-loading overlay.
@@ -59,6 +61,11 @@ export class QualityController {
    * Driven by `updateRuntimePressure()` in the rAF loop.
    */
   _runtimePressure = 0;
+  /** Debug-only pressure override set via `updateConfig({ debugPressure })`.
+   *  When a number, `pressure` reports it and `updateRuntimePressure`
+   *  early-returns so the real pressure signal can't fight the
+   *  override; `null` restores normal behaviour. */
+  _debugPressure = null;
   /** Whether the auto-dim system is enabled (mirrors the Settings toggle). */
   _autoDimEnabled = true;
   /** Diagnostics: what the load-time probe measured and chose.  Exposed
@@ -86,7 +93,7 @@ export class QualityController {
   _lastAqSampleMs = 0;
   _latestAqP95 = 0;
 
-  get pressure() { return this._runtimePressure; }
+  get pressure() { return this._debugPressure ?? this._runtimePressure; }
   get baselineMs() { return this._baselineMs; }
   get calibrated() { return this._calibrated; }
   get autoDimEnabled() { return this._autoDimEnabled; }
@@ -134,6 +141,9 @@ export class QualityController {
    */
   updateRuntimePressure(dt, frameP95) {
     if (!this._autoDimEnabled || !this._calibrated) return;
+    // A debug override freezes the real pressure signal so it can't
+    // drift away from (or fight) the forced value.
+    if (this._debugPressure != null) return;
 
     this._runtimePressure = advancePressure(this._runtimePressure, dt, frameP95);
 
@@ -298,6 +308,13 @@ export class QualityController {
       this._lastAqSampleMs = now;
     }
     return this._latestAqP95;
+  }
+
+  /** Debug-only override for `pressure` (number to force, `null` to
+   *  release).  Pure-worker state — never touches SceneConfig. */
+  setDebugPressure(value) {
+    this._debugPressure = typeof value === 'number' && Number.isFinite(value)
+      ? Math.min(1, Math.max(0, value)) : null;
   }
 
   /** Apply the `autoDegrade` settings toggle (the pure-worker flag

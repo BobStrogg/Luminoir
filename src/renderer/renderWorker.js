@@ -197,7 +197,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
 
   ctx.scene.background = new THREE.Color(SceneConfig.backgroundColor);
   ctx.scene.add(ctx.host.contentRoot);
-  ctx.keyLightRig.setupLighting(ctx.scene, isMobile, renderer);
+  ctx.keyLightRig.setupLighting(ctx.scene, isMobile, renderer, isConstrained);
 
   // Save base light intensity so the runtime pressure system can scale it.
   ctx.quality.baseLightIntensity = SceneConfig.lightBall.intensity;
@@ -361,11 +361,16 @@ function handleUpdateConfig({ updates }) {
   if ('autoDegrade' in updates) {
     quality.setAutoDegrade(!!updates.autoDegrade);
   }
+  // Debug-only pressure override for probing the pressure actuators
+  // (LOD gate, shadow throttle, FXAA suppression) on demand.
+  if ('debugPressure' in updates) {
+    quality.setDebugPressure(updates.debugPressure);
+  }
   let cameraDirty = false;
   for (const path in updates) {
-    // `autoDegrade` is handled above; skip it here so we don't
-    // accidentally poke an `autoDegrade` key into `SceneConfig`.
-    if (path === 'autoDegrade') continue;
+    // `autoDegrade` / `debugPressure` are handled above; skip them
+    // here so we don't poke them into `SceneConfig`.
+    if (path === 'autoDegrade' || path === 'debugPressure') continue;
     const value = updates[path];
     const parts = path.split('.');
     let obj = SceneConfig;
@@ -492,6 +497,7 @@ function handleProbe({ id }) {
         managed: lod.managedCount,
         hidden: lod.hiddenCount,
         lastDistance: lod.lastDistance,
+        effectiveThreshold: lod.effectiveThreshold,
       },
     },
   });
