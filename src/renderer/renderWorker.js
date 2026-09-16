@@ -10,440 +10,70 @@
  *
  * Running rendering off-thread means main-thread garbage collection
  * or userland work can never drop a rendered frame.
+ *
+ * The per-subsystem state that used to live here as module globals is
+ * now owned by the classes under `./worker/`; this file is just the
+ * message switch plus the `handleInit` wiring sequence.
  */
 import * as THREE from 'three';
-import { WebGPURenderer, PostProcessing } from 'three/webgpu';
-import { pass, renderOutput } from 'three/tsl';
-import { fxaa } from 'three/examples/jsm/tsl/display/FXAANode.js';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { SVG3DBuilder, prefetchTitleFont } from '../rendering/SVG3DBuilder.js';
-import { setRendererKind, setPlayheadX } from '../rendering/Materials.js';
-import { LightBallController } from '../animation/LightBallController.js';
+import { setRendererKind } from '../rendering/Materials.js';
 import { CameraController } from '../animation/CameraController.js';
 import { ElementProxy } from './ElementProxy.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
-import { RingBuffer } from './worker/RingBuffer.js';
-import {
-  chooseLoadTimeQuality,
-  nextQualityStep,
-  advancePressure,
-  lightIntensityForPressure,
-  shadowIntervalMs,
-  fxaaSuppressedFor,
-} from './worker/qualityPolicy.js';
-import { assignStaffColorIndices } from '../animation/staffColors.js';
+import { detectPlatform } from './worker/ua.js';
+import { createRenderer, applyOutputSettings } from './worker/RendererFactory.js';
+import { AntiAliasing } from './worker/AntiAliasing.js';
+import { KeyLightRig } from './worker/KeyLightRig.js';
+import { QualityController } from './worker/QualityController.js';
+import { LodGate } from './worker/LodGate.js';
+import { PlayedNoteColorizer } from './worker/PlayedNoteColorizer.js';
+import { PlaybackClock } from './worker/PlaybackClock.js';
+import { FrameStats } from './worker/FrameStats.js';
+import { SceneHost } from './worker/SceneHost.js';
+import { RenderLoop } from './worker/RenderLoop.js';
 
 /* ------------------------------------------------------------------ */
-/*  GPU quality — load-time probe + runtime pressure                  */
+/*  Shared worker context                                              */
 /* ------------------------------------------------------------------ */
 
 /**
- * Two-phase GPU quality system.
- *
- * **Phase 1 — load-time probe** (`_probeGpuCost`, called during init and
- * score loading):
- *   The init probe renders the empty scene several times to choose the
- *   maximum shadow-map resolution, DPR, and PCF type the GPU can support.
- *   Safari, mobile, and Tesla then run a second probe with the real score
- *   while the loading overlay is still visible.  That probe may only
- *   downshift quality, so dense geometry is measured without causing a
- *   mid-playback resolution pop or shadow-map flicker.
- *
- * **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
- *   A 0→1 float that rises only when recent p95 frame time exceeds
- *   the 60 fps target.  It smoothly scales light-ball intensity and
- *   spaces out static directional-shadow refreshes from 30 Hz toward
- *   ~7 Hz.  Neither actuator reallocates GPU resources.
- *
- *   Shadow map size, DPR, and PCF type require a dispose / reallocate,
- *   so those settings only change behind the score-loading overlay.
- *
- * Calibration:
- *   The baseline rAF interval is measured from the first 30 play-session
- *   ticks for diagnostics.  Runtime pressure itself targets a fixed
- *   16.67 ms frame budget so a 120 Hz display does not degrade quality
- *   merely because an occasional frame takes two refresh intervals.
+ * Plain object shared by every worker subsystem.  Components read
+ * their peers through `ctx` lazily (per call, not per construction)
+ * so there are no import cycles and construction order is free.
+ * `renderer`, `camera`, `controls`, `elementProxy` and `cameraCtrl`
+ * are filled in by `handleInit`.
  */
+const ctx = {
+  post: (msg) => self.postMessage(msg),
+  markDirty: () => ctx.loop.markDirty(),
+  renderer: null,
+  /** @type {THREE.PerspectiveCamera | null} */
+  camera: null,
+  /** @type {OrbitControls | null} */
+  controls: null,
+  /** @type {ElementProxy | null} */
+  elementProxy: null,
+  /** @type {CameraController | null} */
+  cameraCtrl: null,
+  /** Viewport CSS height, tracked from init/resize for the pixel-size
+   *  estimate in `LodGate.apply`. */
+  viewportHeightCss: 600,
+};
 
-/** Baseline rAF interval (ms) learned from the first play session.
- *  Set once by `_calibrate()` and exposed for diagnostics. */
-let _baselineMs = 16.67;
-let _calibrated = false;
-let _calibCount = 0;
-const _CALIB_TICKS = 30;
-const _calibBuf  = new Float64Array(_CALIB_TICKS);
-const _calibSort = new Float64Array(_CALIB_TICKS);
-
-/** Feed one rAF interval sample.  Locks `_baselineMs` after
- *  `_CALIB_TICKS` samples using the p95 of the collected window.  The
- *  value is diagnostic; runtime pressure uses a fixed 60 fps target.
- *  Keeping p95 here makes the diagnostic directly comparable with the
- *  live p95 signal and ignores one isolated maximum-value stall. */
-function _calibrate(frameMs) {
-  if (_calibrated || frameMs <= 0 || frameMs >= 2000) return;
-  _calibBuf[_calibCount++] = frameMs;
-  if (_calibCount >= _CALIB_TICKS) {
-    _calibSort.set(_calibBuf);
-    _calibSort.sort();
-    // Clamp to a sane range in case the tab is throttled, vsync is
-    // locked, or the calibration window caught a multi-spike burst
-    // (upper bound covers 60 Hz p95 ≈ 17–18 ms with margin).
-    _baselineMs = Math.max(6, Math.min(25, _calibSort[Math.floor(_CALIB_TICKS * 0.95)]));
-    _calibrated = true;
-  }
-}
-
-/** Reset calibration — call on play-start so baseline re-measures
- *  from the fresh play context, not stale idle intervals. */
-function _resetCalibration() {
-  _calibCount = 0;
-  _calibBuf.fill(0);
-  _baselineMs = 16.67;
-  _calibrated = false;
-  _lastAqSampleMs = 0;
-  _latestAqP95 = 0;
-}
-
-/**
- * 0→1 runtime pressure float.  0 = no pressure (lights at full
- * intensity); 1 = maximum pressure (lights fully dimmed).
- * Driven by `_updateRuntimePressure()` in the rAF loop.
- */
-let _runtimePressure = 0;
-/** Base light intensity saved at init so pressure can scale it. */
-let _baseLightIntensity = 0;
-/** Whether the auto-dim system is enabled (mirrors the Settings toggle). */
-let _autoDimEnabled = true;
-/** Diagnostics: what the load-time probe measured and chose.  Exposed
- *  via `probe()` so the dev overlay / Playwright tests can verify the
- *  quality selection matches the hardware. */
-let _probeMsMeasured = -1;
-let _sceneProbeMsMeasured = -1;
-let _chosenShadowMapSize = 0;
-let _chosenDprCap = 0;
-let _baseDevicePixelRatio = 1;
-let _maxShadowMapSize = 0;
-let _maxDprCap = 0;
-let _maxSoftPcf = false;
-let _sceneGpuBudgetMs = 14;
-let _runSceneProbe = false;
-let _allowVeryLowQuality = false;
-
-/**
- * Update `_runtimePressure` and apply it to light intensity.
- * Call once per rAF tick after computing `frameP95`.
- * @param {number} dt        Frame duration in seconds.
- * @param {number} frameP95  Recent p95 rAF interval in ms.
- */
-function _updateRuntimePressure(dt, frameP95) {
-  if (!_autoDimEnabled || !_calibrated) return;
-
-  _runtimePressure = advancePressure(_runtimePressure, dt, frameP95);
-
-  // Apply to light intensity.  LightBallController reads
-  // SceneConfig.lightBall.intensity every update() call, so writing
-  // here takes effect on the very next frame with no artifacts.
-  SceneConfig.lightBall.intensity = lightIntensityForPressure(_baseLightIntensity, _runtimePressure);
-  _updateFxaaPressure();
-}
-
-/**
- * Block until the GPU has actually finished executing all submitted
- * work.  `renderer.render()` only measures CPU-side command encoding —
- * on Chromium (WebGPU *and* WebGL) submission never waits for the GPU,
- * so timing `render()` alone reads ~0.2 ms regardless of how slow the
- * GPU is.  That made the old probe classify every Chromium machine as
- * "very fast" and hand out 6144² shadows + DPR 2.0 unconditionally —
- * exactly the machines that then couldn't hold a consistent frame rate.
- *
- *   • WebGPU: `device.queue.onSubmittedWorkDone()` resolves when the
- *     queue is drained.
- *   • WebGL: a 1×1 `readPixels` forces a full pipeline flush + sync
- *     (the classic synchronous fence).
- */
-async function _gpuSync() {
-  if (!renderer) return;
-  const device = renderer.backend?.device;
-  if (device?.queue?.onSubmittedWorkDone) {
-    await device.queue.onSubmittedWorkDone();
-    return;
-  }
-  const gl = typeof renderer.getContext === 'function' ? renderer.getContext() : null;
-  if (gl && typeof gl.readPixels === 'function') {
-    const px = new Uint8Array(4);
-    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
-  }
-}
-
-function _measureMsaaSamples(usingWebGPU) {
-  if (usingWebGPU) {
-    return Math.max(1, Number(renderer?.samples) || 1);
-  }
-  const gl = typeof renderer?.getContext === 'function' ? renderer.getContext() : null;
-  const attributes = typeof renderer?.getContextAttributes === 'function'
-    ? renderer.getContextAttributes()
-    : null;
-  if (!attributes?.antialias || !gl?.getParameter) return 1;
-  return Math.max(1, Number(gl.getParameter(gl.SAMPLES)) || 1);
-}
-
-function _renderSceneFrame() {
-  if (_fxaaAvailable && !_fxaaSuppressed) {
-    if (_postProcessing) return _postProcessing.render();
-    if (_effectComposer) return _effectComposer.render();
-  }
-  return renderer.render(scene, camera);
-}
-
-function _resizeAntiAliasing(width, height) {
-  if (!_effectComposer) return;
-  _effectComposer.setPixelRatio(renderer.getPixelRatio());
-  _effectComposer.setSize(width, height);
-  if (_fxaaPass?.material?.uniforms?.resolution) {
-    renderer.getDrawingBufferSize(_aaBufferSize);
-    _fxaaPass.material.uniforms.resolution.value.set(
-      1 / Math.max(1, _aaBufferSize.x),
-      1 / Math.max(1, _aaBufferSize.y),
-    );
-  }
-}
-
-async function _setupAntiAliasing(usingWebGPU, width, height) {
-  _msaaSamples = _measureMsaaSamples(usingWebGPU);
-  if (_msaaSamples > 1) {
-    _aaMode = `${_msaaSamples}x MSAA`;
-    return;
-  }
-
-  try {
-    if (usingWebGPU) {
-      const scenePass = pass(scene, camera);
-      const outputPass = renderOutput(scenePass, renderer.toneMapping, renderer.outputColorSpace);
-      _postProcessing = new PostProcessing(renderer);
-      _postProcessing.outputColorTransform = false;
-      _postProcessing.outputNode = fxaa(outputPass);
-    } else {
-      _effectComposer = new EffectComposer(renderer);
-      _effectComposer.addPass(new RenderPass(scene, camera));
-      _effectComposer.addPass(new OutputPass());
-      _fxaaPass = new ShaderPass(FXAAShader);
-      _effectComposer.addPass(_fxaaPass);
-      _resizeAntiAliasing(width, height);
-    }
-    _fxaaAvailable = true;
-    _aaMode = 'FXAA';
-  } catch (error) {
-    _postProcessing = null;
-    if (_effectComposer) _effectComposer.dispose();
-    _effectComposer = null;
-    _fxaaPass = null;
-    _aaMode = 'None';
-    console.warn('[Luminoir] FXAA setup failed; continuing without post-process AA:', error);
-  }
-}
-
-function _updateFxaaPressure() {
-  if (!_fxaaAvailable) return;
-  _fxaaSuppressed = fxaaSuppressedFor(_fxaaSuppressed, _runtimePressure);
-}
-
-/**
- * Probe GPU rendering cost with the current scene by rendering it
- * `count` times and returning wall-clock milliseconds — including GPU
- * execution time (`_gpuSync`) and a full shadow-map pass per frame.
- *
- * The shadow pass must be forced explicitly: `_updateKeyLight` switches
- * the key light to manual shadow updates (`shadow.autoUpdate = false`)
- * during `setupLighting`, so without `needsUpdate = true` per frame the
- * probe would measure frames with no shadow render at all.  Forcing it
- * measures the worst frame in the 30 Hz shadow-refresh cadence.
- *
- * Init uses the minimum sample to classify peak hardware capability;
- * the optional score-aware pass uses the median to make a conservative
- * downshift decision after real geometry is present.
- */
-async function _probeGpuCost(count = 7, median = false) {
-  if (!renderer || !scene || !camera) return 0;
-  // Warm-up render — don't measure: first call often stalls on driver
-  // JIT / shader cache miss regardless of scene complexity.
-  _renderSceneFrame();
-  await _gpuSync();
-  let best = Infinity;
-  const samples = median ? new Float64Array(count) : null;
-  for (let i = 0; i < count; i++) {
-    if (_keyLight) _keyLight.shadow.needsUpdate = true;
-    const t0 = performance.now();
-    _renderSceneFrame();
-    await _gpuSync();
-    const t = performance.now() - t0;
-    if (samples) samples[i] = t;
-    if (t < best) best = t;
-  }
-  if (samples) {
-    samples.sort();
-    return samples[Math.floor(samples.length / 2)];
-  }
-  return Number.isFinite(best) ? best : 0;
-}
-
-/**
- * Choose and apply shadow-map size, DPR cap, and PCF type based on the
- * result of `_probeGpuCost()`.  Called once from `handleInit`.
- *
- * Probe cost reference, GPU-synced via `_gpuSync` (empty scene with a
- * forced 6144² PCFSoft shadow pass at DPR ≤ 2 — see `_probeGpuCost`):
- *   Apple M-series / discrete GPU   ≈ 1.5–2 ms/frame  → keep 6144²
- *   recent integrated GPU           ≈ 2–5 ms/frame    → 4096²
- *   older / budget integrated GPU   ≈ 5 ms+           → 2048²
- * (The pre-GPU-sync numbers that used to live here were submit-time
- * only and read ~0.25 ms on every Chromium machine, which routed all
- * of them into the top tier regardless of actual GPU speed.)
- */
-function _applyLoadTimeQuality(probeMs, baseDpr, isConstrained) {
-  const { mapSize, softPcf, dprCap } = chooseLoadTimeQuality(probeMs, isConstrained);
-  _maxShadowMapSize = mapSize;
-  _maxSoftPcf = softPcf;
-  _maxDprCap = dprCap;
-  _setShadowQuality(mapSize, softPcf, baseDpr, dprCap);
-}
-
-/** Apply shadow quality and DPR settings.  Must be called before
- *  the render loop starts so there is no mid-session dispose. */
-function _setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
-  if (!renderer || !_keyLight) return;
-  _chosenShadowMapSize = mapSize;
-  _chosenDprCap = dprCap;
-  renderer.shadowMap.type = softPcf
-    ? THREE.PCFSoftShadowMap
-    : THREE.PCFShadowMap;
-  renderer.setPixelRatio(Math.min(baseDpr, dprCap));
-  if (_effectComposer) {
-    renderer.getSize(_aaBufferSize);
-    _resizeAntiAliasing(_aaBufferSize.x, _aaBufferSize.y);
-  }
-  if (_keyLight.shadow.mapSize.width !== mapSize) {
-    _keyLight.shadow.mapSize.width  = mapSize;
-    _keyLight.shadow.mapSize.height = mapSize;
-    if (_keyLight.shadow.map) {
-      _keyLight.shadow.map.dispose();
-      _keyLight.shadow.map = null;
-    }
-    _keyLight.shadow.autoUpdate = true;
-    const shadowCam = _keyLight.shadow.camera;
-    _keyLightTexelSize.set(
-      (shadowCam.right - shadowCam.left) / mapSize,
-      (shadowCam.top - shadowCam.bottom) / mapSize,
-    );
-  }
-  _lastKeyLightSnapped.x = null;
-  _lastKeyLightSnapped.z = null;
-  _lastShadowUpdateMs = 0;
-  _markDirty();
-}
-
-function _stepDownQuality() {
-  const step = nextQualityStep(_chosenShadowMapSize, {
-    maxDprCap: _maxDprCap,
-    allowVeryLowQuality: _allowVeryLowQuality,
-  });
-  if (!step) return false;
-  _setShadowQuality(step.mapSize, step.softPcf, _baseDevicePixelRatio, step.dprCap);
-  return true;
-}
-
-async function _refineSceneQuality() {
-  _setShadowQuality(_maxShadowMapSize, _maxSoftPcf, _baseDevicePixelRatio, _maxDprCap);
-  if (!_runSceneProbe) {
-    _sceneProbeMsMeasured = -1;
-    return;
-  }
-  let measured = await _probeGpuCost(3, true);
-  while (measured > _sceneGpuBudgetMs && _stepDownQuality()) {
-    measured = await _probeGpuCost(3, true);
-  }
-  _sceneProbeMsMeasured = measured;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Per-worker global state                                            */
-/* ------------------------------------------------------------------ */
-
-/** @type {THREE.WebGLRenderer | import('three/webgpu').WebGPURenderer | null} */
-let renderer = null;
-let _postProcessing = null;
-let _effectComposer = null;
-let _fxaaPass = null;
-let _fxaaAvailable = false;
-let _fxaaSuppressed = false;
-let _msaaSamples = 1;
-let _aaMode = 'None';
-const _aaBufferSize = new THREE.Vector2();
-/** @type {THREE.Scene} */
-const scene = new THREE.Scene();
-/**
- * Parent group for every score-related object.  Rotated -π/2 around X
- * once, here, so the score builds in its natural SVG-flat coordinate
- * system (notation laid out on the local XY plane, extruding in +Z)
- * and ends up rendered as a horizontal "floor" in world space:
- *
- *   • Local X (music progression) → World X (unchanged)
- *   • Local Y (vertical staff spread, top→bottom on the page) → World -Z
- *     (negative Z extends "back" away from the camera, so a higher
- *     staff's notes sit at a more-negative world Z; lower staves at
- *     more-positive Z toward the viewer).
- *   • Local Z (notation elevation off the paper) → World +Y (up)
- *
- * After the rotation: the paper plane (built at local Z=-0.05) sits at
- * world Y≈-0.05; noteheads (built at local Z=0.010) hover at world
- * Y≈0.010; light balls (built at local restZ=0.05) bounce in world Y.
- *
- * Every downstream system that operates in **score-local** coordinates
- * (SVG3DBuilder output, LightBallController ball/light positions,
- * CameraController X-follow track) parents under this group, so its
- * authoring-time XY semantics are preserved while the visible result
- * is a flat-floor 3D layout.
- */
-const contentRoot = new THREE.Group();
-contentRoot.rotation.x = -Math.PI / 2;
-/** @type {THREE.PerspectiveCamera} */
-let camera = null;
-/** @type {OrbitControls} */
-let controls = null;
-/** @type {ElementProxy} */
-let elementProxy = null;
-// Builder is constructed lazily during `handleInit` *after* we've
-// detected which renderer is active and called `setRendererKind()`,
-// so its internal `Materials.noteHead()` factory picks the right
-// shader path on first use.  Leaving it as a module-level
-// `new SVG3DBuilder()` initialiser would always bind the default
-// WebGL path at load time and silently skip the WebGPU-only
-// `emissiveNode` glow.
-/** @type {SVG3DBuilder | null} */
-let builder = null;
-/** @type {LightBallController | null} */
-let lightBalls = null;
-/** @type {CameraController | null} */
-let cameraCtrl = null;
-
-let rafId = 0;
-let lastFrameTime = 0;
-
-// Playback clock anchor.  Main thread sends state changes; worker
-// computes current music time locally from its own performance.now().
-/** @type {{ state: 'stopped' | 'playing' | 'paused', musicAnchor: number, perfAnchor: number, tempoScale: number }} */
-let clock = { state: 'stopped', musicAnchor: 0, perfAnchor: 0, tempoScale: 1 };
-
-// Cached score-framing inputs.  Populated by `handleSetTimeline`,
-// consumed by `handleUpdateConfig` when a camera-affecting setting
-// changes — without this cache we'd have to ask the main thread to
-// resend the whole note timeline just to re-snap the camera.
-let _lastFraming = null;
+ctx.host = new SceneHost(ctx);
+ctx.clock = new PlaybackClock();
+ctx.frameStats = new FrameStats();
+ctx.keyLightRig = new KeyLightRig();
+ctx.antiAliasing = new AntiAliasing();
+ctx.quality = new QualityController(ctx);
+ctx.lod = new LodGate();
+ctx.colorizer = new PlayedNoteColorizer();
+ctx.loop = new RenderLoop(ctx);
+// Convenience alias — the scene itself lives on the host.
+ctx.scene = ctx.host.scene;
 
 /* ------------------------------------------------------------------ */
 /*  Message plumbing                                                   */
@@ -467,35 +97,9 @@ self.onmessage = async (e) => {
   }
 };
 
-function post(msg) { self.postMessage(msg); }
-
 /* ------------------------------------------------------------------ */
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
-
-/** Best-effort mobile detection from the worker's user-agent.  Used to
- *  pick a smaller shadow map, cheaper PCF filter and a tighter
- *  device-pixel-ratio cap so iOS Safari's "frame went over 16.67 ms →
- *  rAF clamps to 30 Hz and stays there" behaviour doesn't trigger
- *  during dense passages of large scores like Jupiter. */
-function _workerUserAgent() {
-  return (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
-}
-
-function _isMobileUA() {
-  return /iPhone|iPad|iPod|Android|Mobile/i.test(_workerUserAgent());
-}
-
-function _isSafariUA() {
-  const ua = _workerUserAgent();
-  return /AppleWebKit/i.test(ua)
-    && /Safari/i.test(ua)
-    && !/(Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android)/i.test(ua);
-}
-
-function _isTeslaUA() {
-  return /Tesla|TESLA_AUTO/i.test(_workerUserAgent());
-}
 
 async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
   // SceneConfig is mirrored in the worker; set the runtime flags
@@ -509,54 +113,23 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // the per-frame budget at desktop quality, and the OS halves the
   // rAF rate the moment a frame goes over.  Trim shadow / DPR /
   // antialias here so dense passages stay under 16.67 ms.
-  const isMobile = _isMobileUA();
-  const isSafari = _isSafariUA();
-  const isTesla = _isTeslaUA();
-  const isConstrained = isMobile || isTesla;
+  const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
 
-  // Dual-renderer: try `WebGPURenderer` first (for Chrome/Edge on
-  // secure contexts), fall back to the legacy `THREE.WebGLRenderer`
-  // everywhere else.  We deliberately do *not* use `WebGPURenderer`'s
-  // built-in WebGL2 fallback (`forceWebGL: true` → `WebGLBackend`)
-  // because `InstanceNode` in that backend packs `instanceMatrix`
-  // into a UBO capped at GL_MAX_UNIFORM_BLOCK_SIZE = 16384 bytes —
-  // which is only 256 matrices.  Any InstancedMesh with more than
-  // 256 instances (our staff-line and simple-stem buckets can
-  // easily hit 400+ on Dream a Little Dream, 2000+ on Sylvia Suite)
-  // fails its vertex shader link with
-  //   "Size of uniform block NodeBuffer_N in VERTEX shader exceeds…"
-  // and the affected meshes disappear from the render.  The legacy
-  // `WebGLRenderer` always uses instanced vertex attributes for
-  // matrices so it has no such cap.
-  //
-  // `?renderer=webgl` forces the legacy fallback even on a
-  // WebGPU-capable origin, useful for reproducing WebGL-specific
-  // bugs from the same machine.
-  let usingWebGPU = false;
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
   // iOS.  Desktop keeps the antialias for crisp notation edges.
   const wantAntialias = !isMobile && !isTesla;
-  if (!forceWebGL) {
-    try {
-      renderer = new WebGPURenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
-      await renderer.init();
-      usingWebGPU = true;
-    } catch {
-      renderer = null;
-    }
-  }
+  const { renderer, usingWebGPU, error } = await createRenderer(
+    { canvas, forceWebGL, antialias: wantAntialias });
   if (!renderer) {
-    try {
-      renderer = new THREE.WebGLRenderer({ canvas, antialias: wantAntialias, powerPreference: 'high-performance' });
-    } catch (e) {
-      post({
-        type: 'renderer_error',
-        message: e?.message ?? 'WebGL context creation failed',
-      });
-      return;
-    }
+    ctx.post({
+      type: 'renderer_error',
+      message: error?.message ?? 'WebGL context creation failed',
+    });
+    return;
   }
+  ctx.renderer = renderer;
+
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
   // builder constructor below.  The WebGL path uses the legacy
@@ -565,29 +138,19 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   setRendererKind(usingWebGPU ? 'webgpu' : 'webgl');
   OPTIMIZATIONS.CHUNK_BUCKETS_BY_X = !usingWebGPU || isSafari;
   OPTIMIZATIONS.MAX_POINT_LIGHTS = (isConstrained || isSafari) ? 4 : 8;
-  builder = new SVG3DBuilder();
-  // Apply tone mapping + sRGB output on every renderer path.  The
-  // played-note material pushes its emissive into HDR territory
-  // (≈3+ before tone-mapping) so a recognisable shape remains under
-  // a self-luminous glow rather than clipping to a flat white blob;
-  // ACES Filmic compresses that range smoothly back into 0..1 for
-  // the displayable framebuffer.
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.0;
+  // Builder is constructed *after* `setRendererKind()` so its internal
+  // `Materials.noteHead()` factory picks the right shader path on
+  // first use.
+  ctx.host.builder = new SVG3DBuilder();
+  applyOutputSettings(renderer);
   // Cap DPR more aggressively on mobile — a Retina iPhone reports
   // DPR 3, which triples fragment-shader work for very little visual
   // gain on a 6" screen showing the entire score.
-  //
-  // The adaptive degrader will adjust both DPR and shadow mapSize at
-  // runtime; here we apply the starting tier's DPR cap directly via
-  // `setPixelRatio` — the degrader's `apply()` call below does the
-  // same thing but we need the renderer sized before `setSize`.
   const dprCap = isMobile ? 1.5 : 2;
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
   renderer.setClearColor(SceneConfig.backgroundColor, 1);
-  _viewportHeightCss = height;
+  ctx.viewportHeightCss = height;
 
   // Enable shadow rendering on whichever renderer we got.  The key
   // light below casts a soft shadow (PCF on WebGL, an equivalent
@@ -606,7 +169,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     : THREE.PCFSoftShadowMap;
 
   const cfg = SceneConfig.camera;
-  camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
+  const camera = ctx.camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
   // Initial pose uses the same left-of-playhead chase formula as
   // CameraController.snapToTarget(), so the first score starts from
   // the "following from the left" side instead of briefly looking back
@@ -618,9 +181,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   camera.lookAt(0, 0, 0);
 
   // ElementProxy mocks the DOM element OrbitControls attaches to.
-  elementProxy = new ElementProxy();
+  const elementProxy = ctx.elementProxy = new ElementProxy();
   elementProxy.setRect(rect);
-  controls = new OrbitControls(camera, elementProxy);
+  const controls = ctx.controls = new OrbitControls(camera, elementProxy);
   controls.enableDamping = false;  // CameraController drives via sphericalDelta
   controls.enablePan = false;
   controls.minDistance = 0.3;
@@ -629,39 +192,33 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Any user-driven motion fires `change`; wire it to the idle-render
   // gate so we re-submit the GPU pass exactly when something visible
   // has updated.
-  controls.addEventListener('change', _markDirty);
+  controls.addEventListener('change', ctx.markDirty);
 
-  scene.background = new THREE.Color(SceneConfig.backgroundColor);
-  scene.add(contentRoot);
-  setupLighting(scene, isMobile);
+  ctx.scene.background = new THREE.Color(SceneConfig.backgroundColor);
+  ctx.scene.add(ctx.host.contentRoot);
+  ctx.keyLightRig.setupLighting(ctx.scene, isMobile, renderer);
 
   // Save base light intensity so the runtime pressure system can scale it.
-  _baseLightIntensity = SceneConfig.lightBall.intensity;
+  ctx.quality.baseLightIntensity = SceneConfig.lightBall.intensity;
 
-  await _setupAntiAliasing(usingWebGPU, width, height);
+  await ctx.antiAliasing.setup(renderer, ctx.scene, camera, usingWebGPU, width, height);
 
   // Load-time GPU probe — renders the empty scene (lights + paper, no score
   // geometry) and uses the measured cost to select the highest shadow-map
   // resolution the GPU can sustain within half the per-frame budget.
   // Awaited here (the GPU-sync fences are async), while the score worker is
   // busy with Verovio WASM, so it adds no perceptible latency to load time.
-  const baseDpr  = devicePixelRatio || 1;
-  _baseDevicePixelRatio = baseDpr;
-  _runSceneProbe = isMobile || isSafari || isTesla;
-  _allowVeryLowQuality = isConstrained;
-  _sceneGpuBudgetMs = 14;
-  const probeMs  = await _probeGpuCost(5);
-  _probeMsMeasured = probeMs;
-  _applyLoadTimeQuality(probeMs, baseDpr, isConstrained);
+  const baseDpr = devicePixelRatio || 1;
+  ctx.quality.baseDevicePixelRatio = baseDpr;
+  ctx.quality.runSceneProbe = isMobile || isSafari || isTesla;
+  ctx.quality.allowVeryLowQuality = isConstrained;
+  ctx.quality.sceneGpuBudgetMs = 14;
+  const probeMs = await ctx.quality.probeGpuCost(5);
+  ctx.quality.probeMsMeasured = probeMs;
+  ctx.quality.applyLoadTimeQuality(probeMs, baseDpr, isConstrained);
 
-  cameraCtrl = new CameraController(camera, controls);
-
-  // Seed the camera-position history used by the cameraJitter probe metric
-  // so the first frame after init doesn't record a bogus giant jump.
-  _prevCameraPos.copy(camera.position);
-  _prevCameraDelta = 0;
-  _cameraDeltaRing.reset();
-  _cameraDeltaRing.fill(0);
+  const cameraCtrl = ctx.cameraCtrl = new CameraController(camera, controls);
+  ctx.frameStats.seedCameraPos(camera.position);
 
   // Smart camera coordination — the controller's auto-orbit needs
   // to know when the user is actively dragging (so it can yield)
@@ -678,333 +235,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // module-level variable that `_addTitle` reads synchronously.
   prefetchTitleFont();
 
-  post({
+  ctx.post({
     type: 'ready',
     renderer: usingWebGPU ? 'WebGPU' : 'WebGL',
-    antiAliasing: _aaMode,
-    msaaSamples: _msaaSamples,
+    antiAliasing: ctx.antiAliasing.mode,
+    msaaSamples: ctx.antiAliasing.msaaSamples,
   });
 
-  startRenderLoop();
-}
-
-function setupLighting(scene, isMobile) {
-  // Bright neutral ambient so the white-ish paper reads as actually
-  // lit-from-everywhere — the dark-theme value of 0.6 was tuned for
-  // a near-black page and looked flat against the cream background.
-  scene.add(new THREE.AmbientLight(0xf4f0e4, 1.2));
-  const key = new THREE.DirectionalLight(0xfff0dd, 0.9);
-  // The key light casts the shadow that grounds every piece of
-  // notation onto the paper.  All quality knobs live in
-  // `SceneConfig.shadow` — see the long comment there for the
-  // full reasoning behind each value.  In short:
-  //
-  //   • `mapSize` and frustum extents together determine texel size
-  //     and therefore how many texels a bar-line shadow covers
-  //     (the limiting case for thin-feature stability).
-  //   • `bias`/`normalBias` combat shadow acne on the thin extruded
-  //     notation; both are kept smaller than `notationDepth = 0.003`
-  //     so the offsets can't push comparison samples past thin
-  //     casters.
-  //   • `radius` controls PCF Soft kernel size; tuned so the
-  //     penumbra is visible without washing out narrow shadows.
-  //   • `_updateKeyLight` snaps the light's XY to a texel-grid
-  //     boundary every frame so the shadow texel raster stays
-  //     pixel-aligned across frames — without that, a high-res map
-  //     still produces a "crawling" shadow edge as the camera pans.
-  //
-  // On mobile the shadow map is the dominant cost on each scheduled
-  // notation depth pass, even with the 30 Hz refresh cap.
-  // 6144² is ~38 M fragments per frame, which by itself blows past
-  // an iPhone GPU's 16.67 ms budget once any other notation is in
-  // view; clamp to 2048 (≈ 4 M fragments, 9× cheaper) so dense
-  // passages of Jupiter etc. don't trigger iOS Safari's rAF clamp.
-  const sCfg = SceneConfig.shadow;
-  const mapSize = isMobile ? Math.min(sCfg.mapSize, 2048) : sCfg.mapSize;
-  key.shadow.mapSize.width = mapSize;
-  key.shadow.mapSize.height = mapSize;
-  const shadowCam = key.shadow.camera;
-  shadowCam.left = -sCfg.frustumHalfWidth;
-  shadowCam.right = sCfg.frustumHalfWidth;
-  shadowCam.top = sCfg.frustumHalfHeight;
-  shadowCam.bottom = -sCfg.frustumHalfHeight;
-  shadowCam.near = sCfg.near;
-  shadowCam.far = sCfg.far;
-  key.shadow.bias = sCfg.bias;
-  key.shadow.normalBias = sCfg.normalBias;
-  key.shadow.radius = sCfg.radius;
-  // World-space size of one shadow-map texel along each axis.  Used
-  // by `_updateKeyLight` to snap the light position to a texel
-  // boundary; see the longer comment on that function for why.
-  _keyLightTexelSize.set(
-    (shadowCam.right - shadowCam.left) / key.shadow.mapSize.width,
-    (shadowCam.top - shadowCam.bottom) / key.shadow.mapSize.height,
-  );
-  // The `target` sub-object is where the directional light "looks
-  // at" — the shadow camera's principal axis is
-  // `normalize(light.position - light.target.position)`.  We add
-  // `target` explicitly (Three.js only auto-adds it when the light
-  // is first added to a scene via `scene.add(key)`) so we can safely
-  // mutate `target.position` from the render loop.
-  scene.add(key.target);
-  _keyLight = key;
-  // Apply the master shadow toggle once the light exists.  This sets
-  // `renderer.shadowMap.enabled` and `key.castShadow` consistently
-  // and seeds the first shadow render if shadows are on.
-  _applyShadowEnabled();
-  // Seed an initial pose so the first-frame render produces a valid
-  // shadow map even before any camera updates have occurred.  Values
-  // are overwritten every frame in `startRenderLoop()`.
-  _updateKeyLight(0, 0);
-  scene.add(key);
-  const fill = new THREE.DirectionalLight(0xc0d0ff, 0.3);
-  fill.position.set(5, 3, -5); scene.add(fill);
-  const rim = new THREE.DirectionalLight(0x8888aa, 0.15);
-  rim.position.set(0, -3, 5); scene.add(rim);
-}
-
-/** Reference to the shadow-casting key directional light, set by
- *  `setupLighting()` and read by the render loop so it can slide the
- *  shadow frustum along with the scene camera. */
-/** @type {THREE.DirectionalLight | null} */
-let _keyLight = null;
-
-/** World-space size of one shadow-map texel.  Set in
- *  `setupLighting()` from the orthographic frustum dimensions ÷ map
- *  resolution.  `_updateKeyLight` rounds the light's XY position to
- *  multiples of these values so the shadow texel grid stays
- *  pixel-aligned across frames. */
-const _keyLightTexelSize = new THREE.Vector2(0.01, 0.01);
-
-/** Keep the light → target offset constant so the incoming light
- *  direction (from the upper-left / front) never changes — what
- *  changes is only *where* on the world plane the shadow camera is
- *  centred.  Now that the score is laid flat as a floor (paper at
- *  world Y≈0), the light sits high overhead with a small horizontal
- *  bias so notation casts a visible cast-shadow toward the camera. */
-const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
-
-/** Last texel-snapped X/Z position used to position the key light.
- *  The shadow camera recentres only after the view target leaves a
- *  2-world-unit dead zone around this point. */
-const _lastKeyLightSnapped = { x: null, z: null };
-
-/** `performance.now()` of the last shadow-map re-render triggered by
- *  `_updateKeyLight`.  Used by the pressure-driven shadow throttle. */
-let _lastShadowUpdateMs = 0;
-let _shadowUpdates = 0;
-let _shadowThrottled = 0;
-
-/** Delay (ms) between shadow re-renders.  At 0 pressure the static
- *  shadow coverage refreshes at no more than 30 Hz; full pressure
- *  stretches that interval to 150 ms, or roughly 7 Hz.
- *
- *  Why this is visually free: the key light is a **DirectionalLight**
- *  — translating it never moves the shadows themselves (the cast
- *  direction is constant); it only slides the orthographic frustum
- *  that decides which part of the world the map covers.  The frustum
- *  half-width is 20 wu while the playhead moves ≈ 0.3–1 wu/s, so even
- *  a 150 ms update lag leaves visible casters comfortably inside the
- *  covered region.  Unlike dimming lights, skipping 6144² shadow
- *  passes recovers *most* of the over-budget GPU time — this is the
- *  actuator that actually restores a consistent frame rate when the
- *  pressure system fires. */
-const _SHADOW_RECENTER_DISTANCE = 2;
-const _SHADOW_UPDATE_MIN_MS = 1000 / 30;
-const _SHADOW_THROTTLE_MAX_MS = 150;
-
-/** Slide the key directional light and its target to the given world
- *  XZ position (Y = 0 since the paper plane sits there after the
- *  contentRoot rotation).  Called every frame from the render loop
- *  so the shadow camera's orthographic frustum always straddles what
- *  the scene camera is looking at, not just the neighbourhood of the
- *  world origin.
- *
- *  The XZ position is **snapped to texel-grid boundaries** before it
- *  reaches the light: at any non-trivial shadow-map resolution one
- *  texel is still worth a fraction of a world unit, so without
- *  snapping the light's XZ can land at any sub-texel offset, which
- *  means the same notation surface samples a slightly different
- *  texel-grid each frame and the shadow boundary "crawls" across
- *  thin features.  Rounding to a texel multiple stabilises the grid:
- *  a static line's shadow stays in the same texels frame after
- *  frame, even while the camera pans, and the shimmer disappears.
- *  The texel size used here is computed in `setupLighting` from the
- *  resolution and frustum dimensions in `SceneConfig.shadow`. */
-function _updateKeyLight(x, z, frameNow = performance.now()) {
-  if (!_keyLight || !SceneConfig.shadow.enabled) return;
-  const tx = _keyLightTexelSize.x;
-  const tz = _keyLightTexelSize.y;
-  const xs = Math.round(x / tx) * tx;
-  const zs = Math.round(z / tz) * tz;
-
-  // Disable automatic per-frame shadow re-render so we can drive it
-  // manually.  This is set once on the first call; Three.js WebGPU's
-  // ShadowNode.js respects `shadow.autoUpdate / shadow.needsUpdate`
-  // the same way the classic WebGLShadowMap does (ShadowNode.js:771).
-  if (_keyLight.shadow.autoUpdate) {
-    _keyLight.shadow.autoUpdate = false;
-    // Force the very first shadow render now (the light was just placed
-    // at the initial position; without this the map stays empty until
-    // the camera pans for the first time).
-    _keyLight.shadow.needsUpdate = true;
-  }
-
-  // Keep the shadow projection completely static while the camera target
-  // remains inside a small dead zone.  The orthographic shadow frustum is
-  // 40×30 world units, so a 2-unit lag leaves ample coverage while turning
-  // a 6144² re-render from a 30 Hz cost into an occasional recenter.
-  if (_lastKeyLightSnapped.x !== null
-      && Math.abs(x - _lastKeyLightSnapped.x) < _SHADOW_RECENTER_DISTANCE
-      && Math.abs(z - _lastKeyLightSnapped.z) < _SHADOW_RECENTER_DISTANCE) return;
-  if (xs === _lastKeyLightSnapped.x && zs === _lastKeyLightSnapped.z) return;
-
-  // Pressure-driven shadow throttle: under sustained GPU pressure,
-  // space shadow-map re-renders out in time instead of re-rendering on
-  // every texel crossing.  See `_SHADOW_THROTTLE_MAX_MS` for why this
-  // is invisible (directional light translation only slides the
-  // coverage frustum, never the shadows themselves).  The position
-  // intentionally stays *unsnapped-pending* — we return before writing
-  // `_lastKeyLightSnapped`, so the next allowed frame picks the move up.
-  const now = frameNow;
-  const shadowInterval = shadowIntervalMs(
-    _runtimePressure, _SHADOW_UPDATE_MIN_MS, _SHADOW_THROTTLE_MAX_MS);
-  if (_lastShadowUpdateMs > 0 && now - _lastShadowUpdateMs < shadowInterval) {
-    _shadowThrottled++;
-    return;
-  }
-  _lastShadowUpdateMs = now;
-  _shadowUpdates++;
-
-  _lastKeyLightSnapped.x = xs;
-  _lastKeyLightSnapped.z = zs;
-
-  _keyLight.target.position.set(xs, 0, zs);
-  _keyLight.position.set(
-    xs + _KEY_LIGHT_OFFSET.x,
-    _KEY_LIGHT_OFFSET.y,
-    zs + _KEY_LIGHT_OFFSET.z,
-  );
-  // `target` is a separate `Object3D`, not automatically re-matrixed
-  // by the renderer; updating its world matrix here ensures the
-  // shadow camera's `lookAt(target.matrixWorld.position)` sees the
-  // freshly-set value on the same frame.
-  _keyLight.target.updateMatrixWorld();
-  // Request a shadow map re-render for this frame now that the light
-  // has moved to a new texel-grid position.
-  _keyLight.shadow.needsUpdate = true;
-}
-
-/** Apply the `SceneConfig.shadow.enabled` flag at runtime.  Called
- *  from `setupLighting` and `handleUpdateConfig` so toggling shadows
- *  off/on takes effect on the next frame (with a one-time material
- *  recompile cost). */
-function _applyShadowEnabled() {
-  if (!renderer || !_keyLight) return;
-  const enabled = SceneConfig.shadow.enabled;
-  renderer.shadowMap.enabled = enabled;
-  _keyLight.castShadow = enabled;
-  _keyLight.shadow.needsUpdate = false;
-  if (enabled) {
-    _keyLight.shadow.needsUpdate = true;
-    _lastKeyLightSnapped.x = null;
-    _lastKeyLightSnapped.z = null;
-    _lastShadowUpdateMs = 0;
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Runtime LOD — LOD_DISTANT_ELEMENTS + DISTANCE_CLIP_GLYPHS          */
-/* ------------------------------------------------------------------ */
-
-/** Meshes carrying LOD tags (`userData.lodSize` / `userData.lodDetail`)
- *  collected once per scene build by `_collectLodMeshes`.  Kept as a
- *  flat array so the per-frame pass doesn't re-traverse the graph. */
-let _lodMeshes = [];
-/** Camera-to-target distance at the last LOD evaluation; -1 forces a
- *  re-evaluation (scene rebuild, resize, DPR change). */
-let _lodLastDistance = -1;
-/** Viewport CSS height, tracked from init/resize for the pixel-size
- *  estimate in `_applyLodVisibility`. */
-let _viewportHeightCss = 600;
-
-/** Collect the LOD-managed meshes from a freshly-built scene root.
- *  Called from handleBuildScene after the root is attached. */
-function _collectLodMeshes(root) {
-  _lodMeshes.length = 0;
-  _lodLastDistance = -1;
-  if (!OPTIMIZATIONS.LOD_DISTANT_ELEMENTS && !OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS) return;
-  root.traverse((n) => {
-    if (n.isMesh && n.userData && (n.userData.lodSize > 0 || n.userData.lodDetail)) {
-      _lodMeshes.push(n);
-    }
-  });
-}
-
-/**
- * Distance-driven visibility gating for the tagged buckets — this is
- * the runtime half of the two LOD flags in `Optimizations.js`:
- *
- *   • `LOD_DISTANT_ELEMENTS` — buckets tagged `lodDetail` (stems,
- *     flags, ledger lines: the small per-note decorations) hide when
- *     the camera is further than `LOD_DISTANCE_THRESHOLD` from its
- *     orbit target.  At that distance they're ≈ 1 device pixel and
- *     contribute nothing visually, but they're the *most numerous*
- *     instance class — on a dense score they dominate both the shadow
- *     pass and the main pass primitive count.
- *
- *   • `DISTANCE_CLIP_GLYPHS` — any tagged bucket hides when its
- *     world-unit footprint (`lodSize`) projects below ~0.7 device
- *     pixels.  This is the generic safety net for extreme zoom-outs;
- *     noteheads only cross it past d ≈ 100+.
- *
- * Both rules use hysteresis (hide and show thresholds differ by
- * ~15–20 %) so the smart camera's gentle zoom oscillation (±6 %
- * radius) can never make buckets flicker at a boundary.
- *
- * Cost: a single distance check per frame; the full mesh pass (a few
- * dozen entries) only runs when the distance actually moved > 1 %.
- * Visibility toggling on plain/instanced meshes does NOT invalidate
- * WebGPU pipelines (unlike light visibility) — pipelines for every
- * mesh were warmed by `precompilePipelines` regardless of visibility.
- */
-function _applyLodVisibility() {
-  if (_lodMeshes.length === 0 || !camera || !controls) return;
-  const d = camera.position.distanceTo(controls.target);
-  if (_lodLastDistance > 0 && Math.abs(d - _lodLastDistance) < _lodLastDistance * 0.01) return;
-  _lodLastDistance = d;
-
-  // World units per *device* pixel at the orbit-target distance.
-  const fovRad = (camera.fov * Math.PI) / 180;
-  const pr = renderer && typeof renderer.getPixelRatio === 'function' ? renderer.getPixelRatio() : 1;
-  const viewportDevicePx = Math.max(1, _viewportHeightCss * pr);
-  const wupp = (2 * d * Math.tan(fovRad / 2)) / viewportDevicePx;
-
-  const detailRule = OPTIMIZATIONS.LOD_DISTANT_ELEMENTS;
-  const clipRule = OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS;
-  const T = OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12;
-
-  let toggled = false;
-  for (let i = 0; i < _lodMeshes.length; i++) {
-    const mesh = _lodMeshes[i];
-    const ud = mesh.userData;
-    let wantVisible;
-    if (mesh.visible) {
-      const hideDetail = detailRule && ud.lodDetail && d > T;
-      const hideSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.7;
-      wantVisible = !(hideDetail || hideSubPixel);
-    } else {
-      // Re-show only once we're clearly back inside both thresholds.
-      const stillDetailHidden = detailRule && ud.lodDetail && d > T * 0.85;
-      const stillSubPixel = clipRule && ud.lodSize > 0 && ud.lodSize < wupp * 0.85;
-      wantVisible = !(stillDetailHidden || stillSubPixel);
-    }
-    if (wantVisible !== mesh.visible) {
-      mesh.visible = wantVisible;
-      toggled = true;
-    }
-  }
-  if (toggled) _markDirty();
+  ctx.loop.start();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1012,6 +250,7 @@ function _applyLodVisibility() {
 /* ------------------------------------------------------------------ */
 
 function handleResize({ width, height, devicePixelRatio, rect }) {
+  const { renderer, camera, elementProxy, antiAliasing, quality, lod } = ctx;
   if (!renderer || !camera) return;
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
@@ -1019,887 +258,75 @@ function handleResize({ width, height, devicePixelRatio, rect }) {
   // hardcoded `min(dpr, 2)` silently undid the probe's choice on the
   // first window resize, putting weak GPUs right back at full
   // resolution.
-  const dprCap = _chosenDprCap > 0 ? _chosenDprCap : 2;
+  const dprCap = quality.chosenDprCap > 0 ? quality.chosenDprCap : 2;
   renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
   renderer.setSize(width, height, false);
-  _resizeAntiAliasing(width, height);
-  _viewportHeightCss = height;
-  _lodLastDistance = -1; // viewport changed → pixel sizes changed → re-evaluate LOD
+  antiAliasing.resize(renderer, width, height);
+  ctx.viewportHeightCss = height;
+  lod.invalidate(); // viewport changed → pixel sizes changed → re-evaluate LOD
   if (elementProxy) elementProxy.setRect(rect);
-  _markDirty();
+  ctx.markDirty();
 }
 
 function handlePointer({ target, payload }) {
-  if (!elementProxy) return;
-  elementProxy.dispatchProxied(target, payload);
+  if (!ctx.elementProxy) return;
+  ctx.elementProxy.dispatchProxied(target, payload);
   // Pointer events that change camera state will fire `change` via
   // OrbitControls and mark the scene dirty automatically — but we
   // mark eagerly here too in case the event is e.g. a touch-end
   // that doesn't immediately move the camera but should still wake
   // the render loop so the next animation step lands on screen.
-  _markDirty();
+  ctx.markDirty();
 }
 
 /* ------------------------------------------------------------------ */
-/*  Scene build / timeline                                              */
+/*  Scene build / timeline / camera                                     */
 /* ------------------------------------------------------------------ */
-
-/** Scene-build payload held between handleBuildScene and the precompile
- *  call in handleSetTimeline.  We defer the precompile until the light
- *  balls have been added to the scene (during setTimeline), so that
- *  `compileAsync` walks a scene that already contains every object
- *  the main loop is ever going to render.  Without this deferral the
- *  light balls' pipelines get compiled inline on the first post-compile
- *  frame — a 100-200 ms stall visible as the first-note stutter.
- *  @type {{ root: any, parsed: any } | null} */
-let _pendingPrecompile = null;
-
-/** One-shot flag set when the scene rebuild + precompile finishes,
- *  cleared the very next time `renderer.render()` puts a frame on
- *  the canvas.  When it transitions from `true → false` we post a
- *  `sceneReady` message so the main thread can hide its loading
- *  spinner exactly when the new score becomes visible — not at the
- *  earlier moment when `setTimeline` returned (which leaves the
- *  spinner overlapping a still-empty canvas for ≈ 100-200 ms while
- *  precompile runs and the GPU uploads). */
-let _postSceneReadyAfterRender = false;
-
-/* ------------------------------------------------------------------ */
-/*  Per-note playback colouring                                        */
-/* ------------------------------------------------------------------ */
-
-/** noteId → { mesh, index, material? } mapping built by SVG3DBuilder.
- *  Populated in handleBuildScene; used by the per-frame colouring
- *  loop below and reset to null on dispose / scene rebuild. */
-/** @type {Map<string, { mesh: any, index: number, material?: any }> | null} */
-let _noteMeshMap = null;
-
-/** Timeline entries (sorted by time) with `{ time, id, staff, x, y }`.
- *  Used to advance the played-note cursor each frame. */
-/** @type {Array<{ time: number, id: string, staff: number, x: number, y: number }> | null} */
-let _playedTimeline = null;
-
-/** How far through `_playedTimeline` we've already coloured.  On
- *  scrub-back we roll the cursor back and revert each entry. */
-let _playedCursor = 0;
-
-/** staff-number → THREE.Color for the note tint applied when a note
- *  from that staff plays.  Assigned in the same iteration order as
- *  `LightBallController.setEvents()` so the colours visually match
- *  each staff's light ball. */
-/** @type {Map<number, THREE.Color>} */
-const _staffColors = new Map();
-
-/** THREE.Color shared across all un-coloured notes — allocated once
- *  per scene rebuild and mutated with the current `SceneConfig.noteColor`
- *  so a live theme change would propagate without re-alloc. */
-let _defaultNoteColor = new THREE.Color(
-  SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b,
-);
-
-/** Meshes whose `instanceColor` buffer was written this frame —
- *  we flag `needsUpdate = true` in one pass at the end of each
- *  cursor advance / rollback batch rather than per setColorAt call. */
-const _dirtyInstanceMeshes = new Set();
-
-/**
- * Apply (or revert to default) the per-note tint on the tracked
- * notehead mesh for `noteId`.
- *
- * For InstancedMesh-backed notes (`index >= 0`) we call
- * `setColorAt(index, color)` and defer the `needsUpdate` flag to
- * `_flushDirtyMeshes()` below.  For the count-1 plain-Mesh fallback
- * (`index === -1`) we update the cloned per-mesh material's
- * `.color` directly — no per-frame upload, it's applied on the
- * next render.
- *
- * @param {string} noteId
- * @param {THREE.Color} color
- */
-function _applyNoteColor(noteId, color) {
-  const entry = _noteMeshMap && _noteMeshMap.get(noteId);
-  if (!entry) return;
-  if (entry.index >= 0 && entry.mesh && entry.mesh.isInstancedMesh) {
-    entry.mesh.setColorAt(entry.index, color);
-    _dirtyInstanceMeshes.add(entry.mesh);
-  } else if (entry.material && entry.material.color) {
-    entry.material.color.copy(color);
-  }
-}
-
-function _flushDirtyMeshes() {
-  const count = _dirtyInstanceMeshes.size;
-  for (const mesh of _dirtyInstanceMeshes) {
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  }
-  _dirtyInstanceMeshes.clear();
-  return count;
-}
-
-/**
- * Walk `_playedTimeline` in whichever direction `musicTime` moved
- * since last frame, applying staff-colour tints to newly-crossed
- * entries and reverting tints on entries that are now in the future
- * (e.g. user scrubbed backward, or transport reset to the start).
- *
- * Cheaper than a full timeline scan per frame — we keep `_playedCursor`
- * as a fast-path pointer and only ever touch the delta from the
- * previous frame.
- */
-function _syncNoteColors(musicTime) {
-  if (!_playedTimeline || !_noteMeshMap || _playedTimeline.length === 0) return 0;
-  const tl = _playedTimeline;
-  // Forward: cursor points at the next *un-played* entry.  Advance
-  // while that entry's time is at or before the current music time.
-  while (_playedCursor < tl.length && tl[_playedCursor].time <= musicTime) {
-    const evt = tl[_playedCursor];
-    const col = _staffColors.get(evt.staff) || _defaultNoteColor;
-    _applyNoteColor(evt.id, col);
-    _playedCursor++;
-  }
-  // Backward: cursor has advanced past a point we're now to the left
-  // of.  Revert each newly-future entry.  Typical case is transport
-  // reset (`musicTime === 0`), which rolls every played note back to
-  // the default colour in one frame.
-  while (_playedCursor > 0 && tl[_playedCursor - 1].time > musicTime) {
-    _playedCursor--;
-    const evt = tl[_playedCursor];
-    _applyNoteColor(evt.id, _defaultNoteColor);
-  }
-  return _flushDirtyMeshes();
-}
 
 function handleBuildScene({ parsed }) {
-  // Hold rendering for the entire build → setTimeline → precompile
-  // sequence.  The main loop checks `_compiling` and skips
-  // `renderer.render()` while it's true, so there's no risk of a
-  // transient frame with half-built state or missing lights.
-  _compiling = true;
-  _lastShadowUpdateMs = 0;
-  _shadowUpdates = 0;
-  _shadowThrottled = 0;
-  _lastKeyLightSnapped.x = null;
-  _lastKeyLightSnapped.z = null;
-  _resetJitterTotals();
-
-  // Remove previous content.  We don't dispose the InstancedMesh
-  // geometries / materials because they're cached inside the builder
-  // and shared across score loads — disposing them here would leave
-  // the cache pointing at zombie GPU buffers that the next
-  // `builder.build()` would unwittingly re-use, producing the
-  // characteristic "stray glyphs drawn in the wrong place" bug.
-  // The only per-scene resource in the tree is the paper backdrop,
-  // which we dispose by hand below.
-  while (contentRoot.children.length) {
-    const child = contentRoot.children[0];
-    contentRoot.remove(child);
-    disposePerSceneResources(child);
-  }
-  const { root, noteMeshMap } = builder.build(parsed);
-  contentRoot.add(root);
-  // Collect the LOD-tagged meshes for the runtime visibility pass
-  // (LOD_DISTANT_ELEMENTS / DISTANCE_CLIP_GLYPHS).
-  _collectLodMeshes(root);
-  // Replace the per-scene note-mesh map.  Previous entries point at
-  // meshes that just got removed from the scene, so they must not
-  // leak into the next score's colour updates.
-  _noteMeshMap = noteMeshMap;
-  _playedTimeline = null;
-  _playedCursor = 0;
-  _staffColors.clear();
-  _dirtyInstanceMeshes.clear();
-  _defaultNoteColor.setRGB(
-    SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b,
-  );
-
-  // Create / reset light balls for this score.  `setEvents()` below
-  // (called from handleSetTimeline) actually populates the scene
-  // with the individual ball meshes / lights / sprites.
-  //
-  // Parent under `contentRoot`, not `scene` — contentRoot's -π/2 X
-  // rotation is what tips the score from "wall" to "floor", and we
-  // want the balls/lights to inherit that same transform so a ball
-  // positioned at score-local `(noteX, noteY, restZ)` ends up at the
-  // same world position as its underlying notehead.  Parenting under
-  // the scene directly would leave the balls hovering in the
-  // pre-rotation XY plane while the notation sat on the floor — the
-  // exact "balls hanging in space" bug we'd otherwise have to work
-  // around with explicit per-ball coordinate transforms.
-  if (lightBalls) lightBalls.dispose();
-  lightBalls = new LightBallController(contentRoot);
-  // Forward chord-arrival events to the smart camera so its
-  // exponentially-decaying activity counter rises and falls in
-  // sync with what the user actually hears.  Cheap (just a Map
-  // mutation per chord) and only fires while playing — see the
-  // guards in `LightBallController.update`.
-  lightBalls.onBeatGroupHit = (staff, chordSize) => {
-    if (cameraCtrl) cameraCtrl.recordBeatGroupHit(staff, chordSize);
-  };
-
-  // Precompile is deferred to handleSetTimeline — the scene isn't
-  // in its final state yet (no light balls).
-  _pendingPrecompile = { root, parsed };
+  ctx.host.buildScene(parsed, ctx.cameraCtrl);
 }
 
-/**
- * Force the renderer to compile every mesh's pipeline up-front,
- * regardless of whether it would be frustum-culled at the current
- * camera position.  Uses `renderer.compileAsync` when available
- * (WebGPU) or falls back to a synchronous `renderer.compile` on
- * WebGL.
- */
-function precompilePipelines(root, _parsed) {
-  if (!renderer || !scene || !camera) return;
-  /** @type {{ mesh: any, prev: boolean }[]} */
-  const frustumToggled = [];
-  root.traverse((n) => {
-    if (n.isMesh && n.frustumCulled) {
-      frustumToggled.push({ mesh: n, prev: n.frustumCulled });
-      n.frustumCulled = false;
-    }
-  });
-  // Also force every currently-hidden mesh/sprite in the *whole*
-  // scene (not just `root`) to visible for the duration of the
-  // compile.  `_projectObject` skips anything with `visible === false`,
-  // so without this the hidden light-ball meshes + sprites don't get
-  // their pipelines compiled during precompile — and then compile
-  // inline the first time a chord transition shows them mid-playback,
-  // which the user perceives as a 15-40 ms camera freeze per new
-  // staff coming in.
-  /** @type {{ obj: any, prev: boolean }[]} */
-  const visibilityToggled = [];
-  scene.traverse((n) => {
-    if ((n.isMesh || n.isSprite) && n.visible === false) {
-      visibilityToggled.push({ obj: n, prev: false });
-      n.visible = true;
-    }
-  });
-  scene.updateMatrixWorld(true);
-
-  const restore = () => {
-    for (const t of frustumToggled) t.mesh.frustumCulled = t.prev;
-    for (const t of visibilityToggled) t.obj.visible = t.prev;
-    _compiling = false;
-    // Scene was just swapped underneath us — mark dirty so the
-    // first post-compile frame actually renders the new score
-    // (otherwise the idle-gate might skip if nothing else has
-    // marked the scene dirty since the rebuild started).
-    _markDirty();
-    // Arm the sceneReady postMessage; the next successful render
-    // (which will be the first frame of the new score) clears the
-    // flag and notifies the main thread.
-    _postSceneReadyAfterRender = true;
-  };
-  _compiling = true;
-  try {
-    // Two-phase warm-up using the *main* camera and the *canvas* render
-    // target.  Three.js WebGPU keys its pipeline cache on
-    // `(scene, camera, renderTarget, lightsNode)`, so warming with a
-    // different camera or a different render target wouldn't save the
-    // main render loop any inline-compile work (we learnt this the
-    // slow way — first-playback stutter was every chunk compiling its
-    // main-camera pipelines on their first visible frame).
-    //
-    //   1. `compileAsync(scene, camera)` creates every pipeline object
-    //      for the renderContext the main loop will actually use.
-    //   2. A single throw-away `render(scene, camera)` to the canvas
-    //      triggers the lazy GPU-side buffer uploads (instance matrices,
-    //      vertex arrays) that Three.js defers until first-draw.
-    //
-    // `frustumCulled = false` (plus the temporary `visible = true` set
-    // above) ensures every mesh/sprite in the entire scene — including
-    // chunks that aren't in the main camera's frustum right now and
-    // hidden light balls that will be revealed on later chords — is
-    // in the render list, so all pipelines compile and all instance
-    // buffers upload up front.
-    //
-    // The warm-up render goes directly to the canvas because
-    // there's no visible flash anymore: by the time this runs,
-    // `handleSetTimeline` has already fired and the camera is snapped
-    // to the first note.
-    const afterCompile = () => {
-      try {
-        _renderSceneFrame();
-      } catch { /* swallow */ }
-      restore();
-    };
-    if (typeof renderer.compileAsync === 'function') {
-      renderer.compileAsync(scene, camera).then(afterCompile, afterCompile);
-    } else if (typeof renderer.compile === 'function') {
-      renderer.compile(scene, camera);
-      afterCompile();
-    } else {
-      restore();
-    }
-  } catch {
-    restore();
-  }
-}
-
-function handleSetTimeline({ timeline, contentMinY, contentMaxY, firstNote }) {
-  if (lightBalls) lightBalls.setEvents(timeline);
-  if (cameraCtrl) {
-    cameraCtrl.configureForScore(contentMinY, contentMaxY);
-    cameraCtrl.setTimeTrack(timeline);
-  }
-  if (firstNote && cameraCtrl) {
-    cameraCtrl.snapToTarget(new THREE.Vector3(firstNote.x, firstNote.y, 0));
-  }
-  // Cache the framing inputs so a settings-panel-driven config change
-  // (e.g. `camera.pitchDegrees`) can re-call `configureForScore` +
-  // `snapToTarget` without requiring the main thread to resend the
-  // whole timeline.  Cleared on dispose alongside the camera & light
-  // controllers in `handleDispose`.
-  _lastFraming = { contentMinY, contentMaxY, firstNote };
-  _markDirty();
-
-  // Build the staff → colour map that the per-frame colouring loop
-  // uses.  Matching the exact assignment order of
-  // `LightBallController.setEvents()` — insertion order of the
-  // `byStaff` map, cycling through `SceneConfig.lightBall.colors` —
-  // guarantees a played note's colour matches its light ball.
-  //
-  // The palette colours are the *bright* hues used by the hovering
-  // light ball; on a played notehead we want a darker, muted
-  // version so the note stands out from unplayed notes without
-  // competing with the moving light ball above it.  `playedNote.
-  // darkness` in `SceneConfig` scales each channel down; the
-  // `Materials.noteHead` fragment shader adds a per-instance
-  // emissive contribution in the same hue so the darker colour
-  // reads as a soft inner glow rather than a matte fill.
-  _staffColors.clear();
-  const palette = SceneConfig.lightBall.colors;
-  const darkness = SceneConfig.playedNote.darkness;
-  for (const [staff, idx] of assignStaffColorIndices(timeline)) {
-    const c = palette[idx % palette.length];
-    _staffColors.set(staff, new THREE.Color(c.r * darkness, c.g * darkness, c.b * darkness));
-  }
-  // Store timeline + reset the played cursor so a new score starts
-  // fresh.  We don't pre-apply default colours here because every
-  // notehead mesh was built with `instanceColor = noteColor` already
-  // by SVG3DBuilder.  The render loop will set colours on the fly
-  // as the transport advances past each entry.
-  _playedTimeline = timeline;
-  _playedCursor = 0;
-
-  // Scene is now final (content + light balls + camera position).
-  // Run the precompile here, not in handleBuildScene, so that
-  // `compileAsync` sees the complete lights/meshes list and no
-  // inline pipeline compilation happens on the first rendered frame.
-  if (_pendingPrecompile) {
-    const { root, parsed } = _pendingPrecompile;
-    _pendingPrecompile = null;
-    if (OPTIMIZATIONS.PRECOMPILE_PIPELINES) {
-      _refineSceneQuality()
-        .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
-        .then(() => precompilePipelines(root, parsed));
-    } else {
-      // Precompile disabled — release the render gate set in
-      // handleBuildScene so the main loop can draw the new scene.
-      _refineSceneQuality()
-        .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
-        .finally(() => {
-          _compiling = false;
-          _markDirty();
-          // Arm sceneReady so the next render notifies the main thread,
-          // matching the behaviour of the precompile path.
-          _postSceneReadyAfterRender = true;
-        });
-    }
-  }
+function handleSetTimeline(msg) {
+  ctx.host.setTimeline(msg, ctx.cameraCtrl);
 }
 
 function handleSnapCamera({ x, y }) {
-  if (cameraCtrl) cameraCtrl.snapToTarget(new THREE.Vector3(x, y, 0));
-  _markDirty();
-}
-
-function disposePerSceneResources(obj) {
-  // Only dispose things that were created *for this scene* and aren't
-  // in the builder's shared cache.
-  //
-  //   - In the bucketing build path (`BUCKET_INSTANCES: true`) every
-  //     extruded glyph `BufferGeometry` lives in the builder's
-  //     `_geometryCache` and the box-line geometry is the shared
-  //     `_unitBox`.  The paper backdrop is the only per-scene
-  //     object — disposing any of the shared geometries here would
-  //     leave the cache pointing at zombie GPU buffers that the next
-  //     `builder.build()` would re-use, producing the characteristic
-  //     "stray glyphs drawn in the wrong place" bug.
-  //
-  //   - In the one-mesh-per-element fallback
-  //     (`BUCKET_INSTANCES: false`) each line creates its own
-  //     `BoxGeometry`, so we dispose those here.  Extruded glyph
-  //     geometries are still cached, so we skip those.
-  obj.traverse((node) => {
-    if (node.name === 'paper') {
-      if (node.geometry) node.geometry.dispose();
-      if (node.material) node.material.dispose();
-      return;
-    }
-    // Title text: ExtrudeGeometry + cloned material, both created per
-    // score load and not in any shared cache.
-    if (node.name === 'title') {
-      if (node.geometry) node.geometry.dispose();
-      if (node.material) node.material.dispose();
-      return;
-    }
-    if (!OPTIMIZATIONS.BUCKET_INSTANCES) {
-      if (node.isMesh && node.geometry && node.geometry.type === 'BoxGeometry') {
-        node.geometry.dispose();
-      }
-    }
-  });
+  if (ctx.cameraCtrl) ctx.cameraCtrl.snapToTarget(new THREE.Vector3(x, y, 0));
+  ctx.markDirty();
 }
 
 /* ------------------------------------------------------------------ */
 /*  Playback clock                                                      */
 /* ------------------------------------------------------------------ */
 
-/**
- * Main thread calls this on every state change (play / pause / stop /
- * setTempo).  We record the music time at this instant and our own
- * perf-clock reference so later frames can compute the current music
- * time locally without any main-thread round-trip.
- */
 function handleClock({ state, musicTime, tempoScale }) {
-  clock = {
-    state,
-    musicAnchor: musicTime,
-    perfAnchor: performance.now(),
-    tempoScale: tempoScale ?? 1,
-  };
+  const { clock, host, quality, frameStats } = ctx;
+  clock.set(state, musicTime, tempoScale);
   if (state === 'playing') {
-    if (lightBalls) lightBalls.play();
+    if (host.lightBalls) host.lightBalls.play();
     // Reset the baseline calibration so it re-measures from the first
     // frames of this play session — not from stale idle-period rAF ticks.
-    _resetCalibration();
+    quality.resetCalibration();
     // Also flush the play-frame ring so old intervals from before this
     // play session don't distort the p95 pressure signal.
-    _playFrameMsRing.reset();
-    _frameMsRing.reset();
-    _frameMsRing.fill(0);
-    _lastFrameFlags = 0;
-    _lastFrameCpuMs = 0;
-    _resetJitterTotals();
+    frameStats.resetForPlay();
   } else if (state === 'paused') {
-    if (lightBalls) lightBalls.pause();
+    if (host.lightBalls) host.lightBalls.pause();
   } else if (state === 'stopped') {
-    if (lightBalls) lightBalls.stop();
+    if (host.lightBalls) host.lightBalls.stop();
   }
   // State transition / scrub — mark dirty so the *next* frame
   // renders the updated cursor / colour state.  When `state` is
   // `playing` the loop forces `_dirty` true every frame anyway, so
   // this only matters for play→stop, play→pause, and seek-while-
   // paused, but it's cheap to do unconditionally.
-  _markDirty();
-}
-
-function currentMusicTime(frameNow = performance.now()) {
-  // `audioVisualOffsetMs` is added unconditionally to the music time
-  // the visual side reads each frame.  Anchored on `SceneConfig` so a
-  // settings-panel slider can move it live; the rAF loop calls into
-  // here every frame, so a new value lights up on the very next
-  // tick.  See the property's JSDoc in `SceneConfig.js` for sign
-  // convention (+N = visuals lead audio by N ms).
-  const offsetSec = (SceneConfig.audioVisualOffsetMs || 0) / 1000;
-  if (clock.state === 'playing') {
-    const elapsed = (frameNow - clock.perfAnchor) / 1000;
-    return clock.musicAnchor + elapsed * clock.tempoScale + offsetSec;
-  }
-  return clock.musicAnchor + offsetSec;
+  ctx.markDirty();
 }
 
 /* ------------------------------------------------------------------ */
-/*  Render loop                                                         */
+/*  Config / dispose / probe                                            */
 /* ------------------------------------------------------------------ */
-
-/**
- * Frame-budget rendering.
- *
- * Every rAF tick we *always* advance the animation (camera + light
- * balls) so the user-visible motion never stutters — even on scores
- * that push the GPU beyond its per-frame budget.  Rendering itself,
- * however, can skip frames when the previous `renderer.render()` call
- * took longer than the target budget; on the next tick we render
- * again.  The effect is: motion remains smooth, the visible image
- * simply updates at a lower rate on overloaded scenes.
- *
- * We measure submission wall time only — WebGPU/WebGL don't block
- * until a fence, so this under-counts GPU time on some drivers, but
- * it's enough to detect catastrophic rendering slowdowns (e.g.
- * `renderer.render()` taking > 12 ms is a clear signal to throttle).
- */
-const RENDER_BUDGET_MS = 12;
-let _lastRenderMs = 0;
-let _framesSinceRender = 0;
-/** Rolling buffer of recent per-frame render-submit timings (ms) so
- *  `probe` can report histograms without us keeping stats forever. */
-const _renderMsRing = new RingBuffer(120);
-let _rendersSkipped = 0;
-/** Wall-clock rAF-to-rAF interval in ms — this is the true "how long
- *  is a frame actually taking" metric, including GPU execution time
- *  that `renderer.render()`'s submit-time doesn't capture.  A 2 fps
- *  user experience shows up here as ~500 ms intervals even though
- *  submit time is <5 ms.
- *  Written on *every* rAF tick (playing + idle) — used by `probe()`
- *  for the full frame-time histogram in the developer overlay. */
-const _frameMsRing = new RingBuffer(120);
-const _FRAME_SHADOW = 1;
-const _FRAME_COLORS = 2;
-const _FRAME_STATS = 4;
-const _FRAME_BUDGET_SKIP = 8;
-let _lastFrameFlags = 0;
-let _lastFrameCpuMs = 0;
-const _newJitterBucket = () => ({ count: 0, sum: 0, max: 0, cpuSum: 0, cpuMax: 0, over12: 0, over16: 0, over20: 0, over33: 0 });
-const _jitterTotals = {
-  all: _newJitterBucket(),
-  afterShadow: _newJitterBucket(),
-  afterNoShadow: _newJitterBucket(),
-  afterColorUpload: _newJitterBucket(),
-  afterStats: _newJitterBucket(),
-  afterBudgetSkip: _newJitterBucket(),
-};
-function _addJitterSample(bucket, frame, cpu) {
-  bucket.count++;
-  bucket.sum += frame;
-  bucket.cpuSum += cpu;
-  if (frame > bucket.max) bucket.max = frame;
-  if (cpu > bucket.cpuMax) bucket.cpuMax = cpu;
-  if (frame > 12) bucket.over12++;
-  if (frame > 16) bucket.over16++;
-  if (frame > 20) bucket.over20++;
-  if (frame > 33) bucket.over33++;
-}
-function _recordJitterSample(frame, cpu, flags) {
-  _addJitterSample(_jitterTotals.all, frame, cpu);
-  _addJitterSample(flags & _FRAME_SHADOW ? _jitterTotals.afterShadow : _jitterTotals.afterNoShadow, frame, cpu);
-  if (flags & _FRAME_COLORS) _addJitterSample(_jitterTotals.afterColorUpload, frame, cpu);
-  if (flags & _FRAME_STATS) _addJitterSample(_jitterTotals.afterStats, frame, cpu);
-  if (flags & _FRAME_BUDGET_SKIP) _addJitterSample(_jitterTotals.afterBudgetSkip, frame, cpu);
-}
-function _resetJitterTotals() {
-  for (const bucket of Object.values(_jitterTotals)) {
-    bucket.count = 0;
-    bucket.sum = 0;
-    bucket.max = 0;
-    bucket.cpuSum = 0;
-    bucket.cpuMax = 0;
-    bucket.over12 = 0;
-    bucket.over16 = 0;
-    bucket.over20 = 0;
-    bucket.over33 = 0;
-  }
-}
-/** Subset of `_frameMsRing` — only records intervals from ticks that
- *  occur while `clock.state === 'playing'`.  The AQ p95 window reads
- *  from this ring instead of `_frameMsRing` so that idle frames
- *  (camera settled, music paused) don't dilute the pressure signal
- *  and cause the AQ system to see artificially low percentiles. */
-const _playFrameMsRing = new RingBuffer(120);
-/** Pre-allocated scratch buffers for in-place sorting inside the hot
- *  rAF loop and the 500 ms stats heartbeat.  Using typed arrays and
- *  sorting them in-place avoids the `new Array` + `push` allocations
- *  that were triggering minor GC pauses every frame and causing the
- *  rAF interval to jitter (manifesting as inconsistent 45-60 fps on
- *  ProMotion hardware despite <4 ms GPU render time). */
-const _aqScratch = new Float64Array(120);    // AQ p95 — sampled at 4 Hz
-const _statsScratch = new Float64Array(120); // _postStats p95 — written every 500 ms
-const _AQ_SAMPLE_INTERVAL_MS = 250;
-let _lastAqSampleMs = 0;
-let _latestAqP95 = 0;
-
-/** Set to `true` while we're pre-compiling pipelines for a freshly-
- *  built scene.  We pause normal rendering during that window so a
- *  mid-compile `renderer.render()` doesn't trigger slow inline
- *  pipeline creation. */
-let _compiling = false;
-
-/** Idle-render gate.  When the user isn't interacting and the music
- *  isn't playing, every frame's image is identical to the previous
- *  one — submitting `renderer.render()` to the GPU 60 times a second
- *  for the same pixels is pure waste, especially with the 6144²
- *  shadow map (≈ 38 M depth-buffer texels redrawn every frame).
- *
- *  We start the flag at `true` so the first frame after init lands a
- *  rendered image on screen, then set it back to `false` after each
- *  successful `renderer.render()`.  Anything that could change the
- *  picture flips it back to `true`:
- *
- *    • OrbitControls's `change` event (user drag, scroll-zoom, or
- *      damping settle frame).
- *    • Pointer events (in case the user does something the controls
- *      don't fire `change` for, e.g. touch-end).
- *    • Resize.
- *    • Scene rebuild / timeline load / camera snap.
- *    • Clock state transitions (play / pause / stop / scrub).
- *    • While the music clock is `playing`, the loop forces it `true`
- *      every frame because notation colours, light-ball positions,
- *      and the camera spring are all advancing.
- *
- *  When idle, the rAF loop still runs (the animation-phase work below
- *  is sub-millisecond when there's nothing animating), but
- *  `renderer.render()` is skipped — GPU drops to ~0 % utilisation
- *  until the user interacts again. */
-let _dirty = true;
-
-function _markDirty() { _dirty = true; }
-
-/** Smoothed `dt` used for camera / light-ball integration so rAF
- *  jitter doesn't feed directly into the springs and smart-camera phase. */
-let _dtSmoothed = 0;
-
-/** Camera-position history for a per-frame `cameraJitter` probe metric. */
-const _prevCameraPos = new THREE.Vector3();
-let _prevCameraDelta = 0;
-const _cameraDeltaRing = new RingBuffer(120);
-
-function startRenderLoop() {
-  lastFrameTime = performance.now();
-  const loop = (frameNow) => {
-    rafId = requestAnimationFrame(loop);
-    const now = Number.isFinite(frameNow) ? frameNow : performance.now();
-    const cpuStart = performance.now();
-    const rawDt = Math.min(Math.max((now - lastFrameTime) / 1000, 0), 0.1);
-    const frameMs = now - lastFrameTime;
-    lastFrameTime = now;
-
-    // Record actual rAF interval so `probe()` can distinguish
-    // submit-time from real GPU-bound frame time.
-    if (frameMs > 0 && frameMs < 2000) {
-      _frameMsRing.push(frameMs);
-      if (clock.state === 'playing') _recordJitterSample(frameMs, _lastFrameCpuMs, _lastFrameFlags);
-      // Separate ring for AQ: only record play-session frames so that
-      // long idle intervals don't make the p95 look deceptively low.
-      if (clock.state === 'playing') {
-        _playFrameMsRing.push(frameMs);
-      }
-
-      // Smooth rAF jitter out of the integration dt that drives camera
-      // motion.  Alpha 0.2 keeps the signal responsive while suppressing
-      // the ±0.5 ms vsync noise we see on Safari.
-      const alpha = Math.max(0, Math.min(1, SceneConfig.dtSmoothAlpha ?? 0.2));
-      if (alpha <= 0 || _dtSmoothed === 0) {
-        _dtSmoothed = rawDt;
-      } else {
-        _dtSmoothed = _dtSmoothed * (1 - alpha) + rawDt * alpha;
-      }
-      // Enforce a non-zero minimum so the integration formulas never
-      // see an exact zero dt on the first frame or a long pause.
-      if (_dtSmoothed < 0.0001) _dtSmoothed = 0.0001;
-    }
-    const dt = _dtSmoothed;
-
-    let frameFlags = 0;
-
-    // --- Animation phase (always runs) -------------------------------
-    const musicTime = currentMusicTime(now);
-    if (lightBalls) {
-      lightBalls.setTime(musicTime);
-      lightBalls.update(dt, camera);
-    }
-    if (cameraCtrl) {
-      const xTime = cameraCtrl.xAtTime(musicTime);
-      if (xTime != null) {
-        const lookAheadSeconds = clock.state === 'playing'
-          ? Math.max(0, SceneConfig.camera.lookAheadSeconds ?? 0)
-          : 0;
-        const xLook = lookAheadSeconds > 0
-          ? cameraCtrl.xAtTime(musicTime + lookAheadSeconds, 'lookAhead')
-          : xTime;
-        _camTarget.set(xTime, 0, 0);
-        cameraCtrl.setTarget(_camTarget, xLook ?? xTime);
-      }
-      cameraCtrl.update(dt, now);
-    }
-
-    // Capture camera-position change for the `cameraJitter` probe metric.
-    // Variation here (not absolute motion) is the best proxy we have
-    // for visible camera jitter caused by rAF dt noise.
-    if (camera && clock.state === 'playing') {
-      const dx = camera.position.x - _prevCameraPos.x;
-      const dy = camera.position.y - _prevCameraPos.y;
-      const dz = camera.position.z - _prevCameraPos.z;
-      const delta = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      _prevCameraPos.copy(camera.position);
-      const deltaDelta = Math.abs(delta - _prevCameraDelta);
-      _prevCameraDelta = delta;
-      _cameraDeltaRing.push(deltaDelta);
-    }
-
-    // Slide the key light's shadow camera to straddle whatever the
-    // scene camera is currently looking at.  The orbit controls'
-    // target tracks the music during playback and the user's pan
-    // gestures when paused — using it here means the shadow frustum
-    // is automatically "focused" wherever the user's attention is,
-    // so notation anywhere in the view always casts a visible
-    // shadow rather than only the chunk near the world origin.
-    _updateKeyLight(controls.target.x, controls.target.z, now);
-    // Distance-LOD visibility gating (LOD_DISTANT_ELEMENTS /
-    // DISTANCE_CLIP_GLYPHS).  Skipped while a precompile is in flight
-    // — precompilePipelines temporarily toggles hidden meshes visible
-    // and restores them afterwards, and a concurrent LOD pass would
-    // corrupt that bookkeeping.
-    if (!_compiling) _applyLodVisibility();
-    // Feed the current playhead X into the glow-falloff uniform so the
-    // noteHead shader can fade out emissive glow on distant played notes.
-    setPlayheadX(_camTarget.x);
-    // Advance / rewind the played-note cursor and apply per-staff
-    // instanceColor updates.  Runs every frame so playback keeps the
-    // coloured-note state exactly in sync with the current music
-    // time — a scrub-back to 0 automatically reverts every played
-    // note to the default dark colour in a single frame.
-    const colorUploadCount = _syncNoteColors(musicTime);
-    if (colorUploadCount > 0) frameFlags |= _FRAME_COLORS;
-
-    // --- Render phase (can be skipped when idle or under pressure) ----
-    // Two reasons to skip a frame:
-    //   • `_compiling` — a pipeline-precompile pass is in flight; a
-    //     mid-compile `renderer.render()` would trigger slow inline
-    //     pipeline creation that's exactly what we're warming up to
-    //     avoid.
-    //   • `!_dirty` — nothing visible changed since last render
-    //     (idle scene, paused music, settled camera).  The GPU pass
-    //     would just blit the same pixels again.
-    //
-    // Music currently playing forces `_dirty = true` every frame
-    // because notation colours, light-ball positions and camera-X
-    // are all advancing on the music clock.
-    //
-    // The render-budget gate is layered on top — when a previous
-    // submit blew past the budget we skip *one* frame to give the
-    // GPU time to drain, but only one in a row, so the picture
-    // doesn't go stale on a sustained slowdown.
-    if (clock.state === 'playing') _dirty = true;
-    const budgetGate = !OPTIMIZATIONS.RENDER_BUDGET_SKIP
-      || _lastRenderMs <= RENDER_BUDGET_MS
-      || _framesSinceRender >= 1;
-    const shouldRender = !_compiling && _dirty && budgetGate;
-    if (shouldRender) {
-      if (_keyLight?.shadow?.needsUpdate) frameFlags |= _FRAME_SHADOW;
-      const t0 = performance.now();
-      _renderSceneFrame();
-      _lastRenderMs = performance.now() - t0;
-      _framesSinceRender = 0;
-      _renderMsRing.push(_lastRenderMs);
-      _dirty = false;
-
-      // Tell the main thread the new score is now on screen so it
-      // can hide the loading spinner.  Post exactly once per build,
-      // after the very first successful render that follows
-      // precompile completion.  Doing it from inside `restore()`
-      // (synchronously after `_compiling = false`) would fire the
-      // message before any frame has actually reached the canvas
-      // and give the user a brief flash of empty paper.
-      if (_postSceneReadyAfterRender) {
-        _postSceneReadyAfterRender = false;
-        self.postMessage({ type: 'sceneReady' });
-      }
-    } else {
-      if (!_compiling && _dirty && !budgetGate) frameFlags |= _FRAME_BUDGET_SKIP;
-      _framesSinceRender++;
-      _rendersSkipped++;
-    }
-
-    // --- Runtime pressure (light dimming) ----------------------------
-    // Uses rAF-to-rAF interval as the GPU pressure signal; only fires
-    // once the baseline has been calibrated from play-session frames.
-    // Also feeds the calibration window while playing.
-    //
-    // Unlike the old tier system this does NOT change shadow map size,
-    // DPR, or PCF type during playback.  Runtime pressure only scales
-    // light-ball intensity and increases the shadow refresh interval;
-    // neither path reallocates GPU resources.
-    if (_playFrameMsRing.filled > 0) {
-      // Calibration: only feeds play-session rAF intervals.
-      if (clock.state === 'playing') _calibrate(frameMs);
-      if (now - _lastAqSampleMs >= _AQ_SAMPLE_INTERVAL_MS) {
-        const wantAq = Math.min(_playFrameMsRing.filled, 60);
-        _latestAqP95 = _playFrameMsRing.percentile(0.95, wantAq, _aqScratch);
-        _lastAqSampleMs = now;
-      }
-      if (_latestAqP95 > 0) _updateRuntimePressure(dt, _latestAqP95);
-    }
-
-    // --- Stats heartbeat ---------------------------------------------
-    // Post a small stats summary every ~0.5 s so the main-thread FPS
-    // badge has fresh numbers without flooding postMessage every
-    // frame.  Numbers are derived from the same ring buffers
-    // `handleProbe` reads, so the badge agrees with what `probe()`
-    // would report on demand.
-    if (now - _lastStatsPostMs >= STATS_POST_INTERVAL_MS) {
-      frameFlags |= _FRAME_STATS;
-      _postStats();
-      _lastStatsPostMs = now;
-    }
-    _lastFrameFlags = frameFlags;
-    _lastFrameCpuMs = performance.now() - cpuStart;
-  };
-  loop();
-}
-
-/** Wall-clock millisecond between consecutive `stats` messages.  500 ms
- *  is fast enough that a sudden slowdown is visible within a beat or
- *  two but slow enough that postMessage cost itself is negligible
- *  (≈ 2 messages/sec). */
-const STATS_POST_INTERVAL_MS = 500;
-let _lastStatsPostMs = 0;
-
-/** Compute and post a fresh `stats` snapshot to the main thread.
- *  Reads only the cheap recent-window samples (last second of frame
- *  intervals) so we don't have to touch the ring buffers' tail. */
-function _postStats() {
-  // Recent-window samples: the last min(samples, ~60 frames worth)
-  // give the freshest readout — the ring's most-recent 60 entries.
-  const fLen = _frameMsRing.filled;
-  if (fLen === 0) return;
-  const want = Math.min(fLen, 60);
-  const fMean = _frameMsRing.mean(want);
-  const fMax = _frameMsRing.max(want);
-  const fps = fMean > 0 ? (1000 / fMean) : 0;
-
-  // Render-submit window (only render frames count; idle frames
-  // skip the renderer call so we don't want to dilute the average
-  // with zeros).
-  const rLen = _renderMsRing.filled;
-  let rMean = 0, rMax = 0, rP95 = 0;
-  if (rLen > 0) {
-    const rWant = Math.min(rLen, 60);
-    rMean = _renderMsRing.mean(rWant);
-    rMax = _renderMsRing.max(rWant);
-    rP95 = _renderMsRing.percentile(0.95, rWant, _statsScratch);
-  }
-
-  // Compute play-frame p95 for the pressure diagnostic.
-  let playP95 = 0;
-  if (_playFrameMsRing.filled > 0) {
-    const pWant = Math.min(_playFrameMsRing.filled, 60);
-    playP95 = _playFrameMsRing.percentile(0.95, pWant, _statsScratch);
-  }
-
-  post({
-    type: 'stats',
-    fps,
-    frameMs: fMean,
-    frameMsMax: fMax,
-    frameMsP95: playP95,
-    renderMs: rMean,
-    renderMsP95: rP95,
-    renderMsMax: rMax,
-    rendering: _dirty || clock.state === 'playing',
-    autoDegrade: _autoDimEnabled,
-    gpuPressure: _runtimePressure,
-    aqBaselineMs: _baselineMs,
-    aqCalibrated: _calibrated,
-    antiAliasing: _aaMode,
-    msaaSamples: _msaaSamples,
-    fxaaSuppressed: _fxaaSuppressed,
-  });
-}
-
-// Scratch Vector3 for setTarget — allocating one per frame would defeat
-// the whole point of running in a worker.
-const _camTarget = new THREE.Vector3();
 
 /**
  * Apply a flat dot-path map of `SceneConfig` updates from the main
@@ -1912,7 +339,7 @@ const _camTarget = new THREE.Vector3();
  * `'audioVisualOffsetMs'`) so the message is small even when only one
  * leaf changes.  Most properties are read every frame from
  * `SceneConfig` already (light-ball bounce/pulse/glow, the
- * audio-visual offset in `currentMusicTime`), so the side effect for
+ * audio-visual offset in `musicTimeAt`), so the side effect for
  * those is zero — just write the new value and the next rAF picks it
  * up.  The exceptions are camera-framing settings
  * (`camera.pitchDegrees` / `camera.contentHeadroom` / `camera.chaseRatio`) —
@@ -1927,25 +354,11 @@ const _camTarget = new THREE.Vector3();
  */
 function handleUpdateConfig({ updates }) {
   if (!updates || typeof updates !== 'object') return;
+  const { quality, cameraCtrl, host, keyLightRig, renderer } = ctx;
   // Pure-worker flags — not stored in SceneConfig — handled before
   // the generic dot-path loop.
   if ('autoDegrade' in updates) {
-    const wasEnabled = _autoDimEnabled;
-    _autoDimEnabled = !!updates.autoDegrade;
-    if (!wasEnabled && _autoDimEnabled) {
-      // Re-enabling after a manual disable: reset calibration so stale
-      // rAF intervals from the disabled period don't seed a misleading
-      // baseline.  Also restore full light intensity immediately.
-      _resetCalibration();
-      _runtimePressure = 0;
-      SceneConfig.lightBall.intensity = _baseLightIntensity;
-      _updateFxaaPressure();
-    } else if (!_autoDimEnabled) {
-      // Disabling: restore full intensity so lights snap back.
-      _runtimePressure = 0;
-      SceneConfig.lightBall.intensity = _baseLightIntensity;
-      _updateFxaaPressure();
-    }
+    quality.setAutoDegrade(!!updates.autoDegrade);
   }
   let cameraDirty = false;
   for (const path in updates) {
@@ -1967,89 +380,42 @@ function handleUpdateConfig({ updates }) {
         || path === 'camera.chaseRatio') {
       cameraDirty = true;
     }
-    if (path === 'shadow.enabled') _applyShadowEnabled();
+    if (path === 'shadow.enabled') keyLightRig.applyShadowEnabled(renderer);
   }
-  if (cameraDirty && cameraCtrl && _lastFraming) {
-    cameraCtrl.configureForScore(_lastFraming.contentMinY, _lastFraming.contentMaxY);
-    if (_lastFraming.firstNote) {
-      cameraCtrl.snapToTarget(new THREE.Vector3(_lastFraming.firstNote.x, _lastFraming.firstNote.y, 0));
+  const lastFraming = host.lastFraming;
+  if (cameraDirty && cameraCtrl && lastFraming) {
+    cameraCtrl.configureForScore(lastFraming.contentMinY, lastFraming.contentMaxY);
+    if (lastFraming.firstNote) {
+      cameraCtrl.snapToTarget(new THREE.Vector3(lastFraming.firstNote.x, lastFraming.firstNote.y, 0));
     }
   }
-  _markDirty();
+  ctx.markDirty();
 }
 
 function handleDispose() {
-  if (rafId) cancelAnimationFrame(rafId);
-  rafId = 0;
-  if (lightBalls) { lightBalls.dispose(); lightBalls = null; }
-  if (controls)   { controls.dispose();   controls = null; }
-  if (_effectComposer) _effectComposer.dispose();
-  _postProcessing = null;
-  _effectComposer = null;
-  _fxaaPass = null;
-  _fxaaAvailable = false;
-  _fxaaSuppressed = false;
-  _msaaSamples = 1;
-  _aaMode = 'None';
-  if (renderer)   { renderer.dispose();   renderer = null; }
-  // Clear per-scene colouring state so a subsequent `init` starts clean.
-  _noteMeshMap = null;
-  _playedTimeline = null;
-  _playedCursor = 0;
-  _staffColors.clear();
-  _dirtyInstanceMeshes.clear();
-  _lastFraming = null;
-  _pendingPrecompile = null;
-  _postSceneReadyAfterRender = false;
-  _lastShadowUpdateMs = 0;
-  _shadowUpdates = 0;
-  _shadowThrottled = 0;
-  _lastKeyLightSnapped.x = null;
-  _lastKeyLightSnapped.z = null;
-  _lodMeshes.length = 0;
-  _lodLastDistance = -1;
+  ctx.loop.stop();
+  ctx.host.dispose();
+  if (ctx.controls) { ctx.controls.dispose(); ctx.controls = null; }
+  ctx.antiAliasing.dispose();
+  if (ctx.renderer) { ctx.renderer.dispose(); ctx.renderer = null; }
+  ctx.keyLightRig.resetCounters();
+  ctx.keyLightRig.resetSnap();
+  ctx.lod.clear();
 }
 
 /** Read-back hook used by tests: returns a small snapshot of camera +
  *  animation state so the main thread can verify wiring (e.g. that
  *  forwarded pointer events are actually driving OrbitControls). */
 function handleProbe({ id }) {
-  // Render-time histogram across the ring buffer
-  const rMax = _renderMsRing.max(_renderMsRing.filled);
-  const p = (q) => _renderMsRing.percentile(q, _renderMsRing.filled, _statsScratch);
-
-  // Actual rAF-to-rAF frame time.  This is what the user perceives —
-  // includes GPU execution time that `renderer.render`'s submit-time
-  // doesn't capture.
-  let fMax = 0;
-  _frameMsRing.forEach((v) => { if (v > fMax) fMax = v; });
-  const fp = (q) => _frameMsRing.percentile(q, _frameMsRing.filled, _statsScratch);
-
-  // Camera-position second-difference (jitter) samples.  This measures
-  // how much the camera's per-frame movement *changes*, not how much it
-  // moves, so it isolates the high-frequency jitter from the underlying
-  // smooth tracking motion.
-  let cMax = 0;
-  _cameraDeltaRing.forEach((v) => { if (v > cMax) cMax = v; });
-  const cp = (q) => _cameraDeltaRing.percentile(q, _cameraDeltaRing.filled, _statsScratch);
-
-  const summarizeBucket = (bucket) => ({
-    count: bucket.count,
-    mean: bucket.count ? bucket.sum / bucket.count : 0,
-    max: bucket.max,
-    cpuMean: bucket.count ? bucket.cpuSum / bucket.count : 0,
-    cpuMax: bucket.cpuMax,
-    over12: bucket.over12,
-    over16: bucket.over16,
-    over20: bucket.over20,
-    over33: bucket.over33,
-  });
+  const { host, clock, frameStats, quality, keyLightRig, lod, antiAliasing } = ctx;
+  const { camera, controls, cameraCtrl, renderer } = ctx;
+  const parts = frameStats.buildProbeSnapshotParts();
 
   // Mesh + light count in the scene graph (lights matter because each
   // one adds a loop iteration to every fragment shader).
   let meshCount = 0, instancedMeshCount = 0, totalInstances = 0, spriteCount = 0;
   let pointLightCount = 0, directionalLightCount = 0, ambientLightCount = 0;
-  scene.traverse((n) => {
+  ctx.scene.traverse((n) => {
     if (n.isMesh) meshCount++;
     if (n.isInstancedMesh) { instancedMeshCount++; totalInstances += n.count; }
     if (n.isSprite) spriteCount++;
@@ -2058,6 +424,7 @@ function handleProbe({ id }) {
     if (n.isAmbientLight) ambientLightCount++;
   });
   const renderInfo = renderer?.info?.render || {};
+  const lastFraming = host.lastFraming;
   self.postMessage({
     type: 'probe',
     id,
@@ -2073,8 +440,8 @@ function handleProbe({ id }) {
       framing: cameraCtrl ? {
         contentDistance: cameraCtrl._contentDistance,
         contentCenterZ: cameraCtrl._contentCenterZ,
-        contentMinY: _lastFraming ? _lastFraming.contentMinY : null,
-        contentMaxY: _lastFraming ? _lastFraming.contentMaxY : null,
+        contentMinY: lastFraming ? lastFraming.contentMinY : null,
+        contentMaxY: lastFraming ? lastFraming.contentMaxY : null,
       } : null,
       smartCamera: cameraCtrl ? {
         enabled: !!SceneConfig.smartCamera?.enabled,
@@ -2087,45 +454,18 @@ function handleProbe({ id }) {
       } : null,
       clockState: clock.state,
       antiAliasing: {
-        mode: _aaMode,
-        msaaSamples: _msaaSamples,
-        fxaaSuppressed: _fxaaSuppressed,
+        mode: antiAliasing.mode,
+        msaaSamples: antiAliasing.msaaSamples,
+        fxaaSuppressed: antiAliasing.suppressed,
       },
       render: {
-        samples: _renderMsRing.filled,
-        mean: _renderMsRing.mean(_renderMsRing.filled),
-        p50: _renderMsRing.filled ? p(0.5) : 0,
-        p95: _renderMsRing.filled ? p(0.95) : 0,
-        p99: _renderMsRing.filled ? p(0.99) : 0,
-        max: rMax,
-        skipped: _rendersSkipped,
-        compiling: _compiling,
-        dirty: _dirty,
+        ...parts.render,
+        compiling: host.compiling,
+        dirty: ctx.loop.dirty,
       },
-      frame: {
-        samples: _frameMsRing.filled,
-        mean: _frameMsRing.mean(_frameMsRing.filled),
-        p50: _frameMsRing.filled ? fp(0.5) : 0,
-        p95: _frameMsRing.filled ? fp(0.95) : 0,
-        p99: _frameMsRing.filled ? fp(0.99) : 0,
-        max: fMax,
-      },
-      jitter: {
-        all: summarizeBucket(_jitterTotals.all),
-        afterShadow: summarizeBucket(_jitterTotals.afterShadow),
-        afterNoShadow: summarizeBucket(_jitterTotals.afterNoShadow),
-        afterColorUpload: summarizeBucket(_jitterTotals.afterColorUpload),
-        afterStats: summarizeBucket(_jitterTotals.afterStats),
-        afterBudgetSkip: summarizeBucket(_jitterTotals.afterBudgetSkip),
-      },
-      cameraJitter: {
-        samples: _cameraDeltaRing.filled,
-        mean: _cameraDeltaRing.mean(_cameraDeltaRing.filled),
-        p50: _cameraDeltaRing.filled ? cp(0.5) : 0,
-        p95: _cameraDeltaRing.filled ? cp(0.95) : 0,
-        p99: _cameraDeltaRing.filled ? cp(0.99) : 0,
-        max: cMax,
-      },
+      frame: parts.frame,
+      jitter: parts.jitter,
+      cameraJitter: parts.cameraJitter,
       scene: {
         meshCount, instancedMeshCount, totalInstances, spriteCount,
         pointLights: pointLightCount,
@@ -2135,22 +475,22 @@ function handleProbe({ id }) {
         triangles: renderInfo.triangles || 0,
       },
       quality: {
-        probeMs: _probeMsMeasured,
-        sceneProbeMs: _sceneProbeMsMeasured,
-        shadowMapSize: _chosenShadowMapSize,
-        dprCap: _chosenDprCap,
+        probeMs: quality.probeMs,
+        sceneProbeMs: quality.sceneProbeMs,
+        shadowMapSize: quality.chosenShadowMapSize,
+        dprCap: quality.chosenDprCap,
         pixelRatio: renderer && renderer.getPixelRatio ? renderer.getPixelRatio() : 0,
-        pressure: _runtimePressure,
-        baselineMs: _baselineMs,
-        calibrated: _calibrated,
+        pressure: quality.pressure,
+        baselineMs: quality.baselineMs,
+        calibrated: quality.calibrated,
         chunking: OPTIMIZATIONS.CHUNK_BUCKETS_BY_X,
-        shadowUpdates: _shadowUpdates,
-        shadowThrottled: _shadowThrottled,
+        shadowUpdates: keyLightRig.shadowUpdates,
+        shadowThrottled: keyLightRig.shadowThrottled,
       },
       lod: {
-        managed: _lodMeshes.length,
-        hidden: _lodMeshes.reduce((n, m) => n + (m.visible ? 0 : 1), 0),
-        lastDistance: _lodLastDistance,
+        managed: lod.managedCount,
+        hidden: lod.hiddenCount,
+        lastDistance: lod.lastDistance,
       },
     },
   });
