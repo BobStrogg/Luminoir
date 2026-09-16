@@ -90,7 +90,7 @@ export class LuminoirApp {
       await this.render.init(canvas);
     } catch (e) {
       console.error('[Luminoir] Renderer init failed:', e);
-      throw new Error('3D renderer unavailable — WebGL / WebGPU could not start in this browser session.');
+      throw new Error('3D renderer unavailable — WebGL / WebGPU could not start in this browser session.', { cause: e });
     }
 
     // Apply any persisted playback-speed value before the first score

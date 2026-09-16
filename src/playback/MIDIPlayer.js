@@ -537,7 +537,7 @@ export class MIDIPlayer {
     const headerTag = readUint32();
     if (headerTag !== 0x4d546864) return { noteEvents: [], channelPrograms: new Map() }; // "MThd"
     const headerLen = readUint32();
-    const format = readUint16();
+    const _format = readUint16();
     const numTracks = readUint16();
     const division = readUint16();
     pos = 8 + headerLen;
@@ -706,7 +706,7 @@ export class MIDIPlayer {
           pos += 2; // two data bytes
         } else if (status === 0xff) {
           // Meta event
-          const metaType = view.getUint8(pos++);
+          const _metaType = view.getUint8(pos++);
           const metaLen = readVarLen();
           pos += metaLen;
         } else if (status === 0xf0 || status === 0xf7) {

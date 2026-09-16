@@ -2,6 +2,8 @@ import * as THREE from 'three';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { Materials } from '../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
+import { assignStaffColorIndices } from './staffColors.js';
+import { centerOf, buildChordGroups } from './chordGroups.js';
 
 /**
  * Animated light balls that bounce from note to note.
@@ -142,41 +144,21 @@ export class LightBallController {
       }
     }
 
-    let colorIdx = 0;
+    // Staff → palette index, in first-seen timeline order — the same
+    // assignment `handleSetTimeline` uses for played-note colours, so a
+    // note's tint always matches its staff's light ball.
+    const staffColorIdx = assignStaffColorIndices(events);
+
     let staffIdxForPool = 0;
     const staffCount = byStaff.size;
     for (const [staff, staffEvents] of byStaff) {
-      // Sort by time
-      staffEvents.sort((a, b) => a.time - b.time);
-
-      // Build chord groups (cluster events within 1 ms of each other)
-      /** @type {ChordGroup[]} */
-      const chordGroups = [];
-      /** @type {ChordGroup|null} */
-      let cur = null;
-
-      for (const e of staffEvents) {
-        if (!cur || Math.abs(e.time - cur.time) > 0.001) {
-          cur = { time: e.time, notes: [] };
-          chordGroups.push(cur);
-        }
-        cur.notes.push({ x: e.x, y: e.y, id: e.id });
-      }
-
-      // Sort notes within each group by y-position (pitch order)
-      for (const g of chordGroups) {
-        g.notes.sort((a, b) => a.y - b.y);
-      }
-
-      // Pre-compute stable note orderings between consecutive chord groups
-      // so that balls track the nearest note rather than jumping by y-index.
-      _buildMatchings(chordGroups);
+      const chordGroups = buildChordGroups(staffEvents);
 
       // Determine max chord size for this staff
       const maxSize = Math.max(1, ...chordGroups.map((g) => g.notes.length));
 
       // Create ball pool
-      const color = SceneConfig.lightBall.colors[colorIdx % SceneConfig.lightBall.colors.length];
+      const color = SceneConfig.lightBall.colors[staffColorIdx.get(staff) % SceneConfig.lightBall.colors.length];
       const balls = [];
       for (let i = 0; i < maxSize; i++) {
         const ball = new LightBall(this._scene, color, `${staff}_${i}`);
@@ -209,13 +191,12 @@ export class LightBallController {
         // defaults to (0,0,0) which gets baked into the pipeline
         // upload with intensity 0).
         if (lightIdx >= 0 && first.notes.length > 0) {
-          const c = _centerOf(first.notes);
+          const c = centerOf(first.notes);
           this._lightPool[lightIdx].position.set(c.x, c.y, SceneConfig.lightBall.restZ);
         }
       }
 
       this._staffData.set(staff, { chordGroups, balls, color, lightIdx });
-      colorIdx++;
     }
   }
 
@@ -350,7 +331,7 @@ export class LightBallController {
           srcX = prev.notes[i].x;
           srcY = prev.notes[i].y;
         } else {
-          const c = _centerOf(prev.notes);
+          const c = centerOf(prev.notes);
           srcX = c.x;
           srcY = c.y;
         }
@@ -363,7 +344,7 @@ export class LightBallController {
           dstX = next.notes[j].x;
           dstY = next.notes[j].y;
         } else {
-          const c = _centerOf(next.notes);
+          const c = centerOf(next.notes);
           dstX = c.x;
           dstY = c.y;
         }
@@ -489,61 +470,9 @@ export class LightBallController {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-/** Average position of an array of { x, y } notes. */
-function _centerOf(notes) {
-  let x = 0, y = 0;
-  for (const n of notes) { x += n.x; y += n.y; }
-  return { x: x / notes.length, y: y / notes.length };
-}
 
 /**
- * Pre-compute a `toNext` index map on each chord group so that ball i
- * in the current group maps to `toNext[i]` in the next group (nearest
- * neighbour by y, avoiding duplicates).  This keeps each ball tracking
- * the closest note through chord transitions instead of jumping by
- * sorted index.
- */
-function _buildMatchings(groups) {
-  for (let g = 0; g < groups.length - 1; g++) {
-    const cur = groups[g];
-    const nxt = groups[g + 1];
-    const maxN = Math.max(cur.notes.length, nxt.notes.length);
-
-    // Build toNext: for each ball slot in cur, which slot in nxt?
-    // Use null to mark "merge into group centre" (no specific target).
-    const toNext = new Array(maxN);
-    const taken = new Set();
-
-    for (let i = 0; i < maxN; i++) {
-      const src = i < cur.notes.length ? cur.notes[i] : _centerOf(cur.notes);
-      let bestJ = -1, bestDist = Infinity;
-      for (let j = 0; j < nxt.notes.length; j++) {
-        if (taken.has(j)) continue;
-        const dy = nxt.notes[j].y - src.y;
-        const dx = nxt.notes[j].x - src.x;
-        const dist = dx * dx + dy * dy;
-        if (dist < bestDist) { bestDist = dist; bestJ = j; }
-      }
-      if (bestJ >= 0) {
-        toNext[i] = bestJ;
-        taken.add(bestJ);
-      } else {
-        // No target available in next group — ball will merge/fade rather
-        // than collapse onto note 0 alongside another ball.
-        toNext[i] = null;
-      }
-    }
-    cur.toNext = toNext;
-  }
-}
-
-/* ------------------------------------------------------------------ */
-
-/**
- * @typedef {{ time: number, notes: Array<{ x: number, y: number, id: string }> }} ChordGroup
+ * @typedef {import('./chordGroups.js').ChordGroup} ChordGroup
  */
 
 /**
