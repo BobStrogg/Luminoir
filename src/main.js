@@ -1,6 +1,7 @@
 import { LuminoirApp } from './LuminoirApp.js';
 import { initControls } from './ui/Controls.js';
 import { SettingsPanel } from './ui/SettingsPanel.js';
+import { SceneConfig } from './rendering/SceneConfig.js';
 
 /**
  * Entry point — bootstraps the Luminoir WebGPU app.
@@ -11,6 +12,32 @@ async function main() {
   const setStatus = (msg) => {
     if (loadingText) loadingText.textContent = msg;
   };
+
+  // Honour `?shadow=0` early so both the UI and the worker init see
+  // the same value.  `SettingsPanel` is constructed next, so the
+  // initial checkbox state matches before any scene is built.
+  const urlParams = new URLSearchParams(window.location.search);
+  SceneConfig.shadow.enabled = urlParams.get('shadow') !== '0';
+
+  const rawDtSmooth = urlParams.get('dtSmooth');
+  SceneConfig.dtSmoothAlpha = rawDtSmooth !== null
+    ? Math.max(0, Math.min(1, parseFloat(rawDtSmooth)))
+    : SceneConfig.dtSmoothAlpha;
+  if (Number.isNaN(SceneConfig.dtSmoothAlpha)) SceneConfig.dtSmoothAlpha = 0.2;
+
+  SceneConfig.smartCamera.enabled = urlParams.get('smartCamera') !== '0';
+
+  const rawLookAhead = urlParams.get('lookAhead');
+  if (rawLookAhead !== null) {
+    const v = parseFloat(rawLookAhead);
+    if (!Number.isNaN(v)) SceneConfig.camera.lookAheadSeconds = Math.max(0, v);
+  }
+
+  const rawSmoothTime = urlParams.get('smoothTime');
+  if (rawSmoothTime !== null) {
+    const v = parseFloat(rawSmoothTime);
+    if (!Number.isNaN(v)) SceneConfig.camera.smoothTime = Math.max(0.01, v);
+  }
 
   // Construct SettingsPanel BEFORE LuminoirApp.  The constructor
   // synchronously hydrates `SceneConfig` from localStorage so the
