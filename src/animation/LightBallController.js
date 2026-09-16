@@ -1,9 +1,9 @@
 import * as THREE from 'three';
 import { SceneConfig } from '../rendering/SceneConfig.js';
-import { Materials } from '../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
 import { assignStaffColorIndices } from './staffColors.js';
 import { centerOf, buildChordGroups } from './chordGroups.js';
+import { LightBall } from './LightBall.js';
 
 /**
  * Animated light balls that bounce from note to note.
@@ -247,10 +247,6 @@ export class LightBallController {
   update(dt, camera = null) {
     if (!this._isPlaying) return;
 
-    const bounceHeight = SceneConfig.lightBall.bounceHeight;
-    const pulseDuration = SceneConfig.lightBall.pulseDuration;
-    const pulseScale = SceneConfig.lightBall.pulseScale;
-
     // Scratch vector reused for camera-distance computations.
     const camPos = camera ? camera.position : null;
 
@@ -262,43 +258,16 @@ export class LightBallController {
     }
 
     for (const [staff, data] of this._staffData) {
-      const { chordGroups, balls, lightIdx } = data;
+      const { chordGroups } = data;
       if (chordGroups.length === 0) continue;
 
-      // Find the latest chord group whose start time is <= current time.
-      // Incremental cursor walk — O(Δ) instead of a full O(n) scan per
-      // staff per frame.  Handles forward playback (advance), scrubbing
-      // backward / transport reset (rewind), and seeking (multi-step in
-      // either direction).
-      let prevIdx = this._groupCursor.get(staff) ?? 0;
-      if (prevIdx >= chordGroups.length) prevIdx = chordGroups.length - 1;
-      while (prevIdx + 1 < chordGroups.length
-        && chordGroups[prevIdx + 1].time <= this._currentTime) prevIdx++;
-      while (prevIdx > 0 && chordGroups[prevIdx].time > this._currentTime) prevIdx--;
-      this._groupCursor.set(staff, prevIdx);
+      const prevIdx = this._advanceCursor(staff, chordGroups);
       const nextIdx = Math.min(prevIdx + 1, chordGroups.length - 1);
 
       const prev = chordGroups[prevIdx];
       const next = chordGroups[nextIdx];
 
-      // Detect a "note hit": ball has just arrived at a new chord.
-      // Fire a pulse that decays over `pulseDuration`.
-      const lastIdx = this._lastVisitedIdx.get(staff);
-      if (lastIdx !== prevIdx) {
-        this._lastVisitedIdx.set(staff, prevIdx);
-        this._hitTime.set(staff, this._currentTime);
-        // Notify subscribers (currently just the smart camera) once
-        // playback has actually started.  Pre-play the
-        // `_lastVisitedIdx` map fills in as the timeline initialises
-        // and we'd otherwise fire spurious hits at score load.
-        if (this._isPlaying && this.onBeatGroupHit && lastIdx !== undefined) {
-          this.onBeatGroupHit(staff, prev.notes.length);
-        }
-      }
-      const sinceHit = this._currentTime - (this._hitTime.get(staff) ?? -Infinity);
-      const pulse = sinceHit < pulseDuration
-        ? 1 + (pulseScale - 1) * Math.pow(1 - sinceHit / pulseDuration, 2)
-        : 1;
+      const pulse = this._detectHit(staff, prevIdx, prev);
 
       // Continuous time-based progress: `progress = (t - start) / span`.
       // The ball is always moving — what makes each note feel "landed" is the
@@ -313,130 +282,185 @@ export class LightBallController {
       // Parabolic bounce: peaks at t=0.5, touches down at t=0 and t=1.
       const bounceAmt = 4 * t * (1 - t);
 
-      const prevCount = prev.notes.length;
-      const nextCount = next.notes.length;
-      const activeCount = Math.max(prevCount, nextCount);
-      const toNext = prev.toNext; // pre-computed nearest-neighbour map
+      this._updateStaffBalls(data, prev, next, t, s, bounceAmt, pulse, camPos, poolAccum);
+    }
 
-      for (let i = 0; i < balls.length; i++) {
-        if (i >= activeCount) {
-          balls[i].setVisible(false);
-          continue;
+    this._commitPoolLights(poolAccum);
+  }
+
+  /**
+   * Find the latest chord group whose start time is <= current time.
+   * Incremental cursor walk — O(Δ) instead of a full O(n) scan per
+   * staff per frame.  Handles forward playback (advance), scrubbing
+   * backward / transport reset (rewind), and seeking (multi-step in
+   * either direction).  Returns the current group's index.
+   */
+  _advanceCursor(staff, chordGroups) {
+    let prevIdx = this._groupCursor.get(staff) ?? 0;
+    if (prevIdx >= chordGroups.length) prevIdx = chordGroups.length - 1;
+    while (prevIdx + 1 < chordGroups.length
+      && chordGroups[prevIdx + 1].time <= this._currentTime) prevIdx++;
+    while (prevIdx > 0 && chordGroups[prevIdx].time > this._currentTime) prevIdx--;
+    this._groupCursor.set(staff, prevIdx);
+    return prevIdx;
+  }
+
+  /**
+   * Detect a "note hit": ball has just arrived at a new chord.
+   * Returns the pulse multiplier, which decays over `pulseDuration`.
+   */
+  _detectHit(staff, prevIdx, prev) {
+    const pulseDuration = SceneConfig.lightBall.pulseDuration;
+    const pulseScale = SceneConfig.lightBall.pulseScale;
+    const lastIdx = this._lastVisitedIdx.get(staff);
+    if (lastIdx !== prevIdx) {
+      this._lastVisitedIdx.set(staff, prevIdx);
+      this._hitTime.set(staff, this._currentTime);
+      // Notify subscribers (currently just the smart camera) once
+      // playback has actually started.  Pre-play the
+      // `_lastVisitedIdx` map fills in as the timeline initialises
+      // and we'd otherwise fire spurious hits at score load.
+      if (this._isPlaying && this.onBeatGroupHit && lastIdx !== undefined) {
+        this.onBeatGroupHit(staff, prev.notes.length);
+      }
+    }
+    const sinceHit = this._currentTime - (this._hitTime.get(staff) ?? -Infinity);
+    return sinceHit < pulseDuration
+      ? 1 + (pulseScale - 1) * Math.pow(1 - sinceHit / pulseDuration, 2)
+      : 1;
+  }
+
+  /**
+   * Position, scale and light every ball of one staff for the
+   * current chord transition `prev → next`.
+   */
+  _updateStaffBalls(data, prev, next, t, s, bounceAmt, pulse, camPos, poolAccum) {
+    const { balls, lightIdx } = data;
+    const bounce = bounceAmt * SceneConfig.lightBall.bounceHeight;
+    const prevCount = prev.notes.length;
+    const nextCount = next.notes.length;
+    const activeCount = Math.max(prevCount, nextCount);
+    const toNext = prev.toNext; // pre-computed nearest-neighbour map
+
+    for (let i = 0; i < balls.length; i++) {
+      if (i >= activeCount) {
+        balls[i].setVisible(false);
+        continue;
+      }
+
+      // Source position: use this ball's note if it exists, otherwise
+      // start from the centre of the previous chord (split effect).
+      let srcX, srcY;
+      if (i < prevCount) {
+        srcX = prev.notes[i].x;
+        srcY = prev.notes[i].y;
+      } else {
+        const c = centerOf(prev.notes);
+        srcX = c.x;
+        srcY = c.y;
+      }
+
+      // Target position: use the matched note in the next group.
+      // Falls back to the centre when merging.
+      let dstX, dstY;
+      const j = toNext ? toNext[i] : i;
+      if (j != null && j < nextCount) {
+        dstX = next.notes[j].x;
+        dstY = next.notes[j].y;
+      } else {
+        const c = centerOf(next.notes);
+        dstX = c.x;
+        dstY = c.y;
+      }
+
+      // Position interpolation with eased progress (smooth start/stop).
+      const x = srcX + (dstX - srcX) * s;
+      const yBase = srcY + (dstY - srcY) * s;
+      const y = yBase + bounce;
+      const z = SceneConfig.lightBall.restZ + bounce * 0.3;
+
+      // Split / merge scale shaping.
+      let scaleFactor = 1.0;
+      if (i >= prevCount) {
+        scaleFactor = s;            // splitting off — grow in
+      } else if (j == null || j >= nextCount) {
+        scaleFactor = 1 - s;        // merging — shrink out
+      }
+
+      const visible = scaleFactor > 0.01;
+      balls[i].setVisible(visible);
+      if (visible) {
+        balls[i].setPosition(x, y, z);
+        balls[i].setScale(scaleFactor * pulse);
+        balls[i].setIntensity((0.7 + bounceAmt * 0.6) * pulse);
+
+        // Modulate the per-ball glow sprite so every staff has a
+        // visible halo at any zoom.  With perspective attenuation
+        // on, the sprite naturally shrinks 1/d with distance — to
+        // keep its apparent screen size roughly constant we scale
+        // the world-space size linearly with `d` (`mod = d × k`),
+        // so the two factors cancel out.  The minimum clamp keeps
+        // the halo from becoming sub-radius at very close zooms.
+        //
+        // Why this matters in practice: orchestral scores like
+        // Sylvia Suite need the camera to back off to ≈30 world
+        // units so all 27 staves fit in frame, and at that
+        // distance the previous `sqrt(d/2)` formula produced
+        // halos only ≈4 px across — small enough that the user
+        // reads them as "missing" on most staves.  A linear scale
+        // keeps the halo at a stable ≈14 px regardless of how
+        // far the camera has pulled back, so every staff's ball
+        // glows visibly even on the largest scores.
+        //
+        // Performance: glow sprites are screen-aligned quads
+        // rendered with additive blending and a tiny 128² texture;
+        // 30+ of them per frame is well under a millisecond on any
+        // GPU we care about, so we don't need a hard cutoff to
+        // skip them at extreme distances.  (The previous
+        // `glowFarDistance = 80` cutoff was a hack to avoid
+        // drawing sub-pixel sprites that didn't make a visible
+        // difference, but it also clipped the glow on legitimate
+        // wide-shot views and is no longer applied.)
+        if (camPos) {
+          const dx = camPos.x - x;
+          const dy = camPos.y - y;
+          const dz = camPos.z - z;
+          const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          // `0.15` keeps the apparent screen size of the halo
+          // roughly constant (≈10 px) across the full viewing-
+          // distance range (Dream-style 2..12 close-up,
+          // Sylvia-style 30 wide-shot).  The clamp at 0.25 keeps
+          // a usable minimum at extreme close-ups so the halo
+          // doesn't disappear entirely when the user mashes the
+          // mouse-wheel zoom.  The opacity side of `glowMod`
+          // (set in `_applyVisuals`) effectively dims the halo
+          // at close-ups and ramps it to full strength at wide
+          // shots, which combined with the texture's intrinsic
+          // alpha (0.18 / 0.05) gives the user's preferred
+          // "subtle close-up, visible on every Sylvia ball"
+          // balance.
+          const mod = Math.max(0.25, d * 0.15);
+          balls[i].setGlowMod(mod);
         }
 
-        // Source position: use this ball's note if it exists, otherwise
-        // start from the centre of the previous chord (split effect).
-        let srcX, srcY;
-        if (i < prevCount) {
-          srcX = prev.notes[i].x;
-          srcY = prev.notes[i].y;
-        } else {
-          const c = centerOf(prev.notes);
-          srcX = c.x;
-          srcY = c.y;
-        }
-
-        // Target position: use the matched note in the next group.
-        // Falls back to the centre when merging.
-        let dstX, dstY;
-        const j = toNext ? toNext[i] : i;
-        if (j != null && j < nextCount) {
-          dstX = next.notes[j].x;
-          dstY = next.notes[j].y;
-        } else {
-          const c = centerOf(next.notes);
-          dstX = c.x;
-          dstY = c.y;
-        }
-
-        // Position interpolation with eased progress (smooth start/stop).
-        const x = srcX + (dstX - srcX) * s;
-        const yBase = srcY + (dstY - srcY) * s;
-        const bounce = bounceAmt * bounceHeight;
-        const y = yBase + bounce;
-        const z = SceneConfig.lightBall.restZ + bounce * 0.3;
-
-        // Split / merge scale shaping.
-        let scaleFactor = 1.0;
-        if (i >= prevCount) {
-          scaleFactor = s;            // splitting off — grow in
-        } else if (j == null || j >= nextCount) {
-          scaleFactor = 1 - s;        // merging — shrink out
-        }
-
-        const visible = scaleFactor > 0.01;
-        balls[i].setVisible(visible);
-        if (visible) {
-          balls[i].setPosition(x, y, z);
-          balls[i].setScale(scaleFactor * pulse);
-          balls[i].setIntensity((0.7 + bounceAmt * 0.6) * pulse);
-
-          // Modulate the per-ball glow sprite so every staff has a
-          // visible halo at any zoom.  With perspective attenuation
-          // on, the sprite naturally shrinks 1/d with distance — to
-          // keep its apparent screen size roughly constant we scale
-          // the world-space size linearly with `d` (`mod = d × k`),
-          // so the two factors cancel out.  The minimum clamp keeps
-          // the halo from becoming sub-radius at very close zooms.
-          //
-          // Why this matters in practice: orchestral scores like
-          // Sylvia Suite need the camera to back off to ≈30 world
-          // units so all 27 staves fit in frame, and at that
-          // distance the previous `sqrt(d/2)` formula produced
-          // halos only ≈4 px across — small enough that the user
-          // reads them as "missing" on most staves.  A linear scale
-          // keeps the halo at a stable ≈14 px regardless of how
-          // far the camera has pulled back, so every staff's ball
-          // glows visibly even on the largest scores.
-          //
-          // Performance: glow sprites are screen-aligned quads
-          // rendered with additive blending and a tiny 128² texture;
-          // 30+ of them per frame is well under a millisecond on any
-          // GPU we care about, so we don't need a hard cutoff to
-          // skip them at extreme distances.  (The previous
-          // `glowFarDistance = 80` cutoff was a hack to avoid
-          // drawing sub-pixel sprites that didn't make a visible
-          // difference, but it also clipped the glow on legitimate
-          // wide-shot views and is no longer applied.)
-          if (camPos) {
-            const dx = camPos.x - x;
-            const dy = camPos.y - y;
-            const dz = camPos.z - z;
-            const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            // `0.15` keeps the apparent screen size of the halo
-            // roughly constant (≈10 px) across the full viewing-
-            // distance range (Dream-style 2..12 close-up,
-            // Sylvia-style 30 wide-shot).  The clamp at 0.25 keeps
-            // a usable minimum at extreme close-ups so the halo
-            // doesn't disappear entirely when the user mashes the
-            // mouse-wheel zoom.  The opacity side of `glowMod`
-            // (set in `_applyVisuals`) effectively dims the halo
-            // at close-ups and ramps it to full strength at wide
-            // shots, which combined with the texture's intrinsic
-            // alpha (0.18 / 0.05) gives the user's preferred
-            // "subtle close-up, visible on every Sylvia ball"
-            // balance.
-            const mod = Math.max(0.25, d * 0.15);
-            balls[i].setGlowMod(mod);
-          }
-
-          // Contribute to the pooled light assigned to this staff.
-          // Pool lights follow the centroid of every visible ball from
-          // every staff they serve, which gives reasonable coverage
-          // even when one light represents multiple staves.
-          if (lightIdx >= 0) {
-            const acc = poolAccum[lightIdx];
-            acc.x += x;
-            acc.y += y;
-            acc.z += z;
-            acc.n += 1;
-            if (pulse > acc.pulse) acc.pulse = pulse;
-          }
+        // Contribute to the pooled light assigned to this staff.
+        // Pool lights follow the centroid of every visible ball from
+        // every staff they serve, which gives reasonable coverage
+        // even when one light represents multiple staves.
+        if (lightIdx >= 0) {
+          const acc = poolAccum[lightIdx];
+          acc.x += x;
+          acc.y += y;
+          acc.z += z;
+          acc.n += 1;
+          if (pulse > acc.pulse) acc.pulse = pulse;
         }
       }
     }
+  }
 
-    // Commit pooled-light positions & intensities for this frame.
+  /** Commit pooled-light positions & intensities for this frame. */
+  _commitPoolLights(poolAccum) {
     for (let i = 0; i < this._lightPool.length; i++) {
       const light = this._lightPool[i];
       const acc = poolAccum[i];
@@ -474,151 +498,3 @@ export class LightBallController {
 /**
  * @typedef {import('./chordGroups.js').ChordGroup} ChordGroup
  */
-
-/**
- * A single light ball: sphere mesh + point light + glow sprite.
- */
-class LightBall {
-  position = new THREE.Vector3();
-  _scale = 1;
-  _intensity = 1;
-  _glowMod = 1;
-
-  constructor(scene, color, key) {
-    this._scene = scene;
-    this._color = color;
-
-    const cfg = SceneConfig.lightBall;
-
-    // Sphere mesh
-    const geo = new THREE.SphereGeometry(cfg.radius, 16, 12);
-    this._mesh = new THREE.Mesh(geo, Materials.lightBall(color));
-    this._mesh.name = `lightBall_${key}`;
-    scene.add(this._mesh);
-
-    // Per-ball PointLight — skipped when `SHARED_STAFF_LIGHTS` is on
-    // (the controller creates one shared light per staff instead).
-    // Every point light adds a per-fragment loop iteration in the lit
-    // material shader, so on a many-staff score the savings from
-    // going from "one light per ball" to "one light per staff" are
-    // substantial (Sylvia Suite: 39 lights → ~20).  Initial
-    // intensity is zero so a newly-created hidden ball doesn't
-    // flood the scene with stray lighting when this path is in use.
-    if (!OPTIMIZATIONS.SHARED_STAFF_LIGHTS) {
-      this._light = new THREE.PointLight(
-        new THREE.Color(color.r, color.g, color.b),
-        0,
-        4, // distance
-        1.5, // decay
-      );
-      scene.add(this._light);
-    } else {
-      this._light = null;
-    }
-
-    // Glow sprite
-    this._glow = new THREE.Sprite(Materials.lightBallGlow(color));
-    this._glow.scale.setScalar(cfg.radius * cfg.glowRadiusMultiplier * 2);
-    scene.add(this._glow);
-  }
-
-  setPosition(x, y, z) {
-    this.position.set(x, y, z);
-    this._mesh.position.copy(this.position);
-    if (this._light) this._light.position.copy(this.position);
-    this._glow.position.copy(this.position);
-  }
-
-  setIntensity(factor) {
-    this._intensity = factor;
-    this._applyVisuals();
-  }
-
-  setScale(factor) {
-    this._scale = factor;
-    this._applyVisuals();
-  }
-
-  /**
-   * Multiplier on the glow sprite's size & opacity applied after
-   * scale/intensity.  Controller sets this from camera distance so
-   * distant-view glows can fade out without touching the sphere mesh.
-   */
-  setGlowMod(mod) {
-    this._glowMod = mod;
-    // Very small mod = effectively off — skip the draw call entirely
-    // so 30+ invisible sprites don't pay per-frame overhead on a big
-    // wide shot where every glow is faded.
-    const show = this._mesh.visible && mod > 0.02;
-    this._glow.visible = show;
-    if (show) this._applyVisuals();
-  }
-
-  setVisible(visible) {
-    // Toggle the mesh and glow sprite, but *not* the point light's
-    // `.visible` flag.
-    //
-    // Three.js's WebGPU pipeline cache key includes a hash of the
-    // scene's light list — when a light toggles `visible`, the
-    // `lightsNode` cache key changes, which invalidates every mesh's
-    // render object *and forces a pipeline recompile*.  On a
-    // moderately complex score that means a mid-playback stall every
-    // time a chord grows and a new ball's light flips on, which the
-    // user sees as the camera pausing right on each note landing.
-    //
-    // Instead we keep the light permanently in the scene graph and
-    // drive its contribution via `intensity`: zero when "hidden",
-    // the usual `_applyVisuals()`-derived value when "visible".  The
-    // lightsNode hash stays stable, no pipelines recompile.
-    this._mesh.visible = visible;
-    // Glow sprite respects the camera-distance mod set by the
-    // controller — don't re-enable it here if the mod has faded it
-    // to zero.
-    this._glow.visible = visible && this._glowMod > 0.02;
-    if (visible) {
-      this._applyVisuals();
-    } else if (this._light) {
-      this._light.intensity = 0;
-    }
-  }
-
-  /** Combine scale and intensity into final visual state. */
-  _applyVisuals() {
-    const s = Math.max(0.001, this._scale);
-    const f = this._intensity;
-    const cfg = SceneConfig.lightBall;
-
-    this._mesh.scale.setScalar(s);
-    if (this._light) this._light.intensity = cfg.intensity * f * s;
-    // Self-emissive on the ball sphere.  Halved again from
-    // `0.35 + f * 0.2` to match the lower `lightBall.intensity`
-    // and dimmer glow halo — the ball still reads as bright
-    // because it's pure-white-on-cream, but it no longer dominates
-    // the played notehead's HDR glow underneath it.
-    this._mesh.material.emissiveIntensity = (0.175 + f * 0.1) * s;
-
-    const baseGlow = cfg.radius * cfg.glowRadiusMultiplier * 2;
-    const glowMod = this._glowMod ?? 1;
-    this._glow.scale.setScalar(baseGlow * (0.8 + f * 0.4) * s * glowMod);
-    // Fade the sprite alpha alongside the size so the edge of the
-    // fade-out doesn't pop when the mesh's draw call flips off.
-    this._glow.material.opacity = glowMod;
-  }
-
-  reset() {
-    this.setPosition(0, 0, 0);
-    this._scale = 1;
-    this._intensity = 1;
-    this._applyVisuals();
-  }
-
-  dispose() {
-    this._scene.remove(this._mesh);
-    if (this._light) this._scene.remove(this._light);
-    this._scene.remove(this._glow);
-    this._mesh.geometry.dispose();
-    this._mesh.material.dispose();
-    if (this._glow.material.map) this._glow.material.map.dispose();
-    this._glow.material.dispose();
-  }
-}

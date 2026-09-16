@@ -1,5 +1,46 @@
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { pathBBox } from './svgPathBounds.js';
+import {
+  getTranslate,
+  getAncestorTranslate,
+  getAncestorRotation,
+  parseLineEndpoints,
+  getChildPathD,
+} from './svgTransforms.js';
+import {
+  polygonToLineOrPath,
+  polylineToPath,
+  ellipseToPath,
+  rectToPath,
+} from './svgPrimitives.js';
+import { computeBounds, computeStaffBounds } from './sceneBounds.js';
+
+/**
+ * Classified groups that WRAP real notes — the walker must still
+ * descend into them (e.g. beamed eighth notes inside
+ * `<g class="beam">`).  All other known classes are pure glyphs and
+ * terminate the walk.
+ */
+const CONTAINER_CLASSES = new Set(['beam', 'tuplet']);
+
+/**
+ * Verovio class names the walker recognises.  The bottom-row classes
+ * are ones Verovio emits for non-notehead notation (augmentation
+ * dots, sustain-pedal markers, dynamic hairpins, fermatas,
+ * multi-measure rests, arpeggios, system braces, ottava-spans,
+ * tuplet brackets/numbers).  Without explicit handling they fell
+ * through to the generic recursion step and their underlying
+ * `<ellipse>` / `<rect>` / `<polyline>` / `<use>` / `<path>` nodes
+ * were silently dropped — visible as missing dotted-quarter dots,
+ * missing 8va lines, missing pedal brackets, etc.  See
+ * `_collectGlyphs` for the per-shape extraction.
+ */
+const KNOWN_CLASSES = [
+  'clef', 'meterSig', 'keySig', 'beam', 'tie', 'slur',
+  'stem', 'flag', 'tuplet', 'accid', 'artic', 'dynam', 'dir',
+  'dots', 'pedal', 'hairpin', 'fermata', 'mRest', 'arpeg',
+  'grpSym', 'octave', 'tupletBracket', 'tupletNum',
+];
 
 /**
  * Parses Verovio SVG output into structured scene data for 3D
@@ -87,8 +128,8 @@ export class SVGSceneParser {
     notes.sort((a, b) => a.x - b.x);
 
     // Compute content bounding box from all parsed elements
-    const bounds = this._computeBounds(out);
-    const staffBounds = this._computeStaffBounds(out);
+    const bounds = computeBounds(out);
+    const staffBounds = computeStaffBounds(out);
 
     // IMPORTANT: do not leak DOM nodes (the original `defs` map and
     // `svgDoc` document) into the return value — this object is
@@ -103,8 +144,8 @@ export class SVGSceneParser {
       otherElements,
       // Exact content bounding box — do not add padding here.  Any
       // padding around the score belongs in the renderer (see
-      // `SVG3DBuilder._addPaper`'s `margin`); doing it here once
-      // led to asymmetric paper padding because `_addPaper` derives
+      // `addPaper`'s `margin` in PaperAndTitle.js); doing it here once
+      // led to asymmetric paper padding because `addPaper` derives
       // the paper centre from `(contentMinY + totalHeight / 2)`,
       // and a pre-padded `totalHeight` shifts that midpoint away
       // from the score's actual centre.
@@ -200,38 +241,13 @@ export class SVGSceneParser {
     // --- Measure group: every child is associated with this measure
     //     (used by the repeat-unroller to identify duplicable units).
     if (classList.includes('measure')) {
-      const startLens = {
-        notes: out.notes.length,
-        staffLines: out.staffLines.length,
-        barLines: out.barLines.length,
-        otherElements: out.otherElements.length,
-      };
-      for (const child of node.children) {
-        await this._walkTree(child, defs, out, scale, staffMap);
-      }
-      // Stamp `measure: id` on everything pushed while inside this
-      // measure.  Empty-string id (rare) is skipped — the unroller
-      // ignores entries without a measure tag, treating them as
-      // page-level decoration that shouldn't be duplicated.
-      if (id) {
-        for (let i = startLens.notes; i < out.notes.length; i++) out.notes[i].measure = id;
-        for (let i = startLens.staffLines; i < out.staffLines.length; i++) out.staffLines[i].measure = id;
-        for (let i = startLens.barLines; i < out.barLines.length; i++) out.barLines[i].measure = id;
-        for (let i = startLens.otherElements; i < out.otherElements.length; i++) out.otherElements[i].measure = id;
-      }
-      return;
+      return await this._walkMeasure(node, id, defs, out, scale, staffMap);
     }
 
     // --- Staff group: collect bare <path> children as staff lines,
     //     then recurse into child <g> elements ---
     if (classList.includes('staff') && !classList.includes('staffDef')) {
-      this._collectStaffLinePaths(node, out.staffLines, scale);
-      for (const child of node.children) {
-        if (child.nodeType === 1 && child.tagName === 'g') {
-          await this._walkTree(child, defs, out, scale, staffMap);
-        }
-      }
-      return;
+      return await this._walkStaff(node, defs, out, scale, staffMap);
     }
 
     // --- Ledger lines ---
@@ -246,29 +262,12 @@ export class SVGSceneParser {
       return;
     }
 
-    // --- Notes ---
+    // --- Notes & rests ---
     if (classList.includes('note')) {
-      const noteData = this._extractNote(node, defs, id, scale, staffMap);
-      if (noteData) out.notes.push(noteData);
-      // Continue recursing to collect stems, flags, etc. inside the note group
-      for (const child of node.children) {
-        await this._walkTree(child, defs, out, scale, staffMap);
-      }
-      return;
+      return await this._walkNoteOrRest(node, id, false, defs, out, scale, staffMap);
     }
-
-    // --- Rests ---
     if (classList.includes('rest')) {
-      const noteData = this._extractNote(node, defs, id, scale, staffMap);
-      if (noteData) {
-        noteData.isRest = true;
-        out.notes.push(noteData);
-      }
-      // Recurse for child elements
-      for (const child of node.children) {
-        await this._walkTree(child, defs, out, scale, staffMap);
-      }
-      return;
+      return await this._walkNoteOrRest(node, id, true, defs, out, scale, staffMap);
     }
 
     // --- Bar lines ---
@@ -280,28 +279,12 @@ export class SVGSceneParser {
     // --- Other classified elements ---
     // Some of these (beam, tuplet) are *containers* — they wrap real notes
     // that we still need to descend into.  Others (clef, meterSig, …) are
-    // pure glyphs and can terminate the walk.
-    //
-    // The bottom row classes are ones Verovio emits for non-notehead
-    // notation (augmentation dots, sustain-pedal markers, dynamic
-    // hairpins, fermatas, multi-measure rests, arpeggios, system
-    // braces, ottava-spans, tuplet brackets/numbers).  Without
-    // explicit handling they fell through to the generic recursion
-    // step and their underlying `<ellipse>` / `<rect>` / `<polyline>`
-    // / `<use>` / `<path>` nodes were silently dropped — visible as
-    // missing dotted-quarter dots, missing 8va lines, missing pedal
-    // brackets, etc.  See `_collectGlyphs` for the per-shape extraction.
-    const containerClasses = new Set(['beam', 'tuplet']);
-    const knownClasses = [
-      'clef', 'meterSig', 'keySig', 'beam', 'tie', 'slur',
-      'stem', 'flag', 'tuplet', 'accid', 'artic', 'dynam', 'dir',
-      'dots', 'pedal', 'hairpin', 'fermata', 'mRest', 'arpeg',
-      'grpSym', 'octave', 'tupletBracket', 'tupletNum',
-    ];
-    for (const cls of knownClasses) {
+    // pure glyphs and can terminate the walk.  See KNOWN_CLASSES for the
+    // class list and its rationale.
+    for (const cls of KNOWN_CLASSES) {
       if (classList.includes(cls)) {
         this._collectGlyphs(node, defs, out.otherElements, cls, scale);
-        if (containerClasses.has(cls)) {
+        if (CONTAINER_CLASSES.has(cls)) {
           // Still walk into children so nested <g class="note"> groups
           // (e.g. beamed eighth notes) get picked up.
           for (const child of node.children) {
@@ -319,6 +302,61 @@ export class SVGSceneParser {
   }
 
   /**
+   * `<g class="measure">` — recurse into children, then stamp the
+   * measure id onto every entry pushed while inside it.
+   */
+  async _walkMeasure(node, id, defs, out, scale, staffMap) {
+    const startLens = {
+      notes: out.notes.length,
+      staffLines: out.staffLines.length,
+      barLines: out.barLines.length,
+      otherElements: out.otherElements.length,
+    };
+    for (const child of node.children) {
+      await this._walkTree(child, defs, out, scale, staffMap);
+    }
+    // Stamp `measure: id` on everything pushed while inside this
+    // measure.  Empty-string id (rare) is skipped — the unroller
+    // ignores entries without a measure tag, treating them as
+    // page-level decoration that shouldn't be duplicated.
+    if (id) {
+      for (let i = startLens.notes; i < out.notes.length; i++) out.notes[i].measure = id;
+      for (let i = startLens.staffLines; i < out.staffLines.length; i++) out.staffLines[i].measure = id;
+      for (let i = startLens.barLines; i < out.barLines.length; i++) out.barLines[i].measure = id;
+      for (let i = startLens.otherElements; i < out.otherElements.length; i++) out.otherElements[i].measure = id;
+    }
+  }
+
+  /**
+   * `<g class="staff">` — collect bare <path> children as staff
+   * lines, then recurse into child <g> elements.
+   */
+  async _walkStaff(node, defs, out, scale, staffMap) {
+    this._collectStaffLinePaths(node, out.staffLines, scale);
+    for (const child of node.children) {
+      if (child.nodeType === 1 && child.tagName === 'g') {
+        await this._walkTree(child, defs, out, scale, staffMap);
+      }
+    }
+  }
+
+  /**
+   * `<g class="note">` / `<g class="rest">` — extract the note entry,
+   * then continue recursing to collect stems, flags, etc. inside the
+   * note group.
+   */
+  async _walkNoteOrRest(node, id, isRest, defs, out, scale, staffMap) {
+    const noteData = this._extractNote(node, defs, id, scale, staffMap);
+    if (noteData) {
+      if (isRest) noteData.isRest = true;
+      out.notes.push(noteData);
+    }
+    for (const child of node.children) {
+      await this._walkTree(child, defs, out, scale, staffMap);
+    }
+  }
+
+  /**
    * Collect bare <path> children of a staff or ledgerLines group as staff lines.
    */
   _collectStaffLinePaths(container, outArray, scale) {
@@ -326,9 +364,9 @@ export class SVGSceneParser {
       if (child.tagName !== 'path') continue;
       const d = child.getAttribute('d');
       if (!d) continue;
-      const endpoints = this._parseLineEndpoints(d);
+      const endpoints = parseLineEndpoints(d);
       if (endpoints) {
-        const tx = this._getAncestorTranslate(container);
+        const tx = getAncestorTranslate(container);
         outArray.push({
           type: 'staffLine',
           isLine: true,
@@ -342,17 +380,6 @@ export class SVGSceneParser {
         outArray.push({ type: 'staffLine', d, ...pos });
       }
     }
-  }
-
-  _parseLineEndpoints(d) {
-    const m = d.match(/^M\s*([-\d.]+)[\s,]+([-\d.]+)\s*L\s*([-\d.]+)[\s,]+([-\d.]+)/);
-    if (!m) return null;
-    return {
-      x1: parseFloat(m[1]),
-      y1: parseFloat(m[2]),
-      x2: parseFloat(m[3]),
-      y2: parseFloat(m[4]),
-    };
   }
 
   /**
@@ -369,7 +396,7 @@ export class SVGSceneParser {
       const defId = href.replace('#', '');
       const defEl = defs[defId];
       if (defEl) {
-        pathData = defEl.getAttribute('d') || this._getChildPathD(defEl);
+        pathData = defEl.getAttribute('d') || getChildPathD(defEl);
       }
     }
 
@@ -412,8 +439,9 @@ export class SVGSceneParser {
     // Ancestor translate of the note group (WITHOUT the <use> x/y offset).
     // Stem/flag paths inside a note group are expressed in the page-margin's
     // coordinate frame, not the note's local frame, so we need this to place
-    // them correctly in world space (see SVG3DBuilder._buildNote).
-    const ancestor = this._getAncestorTranslate(noteGroup);
+    // them correctly in world space (see the childPaths handling in
+    // SVG3DBuilder).
+    const ancestor = getAncestorTranslate(noteGroup);
 
     // Glyph path `<use>` x/y places the path's local (0, 0) — which is the
     // *left edge* of a SMuFL notehead, not its visual centre.  For light
@@ -479,7 +507,7 @@ export class SVGSceneParser {
     // (in the 5.x case) the `<use>`-local translate.
     let el = useEl || groupEl;
     while (el && el.tagName !== 'svg') {
-      const tx = this._getTranslate(el);
+      const tx = getTranslate(el);
       x += tx.x;
       y += tx.y;
       el = el.parentElement;
@@ -498,64 +526,6 @@ export class SVGSceneParser {
     };
   }
 
-  _getTranslate(el) {
-    const t = el.getAttribute('transform') || '';
-    const match = t.match(/translate\(\s*([-\d.]+)[\s,]+([-\d.]+)\s*\)/);
-    if (match) return { x: parseFloat(match[1]), y: parseFloat(match[2]) };
-    return { x: 0, y: 0 };
-  }
-
-  /**
-   * Sum every `rotate(...)` transform on the ancestor chain from `el`
-   * up to the `<svg>` root, returning the total rotation angle that
-   * should be baked into the rendered glyph.
-   *
-   * Verovio uses `<g class="arpeg" transform="rotate(-90 cx,cy)">`
-   * to flip the otherwise-horizontal arpeggio symbol vertical, with
-   * the pivot point coinciding with the inner `<use>`'s
-   * `translate(cx, cy)`.  Without this, every arpeggio came out
-   * lying flat across the staff instead of standing upright next
-   * to its chord — visible on Perfect (3 arpeg groups) and Jupiter
-   * (31 arpeg groups).
-   *
-   * **Conversion**: SVG rotate is expressed in degrees, with positive
-   * angles going counterclockwise mathematically (which is clockwise
-   * visually because SVG's Y axis points down).  The 3D builder Y-
-   * flips the extruded geometry to undo that convention, so a
-   * world-space rotation that *visually matches* the SVG rotate
-   * needs the opposite sign.  We return radians so the caller can
-   * pass it straight to `Matrix4.makeRotationZ`.
-   *
-   * **Pivot**: this implementation only sums the rotation *angle*,
-   * not the pivot.  When rotate's pivot coincides with the rotated
-   * element's translate (the common case Verovio emits — see
-   * arpeggios above), no pivot correction is needed because rotating
-   * around a point that's already the element's local origin leaves
-   * the position unchanged.  For non-coincident pivots the
-   * positional offset is approximate; we can revisit if real-world
-   * scores hit that path.
-   */
-  _getAncestorRotation(el) {
-    let totalAngleRad = 0;
-    let cur = el;
-    while (cur && cur.tagName !== 'svg') {
-      const t = cur.getAttribute('transform') || '';
-      // `rotate(angle)` or `rotate(angle cx cy)`.  We capture only
-      // the angle here; pivot handling is documented above.
-      const re = /rotate\(\s*(-?\d*\.?\d+(?:[eE][+-]?\d+)?)/g;
-      let m;
-      while ((m = re.exec(t)) !== null) {
-        const deg = parseFloat(m[1]);
-        // Negate to convert SVG-Y-down rotation into world-local
-        // rotation (after the geometry's Y flip).  Result is in
-        // radians.
-        totalAngleRad += -deg * Math.PI / 180;
-      }
-      cur = cur.parentElement;
-    }
-    return totalAngleRad;
-  }
-
   _collectPaths(container, outArray, type, scale) {
     container.querySelectorAll('path').forEach((pathEl) => {
       const d = pathEl.getAttribute('d');
@@ -570,9 +540,9 @@ export class SVGSceneParser {
       // would return only the container's translate, which makes
       // every bar line in the score collapse to the same point and
       // breaks the score's vertical bbox calculation.
-      const endpoints = this._parseLineEndpoints(d);
+      const endpoints = parseLineEndpoints(d);
       if (endpoints) {
-        const tx = this._getAncestorTranslate(pathEl.parentElement || container);
+        const tx = getAncestorTranslate(pathEl.parentElement || container);
         outArray.push({
           type,
           isLine: true,
@@ -591,7 +561,7 @@ export class SVGSceneParser {
       const y1 = parseFloat(lineEl.getAttribute('y1') || '0');
       const x2 = parseFloat(lineEl.getAttribute('x2') || '0');
       const y2 = parseFloat(lineEl.getAttribute('y2') || '0');
-      const tx = this._getAncestorTranslate(lineEl);
+      const tx = getAncestorTranslate(lineEl);
       outArray.push({
         type,
         isLine: true,
@@ -603,41 +573,57 @@ export class SVGSceneParser {
     });
   }
 
+  /**
+   * True when `el`'s ancestor chain (up to `container`) passes
+   * through a `.note` or `.rest` group — used to skip nested-note
+   * primitives inside container classes like beam/tuplet.
+   */
+  _inNestedNoteOrRest(el, container) {
+    let p = el.parentElement;
+    while (p && p !== container) {
+      const cls = (p.getAttribute('class') || '').split(/\s+/);
+      if (cls.includes('note') || cls.includes('rest')) return true;
+      p = p.parentElement;
+    }
+    return false;
+  }
+
+  /**
+   * Dispatch a classified container's drawable children to the
+   * per-shape collectors.
+   *
+   * Container classes (beam, tuplet, …) WRAP nested <g class="note">
+   * groups rather than substituting for them.  The walker recurses
+   * into those notes separately, so the container's own
+   * `_collectGlyphs` must NOT re-collect the nested notehead glyphs
+   * or stem paths — otherwise every beamed notehead renders twice:
+   * once via `_extractNote` with the white-base notehead material at
+   * Z = noteElevation, and once via the beam's `_collectGlyphs`
+   * with the dark `_otherMat` at Z = 0.  On a cream paper the two
+   * overlapping disks at different Z levels read as "two noteheads
+   * stacked at different distances from the page" — exactly the
+   * artefact a user would first notice when they start paying
+   * attention to shadows.
+   *
+   * For those containers we walk `<use>` / `<path>` / `<polygon>`
+   * manually, rejecting any element whose ancestor chain (up to
+   * `container`) passes through a `.note` or `.rest` group.
+   */
   _collectGlyphs(container, defs, outArray, type, scale) {
-    // Container classes (beam, tuplet, …) WRAP nested <g class="note">
-    // groups rather than substituting for them.  The walker recurses
-    // into those notes separately, so the container's own
-    // `_collectGlyphs` must NOT re-collect the nested notehead glyphs
-    // or stem paths — otherwise every beamed notehead renders twice:
-    // once via `_extractNote` with the white-base notehead material at
-    // Z = noteElevation, and once via the beam's `_collectGlyphs`
-    // with the dark `_otherMat` at Z = 0.  On a cream paper the two
-    // overlapping disks at different Z levels read as "two noteheads
-    // stacked at different distances from the page" — exactly the
-    // artefact a user would first notice when they start paying
-    // attention to shadows.
-    //
-    // For those containers we walk `<use>` / `<path>` / `<polygon>`
-    // manually, rejecting any element whose ancestor chain (up to
-    // `container`) passes through a `.note` or `.rest` group.
-    const isContainer = type === 'beam' || type === 'tuplet';
+    const isContainer = CONTAINER_CLASSES.has(type);
+    this._collectUseGlyphs(container, defs, outArray, type, scale, isContainer);
+    this._collectPathGlyphs(container, outArray, type, scale, isContainer);
+    if (isContainer) this._collectPolygons(container, outArray, type, scale);
+    this._collectPrimitives(container, outArray, type, scale, isContainer);
+  }
 
-    const inNestedNoteOrRest = (el) => {
-      let p = el.parentElement;
-      while (p && p !== container) {
-        const cls = (p.getAttribute('class') || '').split(/\s+/);
-        if (cls.includes('note') || cls.includes('rest')) return true;
-        p = p.parentElement;
-      }
-      return false;
-    };
-
+  _collectUseGlyphs(container, defs, outArray, type, scale, isContainer) {
     container.querySelectorAll('use').forEach((useEl) => {
-      if (isContainer && inNestedNoteOrRest(useEl)) return;
+      if (isContainer && this._inNestedNoteOrRest(useEl, container)) return;
       const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href') || '';
       const defId = href.replace('#', '');
       const defEl = defs[defId];
-      const pathData = defEl ? (defEl.getAttribute('d') || this._getChildPathD(defEl)) : null;
+      const pathData = defEl ? (defEl.getAttribute('d') || getChildPathD(defEl)) : null;
       const pos = this._resolvePosition(container, useEl, scale);
       if (pos) {
         // Pick up any `rotate(...)` transforms on the ancestor chain
@@ -645,168 +631,94 @@ export class SVGSceneParser {
         // which flips the arpeggio symbol to vertical).  Skipped if
         // zero so unrotated glyphs don't pay the per-instance matrix
         // composition cost.
-        const rot = this._getAncestorRotation(useEl);
+        const rot = getAncestorRotation(useEl);
         const entry = { type, glyphPath: pathData, ...pos };
         if (rot !== 0) entry.rotation = rot;
         outArray.push(entry);
       }
     });
+  }
+
+  _collectPathGlyphs(container, outArray, type, scale, isContainer) {
     container.querySelectorAll(':scope > path, :scope > g > path').forEach((pathEl) => {
-      if (isContainer && inNestedNoteOrRest(pathEl)) return;
+      if (isContainer && this._inNestedNoteOrRest(pathEl, container)) return;
       const d = pathEl.getAttribute('d');
       if (!d) return;
       const pos = this._pathStartPosition(d, container, scale);
       outArray.push({ type, d, ...pos });
     });
-    // Beam bars are `<polygon>` in Verovio output.  Each one has a
-    // unique set of points (because coordinates differ per beam), so
-    // routing them through the glyph bucket would produce one plain
-    // `THREE.Mesh` per beam — hundreds of extra draw calls on scores
-    // like Sylvia Suite.  Instead, detect the 4-point rectangle /
-    // parallelogram case, compute a centre-line + thickness, and emit
-    // as an `isLine` entry so the builder can aggregate every beam in
-    // the piece into a single box-bucket `InstancedMesh`.
-    //
-    // Any polygon that isn't a 4-point shape falls back to a path-d
-    // string (correct but unshared); polygons are rare enough outside
-    // of beams that this edge-case cost is negligible.
-    if (isContainer) {
-      container.querySelectorAll(':scope > polygon').forEach((polyEl) => {
-        const points = polyEl.getAttribute('points');
-        if (!points) return;
-        const tokens = points.trim().split(/[\s,]+/).map(parseFloat).filter((n) => !isNaN(n));
-        if (tokens.length < 4) return;
-        const tx = this._getAncestorTranslate(polyEl);
-        if (tokens.length === 8) {
-          // Assume the 4 points are in order top-left, top-right,
-          // bottom-right, bottom-left (Verovio's convention for beam
-          // parallelograms).  Centre-line runs between the midpoint
-          // of the left edge and the midpoint of the right edge;
-          // thickness is the length of the left edge, so it still
-          // works for beams that slope.
-          const [x1r, y1r, x2r, y2r, x3r, y3r, x4r, y4r] = tokens;
-          const midLX = (x1r + x4r) / 2;
-          const midLY = (y1r + y4r) / 2;
-          const midRX = (x2r + x3r) / 2;
-          const midRY = (y2r + y3r) / 2;
-          const thick = Math.hypot(x1r - x4r, y1r - y4r) * scale;
-          outArray.push({
-            type,
-            isLine: true,
-            x1: (midLX + tx.rawX) * scale,
-            y1: -(midLY + tx.rawY) * scale,
-            x2: (midRX + tx.rawX) * scale,
-            y2: -(midRY + tx.rawY) * scale,
-            thickness: thick,
-          });
-          return;
-        }
-        // Fallback: emit as path-d so it still renders.
-        let d = 'M ' + tokens[0] + ' ' + tokens[1];
-        for (let i = 2; i < tokens.length; i += 2) {
-          d += ' L ' + tokens[i] + ' ' + tokens[i + 1];
-        }
-        d += ' Z';
-        const pos = this._pathStartPosition(d, container, scale);
-        outArray.push({ type, d, ...pos });
-      });
-    }
+  }
 
-    // ----------------------------------------------------------------
-    // Non-glyph primitives Verovio uses for misc. notation symbols.
-    //
-    // Augmentation dots (`<g class="dots"><ellipse cx cy rx ry/></g>`),
-    // sustain-pedal markers (`<rect>`), dynamic hairpins / ottava-line
-    // endcaps (`<polyline>`).  Each is converted to a path-d string and
-    // emitted as a `{type, d, x, y}` entry, which routes through the
-    // builder's `kind === 'path'` path (no 0.48 glyph-use scaling, Y
-    // flipped) — same treatment as bar-line and stem paths.
-    //
-    // **Performance note** (this is the reason for the awkward shape
-    // below): the path-d string is the bucket key in
-    // `SVG3DBuilder._bucketGlyph`, so every entry that shares an
-    // identical d-string folds into a single shared `ExtrudeGeometry`
-    // and `InstancedMesh` — even with hundreds of instances spread
-    // across the page.  We therefore emit *glyph-local* path data
-    // (anchored at (0, 0)) and use the absolute SVG coords for the
-    // entry's `x`/`y` placement, so e.g. all 460 of Perfect's pedal
-    // rects (which are visually identical 60×12 rectangles) collapse
-    // into one bucket → one InstancedMesh → one draw call, instead of
-    // 460 unique geometries / 460 draw calls (which dropped the
-    // worker frame rate by ~25 % when first added).
-    //
-    // The selector pattern matches the existing one for `<path>` to
-    // avoid recursing into nested note groups (which shouldn't ever
-    // happen for these classes, but keeps the extraction symmetrical).
-    // ----------------------------------------------------------------
+  _collectPolygons(container, outArray, type, scale) {
+    // Only reached for container classes (beam, tuplet) — see
+    // `svgPrimitives.js` for why beam polygons collapse to
+    // centre-line + thickness entries.
+    container.querySelectorAll(':scope > polygon').forEach((polyEl) => {
+      const tx = getAncestorTranslate(polyEl);
+      const entry = polygonToLineOrPath(
+        polyEl.getAttribute('points'), tx, scale,
+        this._pathStartPosition('', container, scale),
+      );
+      if (entry) outArray.push({ type, ...entry });
+    });
+  }
+
+  // ----------------------------------------------------------------
+  // Non-glyph primitives Verovio uses for misc. notation symbols.
+  //
+  // Augmentation dots (`<g class="dots"><ellipse cx cy rx ry/></g>`),
+  // sustain-pedal markers (`<rect>`), dynamic hairpins / ottava-line
+  // endcaps (`<polyline>`).  Each is converted to a path-d string and
+  // emitted as a `{type, d, x, y}` entry, which routes through the
+  // builder's `kind === 'path'` path (no 0.48 glyph-use scaling, Y
+  // flipped) — same treatment as bar-line and stem paths.
+  //
+  // **Performance note** (this is the reason for the awkward shape
+  // below): the path-d string is the bucket key in
+  // `InstanceBucketer.addGlyph`, so every entry that shares an
+  // identical d-string folds into a single shared `ExtrudeGeometry`
+  // and `InstancedMesh` — even with hundreds of instances spread
+  // across the page.  We therefore emit *glyph-local* path data
+  // (anchored at (0, 0)) and use the absolute SVG coords for the
+  // entry's `x`/`y` placement, so e.g. all 460 of Perfect's pedal
+  // rects (which are visually identical 60×12 rectangles) collapse
+  // into one bucket → one InstancedMesh → one draw call, instead of
+  // 460 unique geometries / 460 draw calls (which dropped the
+  // worker frame rate by ~25 % when first added).
+  //
+  // The selector pattern matches the existing one for `<path>` to
+  // avoid recursing into nested note groups (which shouldn't ever
+  // happen for these classes, but keeps the extraction symmetrical).
+  // ----------------------------------------------------------------
+  _collectPrimitives(container, outArray, type, scale, isContainer) {
     container.querySelectorAll(':scope > polyline, :scope > g > polyline').forEach((polyEl) => {
-      if (isContainer && inNestedNoteOrRest(polyEl)) return;
-      const points = polyEl.getAttribute('points');
-      if (!points) return;
-      const tokens = points.trim().split(/[\s,]+/).map(parseFloat).filter((n) => !isNaN(n));
-      if (tokens.length < 4) return;
-      // Anchor the path at the first point so every polyline with the
-      // same *shape* (relative offsets) shares a geometry bucket.
-      // Polylines with different point counts or different relative
-      // offsets still get their own bucket — that's correct.
-      const ax = tokens[0];
-      const ay = tokens[1];
-      let d = 'M 0 0';
-      for (let i = 2; i + 1 < tokens.length; i += 2) {
-        d += ' L ' + (tokens[i] - ax) + ' ' + (tokens[i + 1] - ay);
-      }
-      const tx = this._getAncestorTranslate(polyEl);
-      outArray.push({
-        type, d,
-        x: (ax + tx.rawX) * scale,
-        y: -(ay + tx.rawY) * scale,
-      });
+      if (isContainer && this._inNestedNoteOrRest(polyEl, container)) return;
+      const entry = polylineToPath(
+        polyEl.getAttribute('points'),
+        getAncestorTranslate(polyEl), scale);
+      if (entry) outArray.push({ type, ...entry });
     });
 
     container.querySelectorAll(':scope > ellipse, :scope > g > ellipse').forEach((el) => {
-      if (isContainer && inNestedNoteOrRest(el)) return;
-      const cx = parseFloat(el.getAttribute('cx') || '0');
-      const cy = parseFloat(el.getAttribute('cy') || '0');
-      const rx = parseFloat(el.getAttribute('rx') || '0');
-      const ry = parseFloat(el.getAttribute('ry') || '0');
-      if (rx <= 0 || ry <= 0) return;
-      // Cubic-Bezier circle approximation: 4 quadrants × control
-      // distance kappa = (4/3)·tan(π/8) ≈ 0.5523.  Produces a closed
-      // loop that's visually indistinguishable from a true ellipse at
-      // our extrusion resolution.  Glyph-local coords centred at
-      // (0, 0) so all dots with the same (rx, ry) share one geometry.
-      const k = 0.5522847498307933;
-      const kx = rx * k, ky = ry * k;
-      const d =
-        `M ${-rx} 0 ` +
-        `C ${-rx} ${-ky}, ${-kx} ${-ry}, 0 ${-ry} ` +
-        `C ${kx} ${-ry}, ${rx} ${-ky}, ${rx} 0 ` +
-        `C ${rx} ${ky}, ${kx} ${ry}, 0 ${ry} ` +
-        `C ${-kx} ${ry}, ${-rx} ${ky}, ${-rx} 0 Z`;
-      const tx = this._getAncestorTranslate(el);
-      outArray.push({
-        type, d,
-        x: (cx + tx.rawX) * scale,
-        y: -(cy + tx.rawY) * scale,
-      });
+      if (isContainer && this._inNestedNoteOrRest(el, container)) return;
+      const entry = ellipseToPath(
+        parseFloat(el.getAttribute('cx') || '0'),
+        parseFloat(el.getAttribute('cy') || '0'),
+        parseFloat(el.getAttribute('rx') || '0'),
+        parseFloat(el.getAttribute('ry') || '0'),
+        getAncestorTranslate(el), scale);
+      if (entry) outArray.push({ type, ...entry });
     });
 
     container.querySelectorAll(':scope > rect, :scope > g > rect').forEach((el) => {
-      if (isContainer && inNestedNoteOrRest(el)) return;
-      const x = parseFloat(el.getAttribute('x') || '0');
-      const y = parseFloat(el.getAttribute('y') || '0');
-      const w = parseFloat(el.getAttribute('width') || '0');
-      const h = parseFloat(el.getAttribute('height') || '0');
-      if (w <= 0 || h <= 0) return;
-      // Glyph-local rect anchored at (0, 0).  Every pedal-bracket rect
-      // with the same (w, h) shares one geometry bucket.
-      const d = `M 0 0 L ${w} 0 L ${w} ${h} L 0 ${h} Z`;
-      const tx = this._getAncestorTranslate(el);
-      outArray.push({
-        type, d,
-        x: (x + tx.rawX) * scale,
-        y: -(y + tx.rawY) * scale,
-      });
+      if (isContainer && this._inNestedNoteOrRest(el, container)) return;
+      const entry = rectToPath(
+        parseFloat(el.getAttribute('x') || '0'),
+        parseFloat(el.getAttribute('y') || '0'),
+        parseFloat(el.getAttribute('width') || '0'),
+        parseFloat(el.getAttribute('height') || '0'),
+        getAncestorTranslate(el), scale);
+      if (entry) outArray.push({ type, ...entry });
     });
   }
 
@@ -815,28 +727,11 @@ export class SVGSceneParser {
    * Y is negated to convert from SVG (Y-down) to Three.js (Y-up).
    */
   _pathStartPosition(d, contextEl, scale) {
-    const tx = this._getAncestorTranslate(contextEl);
+    const tx = getAncestorTranslate(contextEl);
     return {
       x: tx.rawX * scale,
       y: -tx.rawY * scale,
     };
-  }
-
-  _getAncestorTranslate(el) {
-    let x = 0, y = 0;
-    let cur = el;
-    while (cur && cur.tagName !== 'svg') {
-      const t = this._getTranslate(cur);
-      x += t.x;
-      y += t.y;
-      cur = cur.parentElement;
-    }
-    return { rawX: x, rawY: y };
-  }
-
-  _getChildPathD(defEl) {
-    const child = defEl.querySelector('path');
-    return child ? child.getAttribute('d') : null;
   }
 
   _findStaffNumber(el, staffMap) {
@@ -850,175 +745,5 @@ export class SVGSceneParser {
       cur = cur.parentElement;
     }
     return 1;
-  }
-
-  /**
-   * Compute bounding box from all parsed element positions.
-   *
-   * Bounds cover the full musical content the renderer will draw:
-   * notes + staff lines + bar lines + every classified
-   * `otherElement` we extract (clefs, accidentals, beams, dynamics,
-   * **pedal brackets, dotted-rhythm dots, hairpins, octave lines,
-   * fermatas, tuplet brackets, …**).  Including `otherElements` is
-   * what guarantees the paper backdrop is tall enough to contain
-   * everything the renderer emits — without it, sustain-pedal
-   * rectangles that sit just below the bass staff (or 8va lines
-   * above the treble staff) hung off the edge of the paper
-   * because the bounds were derived only from the staff lines
-   * themselves.
-   *
-   * Title / tempo / copyright / page-number `<text>` elements are
-   * the historical reason the original code excluded `otherElements`
-   * from bounds — those sat far outside the staff Y-extent and pulled
-   * the apparent score centre off.  We don't currently parse any of
-   * those (the walker recurses past unclassified groups and ignores
-   * raw `<text>` nodes), so they never enter `otherElements` and
-   * including the bucket here is safe.  If text rendering is added
-   * later, exclude the relevant types here.
-   */
-  _computeBounds(out) {
-    let minX = Infinity, maxX = -Infinity;
-    let minY = Infinity, maxY = -Infinity;
-    const track = (x, y) => {
-      if (typeof x !== 'number' || typeof y !== 'number') return;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-    };
-    // Path-form entries (`{ d, x, y }`) describe an extruded shape
-    // whose vertices are *added* to the entry's `(x, y)` position
-    // by the 3D builder.  Some emit paths use **absolute** SVG
-    // coords (stems, grpSym braces — `(x, y)` is just the
-    // page-margin translate) and some use **glyph-local** coords
-    // anchored at the origin (the new pedal/dot/hairpin emits —
-    // `(x, y)` is the element's actual on-page position).  Either
-    // way the actual world bounds = `(x, y) + pathBBox(d) × scale`
-    // with Y flipped (because `geo.scale(s, -s, s)` flips the
-    // extruded vertex Y).  Computing this once per entry recovers
-    // the correct visual extent for both representations and stops
-    // the page-margin (0.5, -0.5) from being mistaken for the
-    // score's actual top edge — the bug that left Perfect's pedal
-    // markers hanging off the bottom of an off-centred page.
-    const pathScale = SceneConfig.scale;
-    const trackPath = (d, x, y) => {
-      const bb = pathBBox(d);
-      if (!bb) { track(x, y); return; }
-      track(x + bb.minX * pathScale, y - bb.maxY * pathScale);
-      track(x + bb.maxX * pathScale, y - bb.minY * pathScale);
-    };
-
-    const glyphWorldScale = SceneConfig.scale * SceneConfig.glyphUseScale;
-    for (const n of out.notes) {
-      const bb = pathBBox(n.glyphPath);
-      if (bb) {
-        track(n.x + bb.minX * glyphWorldScale, n.y + bb.minY * glyphWorldScale);
-        track(n.x + bb.maxX * glyphWorldScale, n.y + bb.maxY * glyphWorldScale);
-      } else {
-        track(n.x, n.y);
-      }
-    }
-
-    for (const sl of out.staffLines) {
-      if (sl.isLine) {
-        track(sl.x1, sl.y1);
-        track(sl.x2, sl.y2);
-      } else if (sl.d) {
-        trackPath(sl.d, sl.x, sl.y);
-      }
-    }
-    for (const bl of out.barLines) {
-      if (bl.isLine) {
-        track(bl.x1, bl.y1);
-        track(bl.x2, bl.y2);
-      } else if (bl.d) {
-        trackPath(bl.d, bl.x, bl.y);
-      }
-    }
-
-    // Other elements: glyph (<use>) entries are tracked by their full
-    // path bounding box (scaled by glyphUseScale) so that wide glyphs
-    // like dynamics ("mf", "ff") don't overhang the paper edge.
-    // Path entries go through `trackPath` so their full visual extent
-    // contributes (pedal markers below the bass staff, octave brackets
-    // above the treble, system braces spanning all staves, etc.)
-    // without polluting the bounds with the (0.5, -0.5) ancestor
-    // translate carried by stem-like absolute-coord paths.
-    for (const el of out.otherElements) {
-      if (el.isLine) {
-        track(el.x1, el.y1);
-        track(el.x2, el.y2);
-      } else if (el.glyphPath) {
-        // Glyph paths use uniform positive-Y scaling (no Y flip):
-        //   world = (el.x + glyph.x × glyphWorldScale,
-        //            el.y + glyph.y × glyphWorldScale)
-        const bb = pathBBox(el.glyphPath);
-        if (bb) {
-          track(el.x + bb.minX * glyphWorldScale, el.y + bb.minY * glyphWorldScale);
-          track(el.x + bb.maxX * glyphWorldScale, el.y + bb.maxY * glyphWorldScale);
-        } else {
-          track(el.x, el.y);
-        }
-      } else if (el.d) {
-        trackPath(el.d, el.x, el.y);
-      }
-    }
-    if (minX === Infinity) {
-      minX = 0; maxX = 1; minY = 0; maxY = 1;
-    }
-    return { minX, maxX, minY, maxY };
-  }
-
-  /**
-   * Compute the Y-bounds of the visible 5-line staves only — i.e.
-   * the topmost staff line of the highest staff and the bottommost
-   * staff line of the lowest staff.  Excludes:
-   *
-   *   • Ledger lines (tagged `isLedger: true` by `_walkTree`'s
-   *     ledger-lines branch).
-   *   • Notes (notes can sit far above / below the staff via ledger
-   *     lines; their Y is irrelevant for the visible staff bounds).
-   *   • `otherElements` (pedals below the bass staff, 8va lines
-   *     above the treble, slurs / hairpins / dynamics — these are
-   *     the very things `staffMaxY` / `staffMinY` exist to ignore).
-   *
-   * These bounds are retained as diagnostic metadata; paper sizing
-   * uses full rendered-content bounds.
-   *
-   * Returns `{ minY: null, maxY: null }` if no non-ledger staff
-   * lines were collected (the parser handles unknown markup
-   * gracefully — fallback in `parse()` reuses the full content
-   * bounds).
-   *
-   * @returns {{ minY: number|null, maxY: number|null }}
-   */
-  _computeStaffBounds(out) {
-    let minY = Infinity, maxY = -Infinity;
-    for (const sl of out.staffLines) {
-      if (sl.isLedger) continue;
-      if (sl.isLine) {
-        if (typeof sl.y1 === 'number') {
-          if (sl.y1 < minY) minY = sl.y1;
-          if (sl.y1 > maxY) maxY = sl.y1;
-        }
-        if (typeof sl.y2 === 'number') {
-          if (sl.y2 < minY) minY = sl.y2;
-          if (sl.y2 > maxY) maxY = sl.y2;
-        }
-      } else if (sl.d) {
-        const bb = pathBBox(sl.d);
-        if (bb) {
-          const pathMinY = sl.y - bb.maxY * SceneConfig.scale;
-          const pathMaxY = sl.y - bb.minY * SceneConfig.scale;
-          if (pathMinY < minY) minY = pathMinY;
-          if (pathMaxY > maxY) maxY = pathMaxY;
-        }
-      } else if (typeof sl.y === 'number') {
-        if (sl.y < minY) minY = sl.y;
-        if (sl.y > maxY) maxY = sl.y;
-      }
-    }
-    if (minY === Infinity) return { minY: null, maxY: null };
-    return { minY, maxY };
   }
 }
