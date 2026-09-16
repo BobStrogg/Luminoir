@@ -18,7 +18,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
-import { SVG3DBuilder, prefetchTitleFont } from '../rendering/SVG3DBuilder.js';
+import { SVG3DBuilder } from '../rendering/SVG3DBuilder.js';
+import { prefetchTitleFont } from '../rendering/PaperAndTitle.js';
 import { setRendererKind } from '../rendering/Materials.js';
 import { CameraController } from '../animation/CameraController.js';
 import { ElementProxy } from './ElementProxy.js';

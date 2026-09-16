@@ -1,58 +1,22 @@
 import * as THREE from 'three';
 import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
-import { FontLoader } from 'three/addons/loaders/FontLoader.js';
 import { SceneConfig } from './SceneConfig.js';
 import { Materials } from './Materials.js';
 import { OPTIMIZATIONS } from './Optimizations.js';
-import { parseSimpleLineD, parsePathDToShapePath } from './pathD.js';
-import {
-  computePageMargins,
-  TITLE_LEFT_PADDING,
-  TITLE_HEIGHT,
-  COMPOSER_HEIGHT,
-  TITLE_LINE_GAP,
-} from './TitleBlock.js';
-// Note: `rasteriseTitleBlock` is intentionally NOT imported here.
-// The title is now rendered as extruded 3D geometry (via FontLoader +
-// ExtrudeGeometry) so it casts proper ink-shaped shadows.  The raster
-// fallback lives in TitleBlock.js and is still used by the main
-// thread's `measureTitleBlock` for paper-margin sizing.
-
-/** Resolved title font, populated by `prefetchTitleFont()` during
- *  worker init.  `null` until the fetch completes (or if it fails).
- *  `_addTitle` reads this synchronously so `build()` stays sync and
- *  the buildScene → setTimeline message ordering is preserved. */
-let _titleFont = null;
+import { parsePathDToShapePath } from './pathD.js';
+import { InstanceBucketer } from './InstanceBuckets.js';
+import { emitInstancedChunks } from './InstancedChunkEmitter.js';
+import { addPaper, addTitle, measureTitleLayout } from './PaperAndTitle.js';
+import { buildOneMeshPerElement } from './LegacyMeshBuilder.js';
 
 /**
- * Kick off the font fetch in the background.  Call once from
- * `handleInit` in the render worker so the font is ready (or nearly
- * so) by the time the first `buildScene` message arrives.
- *
- * Fire-and-forget — no need to await.  If the fetch is still in
- * flight when `_addTitle` runs, the title is silently omitted for
- * that scene build; subsequent score loads will have the font cached.
+ * Elements that count as "note-attached" rather than "decoration"
+ * (stems, flags, beams — see `_bucketOtherElements` for the
+ * classification rationale).
  */
-export function prefetchTitleFont() {
-  if (_titleFont) return;   // already loaded
-  (async () => {
-    try {
-      const resp = await fetch(`${import.meta.env.BASE_URL}fonts/optimer_bold.typeface.json`);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const json = await resp.json();
-      _titleFont = new FontLoader().parse(json);
-    } catch (e) {
-      console.warn('[SVG3DBuilder] Could not load title font:', e);
-    }
-  })();
-}
-
-/** Scratch matrix reused by all bucketing helpers — avoids allocating a
- *  fresh `Matrix4` per glyph / line at scene-build time (a Sylvia-level
- *  score would be tens of thousands otherwise).  Callers that need to
- *  retain the result `.clone()` it.
- */
-const _scratchMat = new THREE.Matrix4();
+const NOTE_ATTACHED_TYPES = new Set([
+  'stem', 'flag', 'beam',
+]);
 
 /**
  * Converts parsed SVG scene data into Three.js geometry — SVG paths
@@ -90,7 +54,7 @@ export class SVG3DBuilder {
    * frame for all N occurrences, with per-instance transforms
    * supplying each note's position.
    *
-   * Two instance buckets are used:
+   * Two instance buckets are used (see `InstanceBucketer`):
    *   1. *Glyphs*  — any SVG `<path>` that turned into an extruded
    *      `ShapeGeometry`.  Sharing is keyed on `(pathD, depth, material)`.
    *   2. *Boxes*   — staff / bar lines that used the simple
@@ -120,33 +84,53 @@ export class SVG3DBuilder {
       // scores (N draw calls) but a useful correctness baseline while
       // bisecting visual regressions — exactly the path we had before
       // the bucketing optimisations landed.
-      this._buildOneMeshPerElement(root, parsed, noteMeshMap);
+      buildOneMeshPerElement(this, root, parsed, noteMeshMap);
       return { root, noteMeshMap };
     }
 
-    /** @type {Map<string, { geometry: THREE.BufferGeometry, material: THREE.Material, matrices: THREE.Matrix4[], noteIds: (string|null)[], kind: 'glyph' | 'path' }>} */
-    const glyphBuckets = new Map();
-    /** @type {Map<string, { material: THREE.Material, matrices: THREE.Matrix4[] }>} */
-    const boxBuckets = new Map();
-    // Side-channel used by `_bucketGlyph` when a path-d turns out to
-    // be a simple M-L line — those are rerouted to boxBuckets for
-    // aggressive draw-call coalescing.  We stash the reference so the
-    // nested call can reach it without an extra argument.
-    this._sharedBoxBuckets = boxBuckets;
+    const bucketer = new InstanceBucketer(
+      (pathD, depth, kind) => this.makeExtrudedGeometry(pathD, depth, kind),
+    );
+    this._bucketNotes(bucketer, parsed);
+    this._bucketOtherElements(bucketer, parsed);
+    this._bucketStaffAndBarLines(bucketer, parsed);
+    this._emitBuckets(root, bucketer, parsed, noteMeshMap);
 
-    // --- Notes ---
+    const titleLayout = parsed.title ? measureTitleLayout(parsed.title, parsed.composer) : null;
+
+    // --- Paper backdrop ---
+    addPaper(root, parsed, titleLayout?.block);
+
+    // --- Title block (top-left of paper) ---
+    // The paper's far (top) margin is sized to fit the title block
+    // plus equal padding above and below it — the score never
+    // shifts to make room — so this is a pure on-paper render.  No-op
+    // when `parsed.title` is null (e.g. when an unrecognised file is
+    // imported and we couldn't derive a sensible name).
+    if (parsed.title) {
+      addTitle(root, parsed, titleLayout, this._otherMat);
+    }
+
+    return { root, noteMeshMap };
+  }
+
+  /**
+   * Bucket noteheads + their child paths (stems, flags, ledger bits).
+   */
+  _bucketNotes(bucketer, parsed) {
     for (const note of parsed.notes) {
       if (note.glyphPath) {
         // Notehead: white-base material so `setColorAt` can recolour
         // it per-instance during playback.  Pass note.id so the
         // builder can build a noteId → (mesh, index) map.
-        this._bucketGlyph(glyphBuckets, note.glyphPath, SceneConfig.extrusionDepth,
+        bucketer.addGlyph(note.glyphPath, SceneConfig.extrusionDepth,
           this._noteHeadMat, 'glyph', note.x, note.y, SceneConfig.noteElevation, note.id);
       }
       // Child paths (stems, flags, …) live in *page-margin* coords so we
-      // offset them back into the note-local frame.  See `_buildNote` below
-      // for the full derivation.  These use `_noteMat` (dark base) and
-      // don't get recoloured on playback.
+      // offset them back into the note-local frame.  See the note
+      // handling in `LegacyMeshBuilder` for the same derivation.
+      // These use `_noteMat` (dark base) and don't get recoloured on
+      // playback.
       //
       // `lodDetail: true` — these are exactly the "small per-note
       // decorations (child paths — stems, flags, ledger lines)" that
@@ -157,49 +141,51 @@ export class SVG3DBuilder {
       const offX = (note.ancestorX ?? 0) - note.x;
       const offY = (note.ancestorY ?? 0) - note.y;
       for (const d of note.childPaths) {
-        this._bucketGlyph(glyphBuckets, d, SceneConfig.extrusionDepth * 0.5,
+        bucketer.addGlyph(d, SceneConfig.extrusionDepth * 0.5,
           this._noteMat, 'path', note.x + offX, note.y + offY, SceneConfig.noteElevation,
           null, 0, true);
       }
     }
+  }
 
-    // --- Other elements (clefs, accidentals, beams, flags, …) ---
-    //
-    // Classify each element as either "note-attached" or "decoration".
-    //
-    // Note-attached are the bits that *make up* a note's visual
-    // shape on the page — stems, flags, beams.  These have to share
-    // the notehead's Z plane so the stem actually connects to its
-    // notehead and the beam's bottom edge sits flush with each
-    // stem's top instead of floating a millimetre below it.  They
-    // use `_noteMat` so they match the dark notehead colour.
-    //
-    // Everything else — accidentals, ties, slurs, articulations,
-    // augmentation dots, dynamics, expression marks, clefs, time /
-    // key signatures, tuplet numbers, multi-measure rests, octave
-    // brackets, system braces, pedal markers, fermatas, hairpins —
-    // is *decoration*.  All of it sits on the lower
-    // `otherElementsElevation` plane (Layer 2 in `SceneConfig`'s
-    // elevation stack), distinctly below the notes.  This is what
-    // gives the played notehead clear Z dominance over its
-    // neighbouring accidentals / dots / dynamics; the previous list
-    // included these decorations at `noteElevation` and a glowing
-    // played note could end up Z-fighting with whatever decoration
-    // happened to be parked on the same texel.  Decorations use
-    // `_otherMat` (neutral ink colour, slightly lighter than note
-    // black) so they read as printed annotations rather than
-    // notehead extensions.
-    //
-    // The historical reason for the split was preventing a
-    // duplication bug where stems were pushed into both
-    // `note.childPaths` AND `otherElements` (via `_walkTree`'s
-    // recursion), producing a pair of stems at different Z levels.
-    // That bug stays fixed regardless of which types live in
-    // `NOTE_ATTACHED_TYPES`; this is now purely a visual-priority
-    // decision.
-    const NOTE_ATTACHED_TYPES = new Set([
-      'stem', 'flag', 'beam',
-    ]);
+  /**
+   * Bucket clefs, accidentals, beams, flags and every other
+   * non-note, non-structural element.
+   *
+   * Classify each element as either "note-attached" or "decoration".
+   *
+   * Note-attached are the bits that *make up* a note's visual
+   * shape on the page — stems, flags, beams.  These have to share
+   * the notehead's Z plane so the stem actually connects to its
+   * notehead and the beam's bottom edge sits flush with each
+   * stem's top instead of floating a millimetre below it.  They
+   * use `_noteMat` so they match the dark notehead colour.
+   *
+   * Everything else — accidentals, ties, slurs, articulations,
+   * augmentation dots, dynamics, expression marks, clefs, time /
+   * key signatures, tuplet numbers, multi-measure rests, octave
+   * brackets, system braces, pedal markers, fermatas, hairpins —
+   * is *decoration*.  All of it sits on the lower
+   * `otherElementsElevation` plane (Layer 2 in `SceneConfig`'s
+   * elevation stack), distinctly below the notes.  This is what
+   * gives the played notehead clear Z dominance over its
+   * neighbouring accidentals / dots / dynamics; the previous list
+   * included these decorations at `noteElevation` and a glowing
+   * played note could end up Z-fighting with whatever decoration
+   * happened to be parked on the same texel.  Decorations use
+   * `_otherMat` (neutral ink colour, slightly lighter than note
+   * black) so they read as printed annotations rather than
+   * notehead extensions.
+   *
+   * The historical reason for the split was preventing a
+   * duplication bug where stems were pushed into both
+   * `note.childPaths` AND `otherElements` (via `_walkTree`'s
+   * recursion), producing a pair of stems at different Z levels.
+   * That bug stays fixed regardless of which types live in
+   * `NOTE_ATTACHED_TYPES`; this is now purely a visual-priority
+   * decision.
+   */
+  _bucketOtherElements(bucketer, parsed) {
     for (const el of parsed.otherElements) {
       const attached = NOTE_ATTACHED_TYPES.has(el.type);
       const mat = attached ? this._noteMat : this._otherMat;
@@ -223,30 +209,35 @@ export class SVG3DBuilder {
         // notehead — they all bulge out of the page by the same
         // amount.
         const thickness = el.thickness ?? SceneConfig.staffLineThickness;
-        this._bucketBoxLine(boxBuckets, mat,
+        bucketer.addBoxLine(mat,
           el.x1, el.y1, el.x2, el.y2,
           thickness,
           SceneConfig.notationDepth,
           z, lodDetail);
       } else if (el.glyphPath) {
-        this._bucketGlyph(glyphBuckets, el.glyphPath, SceneConfig.extrusionDepth * 0.8,
+        bucketer.addGlyph(el.glyphPath, SceneConfig.extrusionDepth * 0.8,
           mat, 'glyph', el.x, el.y, z, null, el.rotation || 0, lodDetail);
       } else if (el.d) {
-        this._bucketGlyph(glyphBuckets, el.d, SceneConfig.extrusionDepth * 0.5,
+        bucketer.addGlyph(el.d, SceneConfig.extrusionDepth * 0.5,
           mat, 'path', el.x, el.y, z, null, el.rotation || 0, lodDetail);
       }
     }
+  }
 
+  /**
+   * Bucket staff lines + bar lines (structural; never LOD-tagged).
+   */
+  _bucketStaffAndBarLines(bucketer, parsed) {
     // --- Staff lines ---
     for (const sl of parsed.staffLines) {
       if (sl.isLine) {
-        this._bucketBoxLine(boxBuckets, this._staffMat,
+        bucketer.addBoxLine(this._staffMat,
           sl.x1, sl.y1, sl.x2, sl.y2,
           SceneConfig.staffLineThickness,
           SceneConfig.notationDepth,
           SceneConfig.staffLineElevation);
       } else if (sl.d) {
-        this._bucketGlyph(glyphBuckets, sl.d, 16,
+        bucketer.addGlyph(sl.d, 16,
           this._staffMat, 'path', sl.x || 0, sl.y || 0,
           SceneConfig.staffLineElevation);
       }
@@ -255,26 +246,30 @@ export class SVG3DBuilder {
     // --- Bar lines ---
     for (const bl of parsed.barLines) {
       if (bl.isLine) {
-        this._bucketBoxLine(boxBuckets, this._barMat,
+        bucketer.addBoxLine(this._barMat,
           bl.x1, bl.y1, bl.x2, bl.y2,
           SceneConfig.barLineWidth,
           SceneConfig.notationDepth,
           SceneConfig.barLineElevation);
       } else if (bl.d) {
-        this._bucketGlyph(glyphBuckets, bl.d, 20,
+        bucketer.addGlyph(bl.d, 20,
           this._barMat, 'path', bl.x || 0, bl.y || 0, SceneConfig.barLineElevation);
       }
     }
+  }
 
-    // --- Emit one InstancedMesh per glyph bucket -----------------------
-    //
-    // Within each bucket we further chunk by X so Three.js can frustum-
-    // cull off-screen chunks.  The chunk width is *adaptive*: on a wide
-    // orchestral score (hundreds of world units) a fixed 4-unit chunk
-    // produces thousands of InstancedMeshes, which costs enough in
-    // per-frame scene-graph traversal to dwarf the culling benefit on
-    // some drivers.  We cap the chunk count at `MAX_CHUNKS_PER_BUCKET`
-    // per bucket, widening each chunk as needed.
+  /**
+   * Emit one InstancedMesh per glyph bucket / box bucket.
+   *
+   * Within each bucket we further chunk by X so Three.js can frustum-
+   * cull off-screen chunks.  The chunk width is *adaptive*: on a wide
+   * orchestral score (hundreds of world units) a fixed 4-unit chunk
+   * produces thousands of InstancedMeshes, which costs enough in
+   * per-frame scene-graph traversal to dwarf the culling benefit on
+   * some drivers.  We cap the chunk count at `MAX_CHUNKS_PER_BUCKET`
+   * per bucket, widening each chunk as needed.
+   */
+  _emitBuckets(root, bucketer, parsed, noteMeshMap) {
     const MAX_CHUNKS_PER_BUCKET = 30;
     const MIN_CHUNK_WIDTH = 4;
     const scoreWidth = Math.max(1, parsed.totalWidth || 1);
@@ -288,7 +283,7 @@ export class SVG3DBuilder {
       SceneConfig.noteColor.g,
       SceneConfig.noteColor.b,
     );
-    for (const bucket of glyphBuckets.values()) {
+    for (const bucket of bucketer.glyphBuckets.values()) {
       const isNoteHead = bucket.material === this._noteHeadMat;
       // World-unit footprint of one glyph instance — instance matrices
       // for glyphs are pure translations, so the shared geometry's
@@ -297,7 +292,7 @@ export class SVG3DBuilder {
       if (!bucket.geometry.boundingBox) bucket.geometry.computeBoundingBox();
       const bb = bucket.geometry.boundingBox;
       const lodSize = Math.max(bb.max.x - bb.min.x, bb.max.y - bb.min.y);
-      this._emitInstancedChunks(
+      emitInstancedChunks(
         root, bucket.geometry, bucket.material, bucket.matrices,
         CULL_CHUNK_WIDTH,
         isNoteHead ? noteHeadDefault : null,
@@ -308,7 +303,7 @@ export class SVG3DBuilder {
     }
 
     // --- Emit one InstancedMesh per box bucket -------------------------
-    for (const bucket of boxBuckets.values()) {
+    for (const bucket of bucketer.boxBuckets.values()) {
       // Box lines use their largest cross-section width as the LOD
       // size: a line vanishes visually when its *thin* axis goes
       // sub-pixel, regardless of its length.  Only detail-tagged line
@@ -316,475 +311,9 @@ export class SVG3DBuilder {
       // beams) carry lodDetail=false and are never hidden by the
       // distance rule — for them lodSize=0 also disables sub-pixel
       // culling, keeping the page structure visible at any zoom.
-      this._emitInstancedChunks(root, this._unitBox, bucket.material, bucket.matrices, CULL_CHUNK_WIDTH,
+      emitInstancedChunks(root, this._unitBox, bucket.material, bucket.matrices, CULL_CHUNK_WIDTH,
         null, null, null,
         { lodSize: bucket.lodDetail ? bucket.lodSize : 0, lodDetail: !!bucket.lodDetail });
-    }
-
-    const titleLayout = parsed.title ? this._measureTitleLayout(parsed.title, parsed.composer) : null;
-
-    // --- Paper backdrop ---
-    this._addPaper(root, parsed, titleLayout?.block);
-
-    // --- Title block (top-left of paper) ---
-    // The paper's far (top) margin is sized to fit the title block
-    // plus equal padding above and below it — the score never
-    // shifts to make room — so this is a pure on-paper render.  No-op
-    // when `parsed.title` is null (e.g. when an unrecognised file is
-    // imported and we couldn't derive a sensible name).
-    if (parsed.title) {
-      this._addTitle(root, parsed, titleLayout);
-    }
-
-    return { root, noteMeshMap };
-  }
-
-  /* ------------------------------------------------------------------ */
-  /*  No-instancing fallback                                             */
-  /* ------------------------------------------------------------------ */
-
-  /**
-   * Pre-optimisation build path: one `THREE.Mesh` per SVG element.
-   *
-   * This is a correctness baseline — slow, but uses the exact same
-   * geometry that the bucketed path does, with no instance matrices,
-   * no chunking, no stem dedup, and no shared unit-box.  If a visual
-   * regression reproduces on the bucketed path but clears here, we
-   * know the bug lives in one of the bucketing helpers.
-   *
-   * Also populates `noteMeshMap` so the fallback supports the same
-   * played-note colouring as the bucketed path — each notehead gets
-   * its own cloned `_noteHeadMat` and we track the material.
-   *
-   * @param {THREE.Group} root
-   * @param {import('../verovio/SVGSceneParser.js').ParsedScene} parsed
-   * @param {Map<string, { mesh: THREE.Mesh, index: number, material?: THREE.Material }>} noteMeshMap
-   */
-  _buildOneMeshPerElement(root, parsed, noteMeshMap) {
-    const s = SceneConfig.scale;
-
-    const addGlyph = (pathD, depth, material, kind, x, y, z, noteId = null, rotation = 0) => {
-      const geometry = this._makeExtrudedGeometry(pathD, depth, kind);
-      if (!geometry) return;
-      // Clone the material for noteheads so each one can be coloured
-      // independently during playback.
-      const perMeshMat = (material === this._noteHeadMat && noteId)
-        ? material.clone()
-        : material;
-      const mesh = new THREE.Mesh(geometry, perMeshMat);
-      if (perMeshMat !== material) {
-        perMeshMat.color.setRGB(
-          SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b,
-        );
-      }
-      mesh.position.set(x, y, z);
-      if (rotation) mesh.rotation.z = rotation;
-      // Match the bucketed path: frustum culling disabled on every
-      // content mesh to work around a Chromium WebGPU culling bug.
-      mesh.frustumCulled = false;
-      mesh.castShadow = true;
-      root.add(mesh);
-      if (noteId && noteMeshMap) {
-        noteMeshMap.set(noteId, { mesh, index: -1, material: perMeshMat });
-      }
-    };
-
-    const addBoxLine = (material, x1, y1, x2, y2, widthAcross, depth, zElevation) => {
-      const dx = x2 - x1;
-      const dy = y2 - y1;
-      const len = Math.hypot(dx, dy);
-      if (len < 0.001) return;
-      const geo = new THREE.BoxGeometry(len, widthAcross, depth);
-      const mesh = new THREE.Mesh(geo, material);
-      // Position in world space: X/Y from the line midpoint, Z from
-      // the caller-supplied elevation.  See `_bucketBoxLine` for the
-      // history behind this parameter — it used to be misnamed as a
-      // Y offset and put stems on the paper plane instead of at the
-      // note's hover height.
-      mesh.position.set((x1 + x2) / 2, (y1 + y2) / 2, zElevation);
-      if (Math.abs(dy) > 0.0001) mesh.rotation.z = Math.atan2(dy, dx);
-      mesh.frustumCulled = false;
-      mesh.castShadow = true;
-      root.add(mesh);
-    };
-
-    // Notes
-    for (const note of parsed.notes) {
-      if (note.glyphPath) {
-        addGlyph(note.glyphPath, SceneConfig.extrusionDepth, this._noteHeadMat,
-          'glyph', note.x, note.y, SceneConfig.noteElevation, note.id);
-      }
-      const offX = (note.ancestorX ?? 0) - note.x;
-      const offY = (note.ancestorY ?? 0) - note.y;
-      for (const d of note.childPaths) {
-        addGlyph(d, SceneConfig.extrusionDepth * 0.5, this._noteMat,
-          'path', note.x + offX, note.y + offY, SceneConfig.noteElevation);
-      }
-    }
-
-    // Other elements
-    for (const el of parsed.otherElements) {
-      if (el.glyphPath) {
-        addGlyph(el.glyphPath, SceneConfig.extrusionDepth * 0.8, this._otherMat,
-          'glyph', el.x, el.y, SceneConfig.otherElementsElevation, null, el.rotation || 0);
-      } else if (el.d) {
-        addGlyph(el.d, SceneConfig.extrusionDepth * 0.5, this._otherMat,
-          'path', el.x, el.y, SceneConfig.otherElementsElevation, null, el.rotation || 0);
-      }
-    }
-
-    // Staff lines
-    for (const sl of parsed.staffLines) {
-      if (sl.isLine) {
-        addBoxLine(this._staffMat, sl.x1, sl.y1, sl.x2, sl.y2,
-          SceneConfig.staffLineThickness,
-          SceneConfig.staffLineThickness * 0.5,
-          SceneConfig.staffLineElevation);
-      } else if (sl.d) {
-        addGlyph(sl.d, 16, this._staffMat, 'path', sl.x || 0, sl.y || 0,
-          SceneConfig.staffLineElevation);
-      }
-    }
-
-    // Bar lines
-    for (const bl of parsed.barLines) {
-      if (bl.isLine) {
-        addBoxLine(this._barMat, bl.x1, bl.y1, bl.x2, bl.y2,
-          SceneConfig.barLineWidth,
-          SceneConfig.barLineWidth * 0.5,
-          SceneConfig.barLineElevation);
-      } else if (bl.d) {
-        addGlyph(bl.d, 20, this._barMat, 'path', bl.x || 0, bl.y || 0,
-          SceneConfig.barLineElevation);
-      }
-    }
-
-    // Paper backdrop
-    this._addPaper(root, parsed);
-    if (parsed.title) {
-      this._addTitle(root, parsed);
-    }
-    void s;
-  }
-
-  /* ------------------------------------------------------------------ */
-  /*  Instance bucketing                                                 */
-  /* ------------------------------------------------------------------ */
-
-  /**
-   * Add one instance of a path-derived extruded shape into the right
-   * bucket.  Creates (and caches) the shared geometry on first use;
-   * subsequent instances reuse it and just push a fresh transform.
-   *
-   * Many Verovio path-d strings (stems, ledger lines) are just a
-   * `M x1 y1 L x2 y2` segment — i.e. a straight line.  Those have a
-   * *different* d-string per note (because x1/y1/x2/y2 change), so
-   * each one would create its own bucket and its own InstancedMesh,
-   * defeating the whole point of bucketing.  Instead we detect the
-   * line case and reroute these to the box-line bucket where every
-   * stem in the score shares one shared `BoxGeometry`.
-   *
-   * @param {Map} buckets
-   * @param {string} pathD
-   * @param {number} depth
-   * @param {THREE.Material} material
-   * @param {'glyph'|'path'} kind SMuFL <use> glyph (0.48 scale) vs. page-margin path (1.0 scale + Y-flip)
-   * @param {number} x @param {number} y @param {number} z
-   * @param {string=} noteId Stable SVG element id of the owning note.
-   *   Populated only for notehead glyphs — stems / child paths pass
-   *   undefined.  The render worker later uses this to look up the
-   *   `(mesh, instanceIndex)` for a given playing note.
-   * @param {number=} rotation Z-axis rotation (radians) baked into the
-   *   instance matrix.  Used by `<g class="arpeg" transform="rotate(...)">`
-   *   so the wavy arpeggio symbol renders standing upright next to its
-   *   chord rather than lying flat.  Skipped (zero) for the common
-   *   case so unrotated glyphs don't pay an extra matrix multiply.
-   * @param {boolean=} lodDetail Marks this element as a small per-note
-   *   decoration (stem / flag / ledger line) for the
-   *   `LOD_DISTANT_ELEMENTS` runtime pass — the emitted mesh's
-   *   `userData.lodDetail` lets the render worker hide the bucket
-   *   beyond `LOD_DISTANCE_THRESHOLD`.
-   */
-  _bucketGlyph(buckets, pathD, depth, material, kind, x, y, z, noteId = null, rotation = 0, lodDetail = false) {
-    // Path-kind paths (stems, ledger lines, etc.) that are plain line
-    // segments go through the line-detection fast path.
-    if (OPTIMIZATIONS.STEM_DEDUP && kind === 'path' && !rotation) {
-      const line = parseSimpleLineD(pathD);
-      if (line) {
-        // Page-margin coords: subject to the same Y flip that the
-        // extruded path geometry would get (`geo.scale(s, -s, s)`).
-        const s = SceneConfig.scale;
-        // Pass `z` (the owning note's elevation) through so the
-        // stem sits in the same plane as its notehead — previously
-        // hard-coded 0 left simple stems flush against the paper
-        // while noteheads floated at `noteElevation`, which on
-        // oblique camera angles looks like the note is detached
-        // from its stem.
-        this._bucketBoxLine(this._sharedBoxBuckets, material,
-          x + line.x1 * s, y - line.y1 * s,
-          x + line.x2 * s, y - line.y2 * s,
-          // 8-px-wide cross-section matching the staff-line style;
-          // Z thickness is the shared `notationDepth` so simple
-          // stems sit at the same depth as every other element.
-          0.007, SceneConfig.notationDepth, z, lodDetail);
-        return;
-      }
-    }
-    const key = kind + ':' + material.uuid + ':' + depth + ':' + pathD;
-    let bucket = buckets.get(key);
-    if (!bucket) {
-      const geometry = this._makeExtrudedGeometry(pathD, depth, kind);
-      if (!geometry) return;
-      bucket = { geometry, material, matrices: [], noteIds: [], kind, lodDetail: false };
-      buckets.set(key, bucket);
-    }
-    // A bucket counts as "detail" if any contributor tags it — stems /
-    // flags routed via note childPaths and via `otherElements` share
-    // path-d buckets, and both classes are the small per-note
-    // decorations the LOD pass targets.
-    if (lodDetail) bucket.lodDetail = true;
-    // Compose translate × rotateZ when rotation is requested; the plain
-    // translate path is the hot one (every notehead, beam, stem, …)
-    // so we keep its makeTranslation fast-path.
-    let mat;
-    if (rotation) {
-      mat = new THREE.Matrix4();
-      mat.makeRotationZ(rotation);
-      // setPosition only writes the translation column, leaving the
-      // rotation we just baked in intact.
-      mat.setPosition(x, y, z);
-    } else {
-      mat = _scratchMat.makeTranslation(x, y, z).clone();
-    }
-    bucket.matrices.push(mat);
-    bucket.noteIds.push(noteId || null);
-  }
-
-  /**
-   * Add one box-line instance (staff / bar line).  Everything uses a
-   * single shared `BoxGeometry(1,1,1)` in the emit phase; we just
-   * store translate × rotateZ × scale per instance here.
-   *
-   * `zElevation` is the **Z** translation of the line in world space —
-   * i.e. how far off the paper backdrop the line hovers.  Historical
-   * note: this used to be called `yElevation` and was applied to the
-   * `cy` (Y) translation, which silently turned into a tiny vertical
-   * shift on the page rather than an elevation off the paper.  That
-   * left simple-line stems rendered at z = 0 while their noteheads
-   * sat at `SceneConfig.noteElevation = 0.04`, so from oblique camera
-   * angles the notehead appeared to float off the staff with the
-   * stem stuck down on the page — visible as a detached "halo" on
-   * every note.  Using the value for Z instead (and passing
-   * `SceneConfig.noteElevation` for stems) puts them in the same
-   * plane as their owning note.
-   */
-  _bucketBoxLine(buckets, material, x1, y1, x2, y2, widthAcross, depth, zElevation, lodDetail = false) {
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const len = Math.hypot(dx, dy);
-    if (len < 0.001) return;
-    // Detail-tagged lines (simple-line stems rerouted from
-    // `_bucketGlyph`) get their own bucket, separate from structural
-    // lines that share the same material (beams also use `_noteMat`).
-    // Costs at most one extra InstancedMesh per material, and lets
-    // the LOD pass hide *just* the stems beyond the distance
-    // threshold while beams / staff lines / bar lines stay visible.
-    const key = material.uuid + (lodDetail ? ':detail' : '');
-    let bucket = buckets.get(key);
-    if (!bucket) {
-      bucket = { material, matrices: [], lodDetail, lodSize: 0 };
-      buckets.set(key, bucket);
-    }
-    // Track the *largest* cross-section in the bucket — sub-pixel
-    // culling must only fire when even the widest member is invisible.
-    if (widthAcross > bucket.lodSize) bucket.lodSize = widthAcross;
-    const m = new THREE.Matrix4();
-    const cx = (x1 + x2) / 2;
-    const cy = (y1 + y2) / 2;
-    m.makeTranslation(cx, cy, zElevation);
-    const ang = Math.abs(dy) > 0.0001 ? Math.atan2(dy, dx) : 0;
-    if (ang !== 0) m.multiply(_scratchMat.makeRotationZ(ang));
-    m.multiply(_scratchMat.makeScale(len, widthAcross, depth));
-    bucket.matrices.push(m);
-  }
-
-  /**
-   * Emit one or more `InstancedMesh`es from a list of instance
-   * matrices, partitioning the instances by X chunk so Three.js's
-   * per-mesh frustum culling also does coarse horizontal culling.
-   *
-   * With a single un-chunked `InstancedMesh` the bounding sphere
-   * spans the entire score, so all instances are always drawn.
-   * Chunking to ~4 world units per mesh lets the renderer skip 95 %+
-   * of instances on a Sylvia-Suite-sized score.
-   *
-   * @param {THREE.Group} root
-   * @param {THREE.BufferGeometry} geometry
-   * @param {THREE.Material} material
-   * @param {THREE.Matrix4[]} matrices
-   * @param {number} chunkWidth
-   * @param {THREE.Color=} defaultInstanceColor  Default per-instance
-   *   tint to pre-populate on the InstancedMesh's `instanceColor`
-   *   buffer.  Non-null for noteheads (using the white-base
-   *   `_noteHeadMat`): we init all instances to noteColor so unplayed
-   *   notes render identically to the other, dark-material meshes.
-   * @param {(string|null)[]=} noteIds  Parallel to `matrices`; the
-   *   stable SVG id of the note that owns each instance, or null for
-   *   non-note instances.  Only populated for notehead buckets.
-   * @param {Map<string, { mesh: THREE.Mesh, index: number, material?: THREE.Material }>=} noteMeshMap
-   *   Output map; populated with a `(mesh, index)` entry for every
-   *   entry in `noteIds` that is a stable note id.  When the bucket
-   *   collapses to a single plain `THREE.Mesh` (count === 1 fast
-   *   path) the material is cloned so the single note can still be
-   *   recoloured without affecting the shared `_noteHeadMat`, and
-   *   `{ mesh, index: -1, material }` is stored instead.
-   */
-  _emitInstancedChunks(
-    root, geometry, material, matrices, chunkWidth,
-    defaultInstanceColor = null, noteIds = null, noteMeshMap = null,
-    lodInfo = null,
-  ) {
-    if (matrices.length === 0) return;
-    // Stamp the LOD metadata on every mesh this call emits.  The render
-    // worker collects meshes with a `lodSize`/`lodDetail` tag after each
-    // scene build and gates their `.visible` from camera distance — see
-    // `_applyLodVisibility` in renderWorker.js (LOD_DISTANT_ELEMENTS /
-    // DISTANCE_CLIP_GLYPHS).
-    const tagLod = (mesh) => {
-      if (lodInfo && (lodInfo.lodSize > 0 || lodInfo.lodDetail)) {
-        mesh.userData.lodSize = lodInfo.lodSize;
-        mesh.userData.lodDetail = lodInfo.lodDetail;
-      }
-    };
-    // Three.js 0.172 WebGPU bug: `InstancedMesh` with `count === 1`
-    // renders with the instance matrix effectively ignored (the single
-    // instance appears at world origin with its raw geometry, not at
-    // `setMatrixAt(0, ...)`).  Root cause: `InstanceNode` wraps the
-    // instance-matrix array in a UBO for count ≤ 1000 but never reuploads
-    // it for the count-1 fast path.  Workaround: emit a plain `Mesh`
-    // instead — no perf cost because the bucket only has one draw-call
-    // either way.
-    if (matrices.length === 1) {
-      const singleNoteId = noteIds ? noteIds[0] : null;
-      // Clone the material for a single notehead so it can be
-      // recoloured independently of any shared material — otherwise
-      // every notehead using this path-d would change colour at once.
-      const perMeshMat = (singleNoteId && defaultInstanceColor)
-        ? material.clone()
-        : material;
-      if (perMeshMat !== material && defaultInstanceColor) {
-        perMeshMat.color.copy(defaultInstanceColor);
-      }
-      const mesh = new THREE.Mesh(geometry, perMeshMat);
-      mesh.applyMatrix4(matrices[0]);
-      // Chromium WebGPU + `InstancedMesh.frustumCulled` interact
-      // badly on some drivers: the per-mesh bounding sphere is
-      // computed correctly but the rasteriser sporadically treats
-      // chunks as outside the view volume at oblique camera angles,
-      // leaving notes popping in and out as the user orbits.  Safari
-      // WebKit's WebGPU doesn't repro.  Disabling frustum culling
-      // entirely on the score content is a safe trade — with chunking
-      // off we already draw every bucket every frame anyway, so we
-      // lose no cullable draw calls.
-      mesh.frustumCulled = false;
-      // Every notation mesh casts a shadow onto the paper.  The
-      // paper itself opts in to `receiveShadow` in `_addPaper`.
-      mesh.castShadow = true;
-      tagLod(mesh);
-      root.add(mesh);
-      if (singleNoteId && noteMeshMap) {
-        noteMeshMap.set(singleNoteId, { mesh, index: -1, material: perMeshMat });
-      }
-      return;
-    }
-    if (!OPTIMIZATIONS.CHUNK_BUCKETS_BY_X) {
-      // One InstancedMesh per bucket, no horizontal chunking.  The
-      // whole bucket always passes the frustum test because its
-      // bounding sphere spans the entire score, so we draw every
-      // instance every frame — but we keep draw-call count == bucket
-      // count (usually 20-50 for SMuFL music).
-      const mesh = new THREE.InstancedMesh(geometry, material, matrices.length);
-      for (let i = 0; i < matrices.length; i++) mesh.setMatrixAt(i, matrices[i]);
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.computeBoundingSphere();
-      mesh.frustumCulled = false;
-      mesh.castShadow = true;
-      // Pre-seed the instance-colour buffer so unplayed notes render
-      // at noteColor even with the white-base material.  `setColorAt`
-      // lazily allocates `mesh.instanceColor` on first call.
-      if (defaultInstanceColor) {
-        for (let i = 0; i < matrices.length; i++) mesh.setColorAt(i, defaultInstanceColor);
-        mesh.instanceColor.needsUpdate = true;
-      }
-      // Build noteId → (mesh, index) entries for the render worker.
-      if (noteIds && noteMeshMap) {
-        for (let i = 0; i < matrices.length; i++) {
-          const id = noteIds[i];
-          if (id) noteMeshMap.set(id, { mesh, index: i });
-        }
-      }
-      tagLod(mesh);
-      root.add(mesh);
-      return;
-    }
-    // Group matrices by X-chunk.  Matrix4 stores translation in
-    // `.elements[12..14]`, so `elements[12]` is tx (world X).
-    /** @type {Map<number, { m: THREE.Matrix4, noteId: string|null }[]>} */
-    const byChunk = new Map();
-    for (let i = 0; i < matrices.length; i++) {
-      const m = matrices[i];
-      const tx = m.elements[12];
-      const chunk = Math.floor(tx / chunkWidth);
-      let arr = byChunk.get(chunk);
-      if (!arr) { arr = []; byChunk.set(chunk, arr); }
-      arr.push({ m, noteId: noteIds ? noteIds[i] : null });
-    }
-    for (const arr of byChunk.values()) {
-      // Same WebGPU count=1 workaround as above.
-      if (arr.length === 1) {
-        const singleNoteId = arr[0].noteId;
-        const perMeshMat = (singleNoteId && defaultInstanceColor)
-          ? material.clone()
-          : material;
-        if (perMeshMat !== material && defaultInstanceColor) {
-          perMeshMat.color.copy(defaultInstanceColor);
-        }
-        const mesh = new THREE.Mesh(geometry, perMeshMat);
-        mesh.applyMatrix4(arr[0].m);
-        mesh.frustumCulled = false;
-        mesh.castShadow = true;
-        tagLod(mesh);
-        root.add(mesh);
-        if (singleNoteId && noteMeshMap) {
-          noteMeshMap.set(singleNoteId, { mesh, index: -1, material: perMeshMat });
-        }
-        continue;
-      }
-      const mesh = new THREE.InstancedMesh(geometry, material, arr.length);
-      for (let i = 0; i < arr.length; i++) {
-        mesh.setMatrixAt(i, arr[i].m);
-      }
-      mesh.instanceMatrix.needsUpdate = true;
-      // Deliberately leave frustumCulled on so Three.js can skip
-      // chunks that aren't in view.  `computeBoundingSphere` here
-      // walks every instance matrix and unions the per-instance
-      // sphere — essential, because the default sphere is the
-      // single-instance geometry sphere centred at the origin, which
-      // would mis-cull everything drawn more than a note-head's
-      // width from (0,0,0).
-      mesh.computeBoundingSphere();
-      mesh.castShadow = true;
-      if (defaultInstanceColor) {
-        for (let i = 0; i < arr.length; i++) mesh.setColorAt(i, defaultInstanceColor);
-        mesh.instanceColor.needsUpdate = true;
-      }
-      if (noteMeshMap) {
-        for (let i = 0; i < arr.length; i++) {
-          if (arr[i].noteId) noteMeshMap.set(arr[i].noteId, { mesh, index: i });
-        }
-      }
-      tagLod(mesh);
-      root.add(mesh);
     }
   }
 
@@ -793,7 +322,7 @@ export class SVG3DBuilder {
    * Caches by `(pathD, depth, kind)` so repeated calls don't re-extrude
    * the same shape.  Returns `null` on parse failure.
    */
-  _makeExtrudedGeometry(pathD, depth, kind) {
+  makeExtrudedGeometry(pathD, depth, kind) {
     const cacheKey = kind + ':' + depth + ':' + pathD;
     const cached = this._geometryCache.get(cacheKey);
     if (cached) return cached;
@@ -835,177 +364,6 @@ export class SVG3DBuilder {
   _pathToShapes(d) {
     const shapePath = parsePathDToShapePath(d);
     return SVGLoader.createShapes(shapePath);
-  }
-
-  /* ------------------------------------------------------------------ */
-
-  _addPaper(root, parsed, titleBlock = null) {
-    const paperMat = Materials.paper();
-    // **Equal-padding layout**: paper edge → title, title → highest
-    // rendered notation, and lowest notation → paper edge all use the
-    // same fixed world-unit gap.  Full content bounds already include
-    // ledger notes, slurs, dynamics, and octave lines, so their extent
-    // is never counted a second time as exterior whitespace.
-    //
-    // The X (horizontal) margin stays symmetric; the camera doesn't
-    // tilt left-right, so X appears uniform.  We do bias the camera
-    // pitch slightly so the on-screen whitespace above and below
-    // the page doesn't look perspective-skewed; see
-    // `CameraController.configureForScore` for the framing maths.
-    const marginX = 0.45;
-    const totalWidth = parsed.totalWidth ?? 0;
-    const minX = parsed.contentMinX ?? 0;
-    const margins = computePageMargins(
-      {
-        contentMaxY: (parsed.contentMinY ?? 0) + (parsed.totalHeight ?? 0),
-        contentMinY: parsed.contentMinY ?? 0,
-      },
-      parsed.title,
-      parsed.composer,
-      titleBlock,
-    );
-    const w = totalWidth + marginX * 2;
-    const h = margins.paperTopY - margins.paperBottomY;
-    // Scale the fibre pattern so individual fibres are on a scale
-    // similar to a notehead — too few tiles per world unit makes the
-    // normal map look like soft blurred clouds on close-ups, too many
-    // and the fibres become sub-pixel noise that aliases under
-    // camera motion.  Two tiles per world unit seems to hit the
-    // sweet spot across every score size from 2-unit preludes to
-    // 90-unit orchestral pages.
-    if (paperMat.normalMap) {
-      paperMat.normalMap.repeat.set(Math.max(2, w * 2), Math.max(2, h * 2));
-    }
-    // Bare 4-vertex plane: real paper is flat, the bumpy texture
-    // comes entirely from `Materials.paper()`'s normal map shading.
-    // No need for `PlaneGeometry` segments since we're not feeding
-    // the vertex shader a `displacementMap` to read per-vertex
-    // heights from.
-    const geo = new THREE.PlaneGeometry(w, h);
-    const mesh = new THREE.Mesh(geo, paperMat);
-    const cx = minX + totalWidth / 2;
-    // Paper centroid in score-local Y: midpoint of the paper's
-    // top/bottom edges.  For titled scores the centroid sits *above*
-    // the staff's geometric centre because the top margin is taller
-    // (extra pad + block.height + pad for the title block).  For
-    // untitled scores the paper centres on the staff itself.
-    const cy = (margins.paperTopY + margins.paperBottomY) / 2;
-    mesh.position.set(cx, cy, -0.05);
-    mesh.name = 'paper';
-    // Paper spans the whole score — keep it always drawn for the same
-    // reason as the content meshes (Chromium WebGPU culling glitch).
-    mesh.frustumCulled = false;
-    // The paper is the only mesh in the scene that *receives* the
-    // key light's shadow.  Every score element above is at z >=
-    // noteElevation while the paper sits at z = -0.05, so the
-    // shadow falls on the paper alone and reads as the notation
-    // hovering a few millimetres above the page.
-    mesh.receiveShadow = true;
-    root.add(mesh);
-  }
-
-  _measureTitleLayout(title, composer) {
-    if (!_titleFont || !title) return null;
-    const measure = (text, size) => {
-      if (!text) return null;
-      let shapes;
-      try {
-        shapes = _titleFont.generateShapes(text, size);
-      } catch {
-        return null;
-      }
-      if (!shapes || shapes.length === 0) return null;
-      const geometry = new THREE.ShapeGeometry(shapes);
-      geometry.computeBoundingBox();
-      const bounds = geometry.boundingBox;
-      const metrics = {
-        shapes,
-        minY: bounds.min.y,
-        maxY: bounds.max.y,
-        width: bounds.max.x - bounds.min.x,
-        height: bounds.max.y - bounds.min.y,
-      };
-      geometry.dispose();
-      return metrics;
-    };
-    const titleMetrics = measure(title, TITLE_HEIGHT);
-    if (!titleMetrics) return null;
-    const composerMetrics = measure(composer, COMPOSER_HEIGHT);
-    const height = titleMetrics.height
-      + (composerMetrics ? TITLE_LINE_GAP + composerMetrics.height : 0);
-    return {
-      block: {
-        width: Math.max(titleMetrics.width, composerMetrics?.width || 0),
-        height,
-        hasComposer: !!composerMetrics,
-      },
-      title: titleMetrics,
-      composer: composerMetrics,
-    };
-  }
-
-  /**
-   * Add the score's title + composer block to the paper's top-left
-   * as extruded 3D geometry — the same pipeline used for all other
-   * notation — so the text casts a proper ink-shaped shadow onto the
-   * paper just like notes and staff lines do.
-   *
-   * Font: `optimer_bold.typeface.json` (Three.js bundled serif, 112 KB).
-   * Loaded once per worker lifetime via `_loadTitleFont()` and cached.
-   *
-   * Coordinate system (score-local, pre-contentRoot rotation):
-   *   • Y-up: larger Y = top of page, smaller Y = bottom.
-   *   • Z = elevation above paper.  Notes sit at `noteElevation`;
-   *     this text uses the same value so it shadows identically.
-   * `font.generateShapes(text, size)` returns shapes whose XY coords
-   * are in world units with baseline at Y = 0 — no additional scale
-   * is needed beyond `size = TITLE_HEIGHT` (or `COMPOSER_HEIGHT`).
-   *
-   * Extrusion depth is chosen to match the visual weight of notation
-   * (glyphs extrude ≈ 0.003 wu after scale × glyphUseScale).
-   */
-  _addTitle(root, parsed, layout) {
-    const title = parsed.title;
-    const composer = parsed.composer;
-    if (!title || !_titleFont || !layout) return;
-
-    const margins = computePageMargins(
-      {
-        contentMaxY: (parsed.contentMinY ?? 0) + (parsed.totalHeight ?? 0),
-        contentMinY: parsed.contentMinY ?? 0,
-      },
-      title,
-      composer,
-      layout.block,
-    );
-
-    const leftX = (parsed.contentMinX ?? 0) + TITLE_LEFT_PADDING;
-    const z = SceneConfig.noteElevation;
-    // Extrusion depth: match the per-glyph world depth of notation
-    // (extrusionDepth × scale × glyphUseScale ≈ 0.003 wu).
-    const depth = SceneConfig.extrusionDepth * SceneConfig.scale * SceneConfig.glyphUseScale;
-
-    const _addTextMesh = (metrics, baselineY, color) => {
-      const geo = new THREE.ExtrudeGeometry(metrics.shapes, { depth, bevelEnabled: false });
-      geo.computeVertexNormals();
-      const mat = this._otherMat.clone();
-      mat.color.set(color);
-      const mesh = new THREE.Mesh(geo, mat);
-      mesh.position.set(leftX, baselineY, z);
-      mesh.frustumCulled = false;
-      mesh.castShadow = true;
-      mesh.name = 'title';
-      root.add(mesh);
-    };
-
-    const titleBaseline = margins.titleTopY - layout.title.maxY;
-    _addTextMesh(layout.title, titleBaseline, '#1f1a0e');
-
-    if (composer && layout.composer && margins.titleBottomY != null) {
-      const titleVisualBottom = titleBaseline + layout.title.minY;
-      const composerBaseline = titleVisualBottom - TITLE_LINE_GAP - layout.composer.maxY;
-      _addTextMesh(layout.composer, composerBaseline, '#5a4f3c');
-    }
   }
 
   dispose() {

@@ -100,7 +100,7 @@ export class RenderLoop {
   _tick(frameNow) {
     const now = Number.isFinite(frameNow) ? frameNow : performance.now();
     const cpuStart = performance.now();
-    const { dt, frameMs } = this._advanceTiming(now);
+    const dt = this._advanceTiming(now);
 
     let frameFlags = 0;
 
@@ -113,22 +113,28 @@ export class RenderLoop {
     frameFlags |= this._render();
 
     // --- Runtime pressure (light dimming) ----------------------------
-    this._updatePressure(dt, now, frameMs);
+    this._updatePressure(dt, now, this._frameMs);
 
     // --- Stats heartbeat ---------------------------------------------
     frameFlags = this._heartbeat(now, frameFlags);
     this._ctx.frameStats.endFrame(frameFlags, performance.now() - cpuStart);
   }
 
+  /** Raw rAF-to-rAF interval in ms, stored per tick so `_advanceTiming`
+   *  doesn't allocate a `{ dt, frameMs }` result object every frame. */
+  _frameMs = 0;
+
   /**
    * Frame timing: record the rAF-to-rAF interval and smooth the
-   * integration dt.  Returns the smoothed dt (seconds) and raw
-   * frameMs for the pressure/calibration step.
+   * integration dt.  Returns the smoothed dt (seconds); the raw
+   * frameMs for the pressure/calibration step is stored on
+   * `this._frameMs`.
    */
   _advanceTiming(now) {
     const { clock, frameStats } = this._ctx;
     const rawDt = Math.min(Math.max((now - this._lastFrameTime) / 1000, 0), 0.1);
     const frameMs = now - this._lastFrameTime;
+    this._frameMs = frameMs;
     this._lastFrameTime = now;
 
     // Record actual rAF interval so `probe()` can distinguish
@@ -149,7 +155,7 @@ export class RenderLoop {
       // see an exact zero dt on the first frame or a long pause.
       if (this._dtSmoothed < 0.0001) this._dtSmoothed = 0.0001;
     }
-    return { dt: this._dtSmoothed, frameMs };
+    return this._dtSmoothed;
   }
 
   /** Light balls + camera chase/lookahead + camera-jitter record. */
