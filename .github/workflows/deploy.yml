@@ -40,6 +40,11 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
+      # Quality gate — a lint or unit-test failure blocks the deploy.
+      - run: pnpm run lint
+
+      - run: pnpm run test
+
       - run: pnpm run build
 
       - uses: actions/configure-pages@v5
