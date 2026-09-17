@@ -383,6 +383,13 @@ targets then remain on one row without overlap even at 320px.
 
 ## GitHub Actions CI
 
-`.github/workflows/deploy.yml` — Vite build + GitHub Pages deploy.
+`.github/workflows/deploy.yml` — Vite build + GitHub Pages deploy.  Build gates on
+`pnpm lint` and `pnpm test` before the Vite production build, so a lint or unit-test
+failure blocks the Pages deploy.
+
+`.github/workflows/release.yml` — whenever `package.json` changes on `main`, it reads
+`version`, creates a `v<version>` git tag, and publishes a GitHub Release with auto-
+generated notes.  Tagging a version already on the remote is a no-op.
+
 `pnpm/action-setup` step must NOT specify `version:` — it defers to `packageManager` in
 `package.json`.  (Multiple-versions error was fixed in commit `669249a`.)
