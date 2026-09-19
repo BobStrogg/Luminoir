@@ -6,11 +6,15 @@
  */
 
 /**
- * Choose shadow-map size, DPR cap, and PCF type based on the result
- * of `_probeGpuCost()`.
+ * Choose shadow-map size and PCF type based on the result of
+ * `_probeGpuCost()`.  Resolution is deliberately NOT part of this
+ * decision — the renderer always runs at the browser's native
+ * `devicePixelRatio`; performance is recovered through shadow-map
+ * size, shadow refresh rate, LOD gating, FXAA suppression and light
+ * dimming instead of lowering the framebuffer resolution.
  *
  * Probe cost reference, GPU-synced via `_gpuSync` (empty scene with a
- * forced 6144² PCFSoft shadow pass at DPR ≤ 2 — see `_probeGpuCost`):
+ * forced 6144² PCFSoft shadow pass at native DPR — see `_probeGpuCost`):
  *   Apple M-series / discrete GPU   ≈ 1.5–2 ms/frame  → keep 6144²
  *   recent integrated GPU           ≈ 2–5 ms/frame    → 4096²
  *   older / budget integrated GPU   ≈ 5 ms+           → 2048²
@@ -20,43 +24,45 @@
  *
  * @param {number} probeMs
  * @param {boolean} isConstrained  Mobile / Tesla profile.
- * @returns {{ mapSize: number, softPcf: boolean, dprCap: number }}
+ * @returns {{ mapSize: number, softPcf: boolean }}
  */
 export function chooseLoadTimeQuality(probeMs, isConstrained) {
   // On mobile the rAF rate halves permanently the first time a frame
   // exceeds budget, so we are extremely conservative.
   if (isConstrained) {
-    return { mapSize: 2048, softPcf: false, dprCap: 1.5 };
+    return { mapSize: 2048, softPcf: false };
   }
   if (probeMs < 2) {
     // Very fast GPU (M3/M4, dedicated GPU) — full quality.
-    return { mapSize: 6144, softPcf: true, dprCap: 2.0 };
+    return { mapSize: 6144, softPcf: true };
   }
   if (probeMs < 5) {
     // Typical Apple Silicon or recent integrated GPU.
-    return { mapSize: 4096, softPcf: true, dprCap: 1.75 };
+    return { mapSize: 4096, softPcf: true };
   }
   // Slower integrated GPU — drop to 2048 with plain PCF.
-  return { mapSize: 2048, softPcf: false, dprCap: 1.5 };
+  return { mapSize: 2048, softPcf: false };
 }
 
 /**
  * Next rung down the shadow-quality ladder, or `null` when already
  * at the bottom.  Used by `_refineSceneQuality`'s step-down loop.
+ * Only the shadow map steps down — the framebuffer always stays at
+ * native resolution.
  *
  * @param {number} currentMapSize
- * @param {{ maxDprCap: number, allowVeryLowQuality: boolean }} opts
- * @returns {{ mapSize: number, softPcf: boolean, dprCap: number } | null}
+ * @param {{ allowVeryLowQuality: boolean }} [opts]
+ * @returns {{ mapSize: number, softPcf: boolean } | null}
  */
-export function nextQualityStep(currentMapSize, { maxDprCap, allowVeryLowQuality }) {
+export function nextQualityStep(currentMapSize, { allowVeryLowQuality = false } = {}) {
   if (currentMapSize > 4096) {
-    return { mapSize: 4096, softPcf: true, dprCap: Math.min(maxDprCap, 1.75) };
+    return { mapSize: 4096, softPcf: true };
   }
   if (currentMapSize > 2048) {
-    return { mapSize: 2048, softPcf: false, dprCap: Math.min(maxDprCap, 1.5) };
+    return { mapSize: 2048, softPcf: false };
   }
   if (allowVeryLowQuality && currentMapSize > 1024) {
-    return { mapSize: 1024, softPcf: false, dprCap: Math.min(maxDprCap, 1.25) };
+    return { mapSize: 1024, softPcf: false };
   }
   return null;
 }

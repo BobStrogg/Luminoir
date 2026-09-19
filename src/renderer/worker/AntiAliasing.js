@@ -65,14 +65,6 @@ export class AntiAliasing {
     }
   }
 
-  /** Resize the composer to the renderer's current size (used by
-   *  QualityController.setShadowQuality after a DPR change). */
-  resizeToRenderer(renderer) {
-    if (!this._effectComposer) return;
-    renderer.getSize(this._aaBufferSize);
-    this.resize(renderer, this._aaBufferSize.x, this._aaBufferSize.y);
-  }
-
   async setup(renderer, scene, camera, usingWebGPU, width, height) {
     this._msaaSamples = this._measureMsaaSamples(renderer, usingWebGPU);
     if (this._msaaSamples > 1) {

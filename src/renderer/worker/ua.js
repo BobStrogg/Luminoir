@@ -1,8 +1,9 @@
 /** Best-effort mobile detection from the worker's user-agent.  Used to
- *  pick a smaller shadow map, cheaper PCF filter and a tighter
- *  device-pixel-ratio cap so iOS Safari's "frame went over 16.67 ms →
- *  rAF clamps to 30 Hz and stays there" behaviour doesn't trigger
- *  during dense passages of large scores like Jupiter. */
+ *  pick a smaller shadow map, a cheaper PCF filter and no MSAA so iOS
+ *  Safari's "frame went over 16.67 ms → rAF clamps to 30 Hz and stays
+ *  there" behaviour doesn't trigger during dense passages of large
+ *  scores like Jupiter.  (The framebuffer always runs at native
+ *  devicePixelRatio — resolution is never reduced.) */
 export function workerUserAgent() {
   return (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
 }

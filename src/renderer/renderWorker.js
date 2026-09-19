@@ -112,8 +112,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   if (typeof smoothTime === 'number') SceneConfig.camera.smoothTime = smoothTime;
   // Mobile devices (iOS Safari especially) sit right on the edge of
   // the per-frame budget at desktop quality, and the OS halves the
-  // rAF rate the moment a frame goes over.  Trim shadow / DPR /
-  // antialias here so dense passages stay under 16.67 ms.
+  // rAF rate the moment a frame goes over.  Trim shadow resolution and
+  // antialias here so dense passages stay under 16.67 ms — never the
+  // framebuffer resolution itself, which always runs at native DPR.
   const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
 
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
@@ -144,11 +145,12 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // first use.
   ctx.host.builder = new SVG3DBuilder();
   applyOutputSettings(renderer);
-  // Cap DPR more aggressively on mobile — a Retina iPhone reports
-  // DPR 3, which triples fragment-shader work for very little visual
-  // gain on a 6" screen showing the entire score.
-  const dprCap = isMobile ? 1.5 : 2;
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
+  // Always render at the browser's native devicePixelRatio — even on
+  // mobile, where DPR 3 triples fragment work.  Resolution is the one
+  // thing we never trade for performance; the probe below recovers the
+  // budget through shadow-map size, LOD gating and the runtime pressure
+  // actuators instead.
+  renderer.setPixelRatio(devicePixelRatio || 1);
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
   renderer.setClearColor(SceneConfig.backgroundColor, 1);
   ctx.viewportHeightCss = height;
@@ -209,14 +211,12 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // resolution the GPU can sustain within half the per-frame budget.
   // Awaited here (the GPU-sync fences are async), while the score worker is
   // busy with Verovio WASM, so it adds no perceptible latency to load time.
-  const baseDpr = devicePixelRatio || 1;
-  ctx.quality.baseDevicePixelRatio = baseDpr;
   ctx.quality.runSceneProbe = isMobile || isSafari || isTesla;
   ctx.quality.allowVeryLowQuality = isConstrained;
   ctx.quality.sceneGpuBudgetMs = 14;
   const probeMs = await ctx.quality.probeGpuCost(5);
   ctx.quality.probeMsMeasured = probeMs;
-  ctx.quality.applyLoadTimeQuality(probeMs, baseDpr, isConstrained);
+  ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
 
   const cameraCtrl = ctx.cameraCtrl = new CameraController(camera, controls);
   ctx.frameStats.seedCameraPos(camera.position);
@@ -251,16 +251,13 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
 /* ------------------------------------------------------------------ */
 
 function handleResize({ width, height, devicePixelRatio, rect }) {
-  const { renderer, camera, elementProxy, antiAliasing, quality, lod } = ctx;
+  const { renderer, camera, elementProxy, antiAliasing, lod } = ctx;
   if (!renderer || !camera) return;
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  // Respect the DPR cap chosen by the load-time GPU probe — the old
-  // hardcoded `min(dpr, 2)` silently undid the probe's choice on the
-  // first window resize, putting weak GPUs right back at full
-  // resolution.
-  const dprCap = quality.chosenDprCap > 0 ? quality.chosenDprCap : 2;
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, dprCap));
+  // Always render at the browser's native devicePixelRatio — resolution
+  // is never reduced for performance (see handleInit).
+  renderer.setPixelRatio(devicePixelRatio || 1);
   renderer.setSize(width, height, false);
   antiAliasing.resize(renderer, width, height);
   ctx.viewportHeightCss = height;
@@ -484,7 +481,6 @@ function handleProbe({ id }) {
         probeMs: quality.probeMs,
         sceneProbeMs: quality.sceneProbeMs,
         shadowMapSize: quality.chosenShadowMapSize,
-        dprCap: quality.chosenDprCap,
         pixelRatio: renderer && renderer.getPixelRatio ? renderer.getPixelRatio() : 0,
         pressure: quality.pressure,
         baselineMs: quality.baselineMs,
