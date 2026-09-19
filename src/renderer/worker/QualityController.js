@@ -13,11 +13,13 @@ import {
  * **Phase 1 — load-time probe** (`probeGpuCost`, called during init and
  * score loading):
  *   The init probe renders the empty scene several times to choose the
- *   maximum shadow-map resolution, DPR, and PCF type the GPU can support.
+ *   maximum shadow-map resolution and PCF type the GPU can support.
  *   Safari, mobile, and Tesla then run a second probe with the real score
  *   while the loading overlay is still visible.  That probe may only
- *   downshift quality, so dense geometry is measured without causing a
- *   mid-playback resolution pop or shadow-map flicker.
+ *   downshift shadow quality, so dense geometry is measured without
+ *   causing a mid-playback shadow-map flicker.  The framebuffer always
+ *   renders at the browser's native `devicePixelRatio` — resolution is
+ *   never traded for performance.
  *
  * **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
  *   A 0→1 float that rises only when recent p95 frame time exceeds
@@ -27,8 +29,9 @@ import {
  *   the LOD gate's pressure-scaled thresholds.  No actuator
  *   reallocates GPU resources.
  *
- *   Shadow map size, DPR, and PCF type require a dispose / reallocate,
- *   so those settings only change behind the score-loading overlay.
+ *   Shadow map size and PCF type require a dispose / reallocate, so
+ *   those settings only change behind the score-loading overlay.
+ *   DPR never changes at all — it is always the native value.
  *
  * Calibration:
  *   The baseline rAF interval is measured from the first 30 play-session
@@ -74,12 +77,9 @@ export class QualityController {
   probeMsMeasured = -1;
   _sceneProbeMsMeasured = -1;
   _chosenShadowMapSize = 0;
-  _chosenDprCap = 0;
   /** Base light intensity saved at init so pressure can scale it. */
   baseLightIntensity = 0;
-  baseDevicePixelRatio = 1;
   _maxShadowMapSize = 0;
-  _maxDprCap = 0;
   _maxSoftPcf = false;
   sceneGpuBudgetMs = 14;
   runSceneProbe = false;
@@ -98,7 +98,6 @@ export class QualityController {
   get calibrated() { return this._calibrated; }
   get autoDimEnabled() { return this._autoDimEnabled; }
   get chosenShadowMapSize() { return this._chosenShadowMapSize; }
-  get chosenDprCap() { return this._chosenDprCap; }
   get probeMs() { return this.probeMsMeasured; }
   get sceneProbeMs() { return this._sceneProbeMsMeasured; }
 
@@ -165,7 +164,7 @@ export class QualityController {
    * on Chromium (WebGPU *and* WebGL) submission never waits for the GPU,
    * so timing `render()` alone reads ~0.2 ms regardless of how slow the
    * GPU is.  That made the old probe classify every Chromium machine as
-   * "very fast" and hand out 6144² shadows + DPR 2.0 unconditionally —
+   * "very fast" and hand out 6144² shadows unconditionally —
    * exactly the machines that then couldn't hold a consistent frame rate.
    *
    *   • WebGPU: `device.queue.onSubmittedWorkDone()` resolves when the
@@ -230,30 +229,27 @@ export class QualityController {
   }
 
   /**
-   * Choose and apply shadow-map size, DPR cap, and PCF type based on
-   * the result of `probeGpuCost()`.  Called once from `handleInit`.
+   * Choose and apply shadow-map size and PCF type based on the result
+   * of `probeGpuCost()`.  Called once from `handleInit`.  Resolution
+   * is untouched — the renderer always runs at native `devicePixelRatio`.
    */
-  applyLoadTimeQuality(probeMs, baseDpr, isConstrained) {
-    const { mapSize, softPcf, dprCap } = chooseLoadTimeQuality(probeMs, isConstrained);
+  applyLoadTimeQuality(probeMs, isConstrained) {
+    const { mapSize, softPcf } = chooseLoadTimeQuality(probeMs, isConstrained);
     this._maxShadowMapSize = mapSize;
     this._maxSoftPcf = softPcf;
-    this._maxDprCap = dprCap;
-    this.setShadowQuality(mapSize, softPcf, baseDpr, dprCap);
+    this.setShadowQuality(mapSize, softPcf);
   }
 
-  /** Apply shadow quality and DPR settings.  Must be called before
+  /** Apply shadow quality settings.  Must be called before
    *  the render loop starts so there is no mid-session dispose. */
-  setShadowQuality(mapSize, softPcf, baseDpr, dprCap) {
-    const { renderer, keyLightRig, antiAliasing, markDirty } = this._ctx;
+  setShadowQuality(mapSize, softPcf) {
+    const { renderer, keyLightRig, markDirty } = this._ctx;
     const keyLight = keyLightRig.light;
     if (!renderer || !keyLight) return;
     this._chosenShadowMapSize = mapSize;
-    this._chosenDprCap = dprCap;
     renderer.shadowMap.type = softPcf
       ? THREE.PCFSoftShadowMap
       : THREE.PCFShadowMap;
-    renderer.setPixelRatio(Math.min(baseDpr, dprCap));
-    antiAliasing.resizeToRenderer(renderer);
     if (keyLight.shadow.mapSize.width !== mapSize) {
       keyLight.shadow.mapSize.width  = mapSize;
       keyLight.shadow.mapSize.height = mapSize;
@@ -274,17 +270,15 @@ export class QualityController {
 
   stepDown() {
     const step = nextQualityStep(this._chosenShadowMapSize, {
-      maxDprCap: this._maxDprCap,
       allowVeryLowQuality: this.allowVeryLowQuality,
     });
     if (!step) return false;
-    this.setShadowQuality(step.mapSize, step.softPcf, this.baseDevicePixelRatio, step.dprCap);
+    this.setShadowQuality(step.mapSize, step.softPcf);
     return true;
   }
 
   async refineSceneQuality() {
-    this.setShadowQuality(
-      this._maxShadowMapSize, this._maxSoftPcf, this.baseDevicePixelRatio, this._maxDprCap);
+    this.setShadowQuality(this._maxShadowMapSize, this._maxSoftPcf);
     if (!this.runSceneProbe) {
       this._sceneProbeMsMeasured = -1;
       return;

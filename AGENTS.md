@@ -146,20 +146,24 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - CRITICAL: the GPU fence makes the probe meaningful on Chromium — bare
   `renderer.render()` only measures CPU submit time (~0.25 ms), which previously routed
   every Chromium browser into the top tier regardless of GPU speed.
-- Initial desktop thresholds: < 2 ms → 6144² PCFSoft DPR 2.0; < 5 ms → 4096²
-  PCFSoft DPR 1.75; else → 2048² PCF DPR 1.5.
-- Mobile and Tesla are constrained profiles: no MSAA, 2048² PCF, DPR 1.5. Safari,
+- Initial desktop thresholds: < 2 ms → 6144² PCFSoft; < 5 ms → 4096²
+  PCFSoft; else → 2048² PCF.
+- Mobile and Tesla are constrained profiles: no MSAA, 2048² PCF. Safari,
   mobile, and Tesla cap the pooled point-light shader loop at four lights.
+- **The framebuffer always renders at the native `devicePixelRatio`** — even
+  on a DPR-3 iPhone.  Resolution is never traded for performance; savings
+  come from shadow-map size, shadow refresh rate, LOD gating, FXAA
+  suppression and light dimming instead.
 - The effective anti-aliasing mode is reported in the renderer diagnostics: desktop
   WebGPU/WebGL normally use the measured 4× default-framebuffer MSAA; no-MSAA mobile/Tesla
   profiles use the FXAA post-pass. FXAA is suppressed above runtime pressure 0.7 and
   restored below 0.25 so it cannot worsen a sustained slowdown.
 - Safari, mobile, and Tesla run a second 3-frame **median** probe with the real score
   while the loading overlay remains visible.  If a forced full frame exceeds 14 ms it
-  can only step down (6144→4096→2048, plus 1024/DPR 1.25 on constrained devices).
-- Shadow map/DPR/PCF may change only while `_compiling` keeps the loading overlay up;
-  they never change during playback. `handleResize` must continue respecting
-  `_chosenDprCap`.
+  can only step down (6144→4096→2048, plus 1024 on constrained devices).
+- Shadow map size / PCF type may change only while `_compiling` keeps the loading
+  overlay up; they never change during playback.  DPR is never changed at all —
+  `handleInit` and `handleResize` both apply the native `devicePixelRatio` directly.
 
 **Phase 2 — runtime pressure** (`_runtimePressure`, updated each rAF):
 - A 0→1 float driven by the recent p95 rAF interval against a fixed 16.67 ms (60 fps)
@@ -207,7 +211,7 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - Jupiter WebGL measurement: ~2.5 M → ~459 k submitted triangles at the playhead;
   frame p95 improved from ~12.7 ms to ~9.2 ms on the reference Chromium run.
 
-**Key design rule**: shadow map size, DPR, and PCF type must NEVER be changed during playback. Doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame. They may change while `_compiling` keeps the score-loading overlay visible.
+**Key design rule**: shadow map size and PCF type must NEVER be changed during playback — doing so requires a shadow-map dispose + re-allocate, which causes a blank/flickery frame.  They may change while `_compiling` keeps the score-loading overlay visible.  The framebuffer's pixel ratio is always the native `devicePixelRatio`: never reintroduce a DPR cap for performance (iOS Safari was rendering visibly soft at DPR 1.5); recover the budget via shadow size/refresh, LOD thresholds, FXAA suppression and light dimming instead.
 
 ---
 
@@ -374,10 +378,10 @@ targets then remain on one row without overlap even at 320px.
 5. **Shadow map type changes**: Must dispose the existing shadow map for the new
    `shadowMap.type` to take effect.  See the pattern above under "Adaptive quality".
 
-6. **DPR on resize**: `handleResize` in the worker must use `_chosenDprCap` (the
-   probe-selected cap), never a hardcoded `Math.min(dpr, 2)` — the hardcoded form
-   silently restored full resolution on weak GPUs at the first window resize.
-   (Fixed; kept here as a warning for future resize-handler edits.)
+6. **DPR on resize**: `handleResize` in the worker must use the raw
+   `devicePixelRatio` from the resize message — no `Math.min(dpr, cap)` of
+   any kind.  Resolution is never traded for performance; the load-time
+   probe sheds cost through shadow-map size and PCF type instead.
 
 ---
 
