@@ -310,9 +310,15 @@ export class RenderLoop {
    */
   _updatePressure(dt, now) {
     const { quality, frameStats } = this._ctx;
-    const playFrameRing = frameStats.playFrameRing;
-    if (playFrameRing.filled > 0) {
-      const latestP95 = quality.sampleAq(now, playFrameRing);
+    // Sample ALL frames, not just play-session ones: a paused camera
+    // drag submits the same heavy render every dirty frame, and on a
+    // saturated GPU that's exactly when the pressure actuators (LOD
+    // shrink, FXAA suppression, caster gating) must engage.  Idle ticks
+    // are ~16.7 ms because nothing renders — they only lower the p95
+    // when there is genuinely nothing to degrade.
+    const frameRing = frameStats.frameMsRing;
+    if (frameRing.filled > 0) {
+      const latestP95 = quality.sampleAq(now, frameRing);
       if (latestP95 > 0) quality.updateRuntimePressure(dt, latestP95);
     }
   }

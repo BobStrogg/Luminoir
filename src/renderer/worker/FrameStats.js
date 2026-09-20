@@ -61,6 +61,11 @@ export class FrameStats {
   _cameraDeltaRing = new RingBuffer(120);
 
   get playFrameRing() { return this._playFrameMsRing; }
+  /** All-frames ring — includes paused/idle ticks.  Used by the runtime
+   *  pressure sampler so heavy *paused* frames (e.g. a camera drag on a
+   *  saturated GPU) can still push pressure up; idle ticks are ~16.7 ms
+   *  only because nothing renders, so they can't mask real pressure. */
+  get frameMsRing() { return this._frameMsRing; }
   get lastRenderMs() { return this._lastRenderMs; }
   get framesSinceRender() { return this._framesSinceRender; }
 
