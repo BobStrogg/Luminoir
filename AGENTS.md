@@ -349,11 +349,17 @@ because the controller is stateless w.r.t. user input: every frame it
 reads the post-`controls.update()` camera offset back into
 `_currentSpherical`, and auto-return only engages seconds after release.
 Do NOT set `controls.enableDamping = false` — an earlier refactor did,
-losing inertia entirely.  For integration smoothness, `_advanceTiming`
-snaps the rAF interval to the calibrated refresh multiple
-(`quantizeFrameMs`, only once `quality.calibrated`): springs integrate in
-perfectly uniform display steps (16.67 ms @ 60 Hz, 8.33 ms @ 120 Hz)
-with dropped frames counting their real step cost.
+losing inertia entirely.  Three details keep the cadence identical on
+every device: (1) `controls.update` is patched to a no-op so pointer/
+wheel handlers can't consume damping steps at event rate — the real
+`controls.syncUpdate(dt)` runs once per rAF tick from `CameraController`;
+(2) `dampingFactor` is rescaled per frame by `dampingFactorForDt` so
+inertia is a fixed wall-clock time-constant at 60 Hz and 120 Hz;
+(3) `_advanceTiming` snaps the rAF interval to the calibrated refresh
+multiple (`quantizeFrameMs` against `quality.displayMs`, the snapped
+median — fed every tick, so it locks before first play): springs
+integrate in perfectly uniform display steps with dropped frames
+counting their real step cost.
 
 **Jitter diagnostics** (`probe().jitter`): frame intervals are correlated with the work from
 preceding frames (shadow pass, note-colour upload, stats heartbeat, budget skip) and include

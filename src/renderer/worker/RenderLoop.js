@@ -121,7 +121,7 @@ export class RenderLoop {
     frameFlags |= this._render();
 
     // --- Runtime pressure (light dimming) ----------------------------
-    this._updatePressure(dt, now, this._frameMs);
+    this._updatePressure(dt, now);
 
     // --- Stats heartbeat ---------------------------------------------
     frameFlags = this._heartbeat(now, frameFlags);
@@ -151,13 +151,19 @@ export class RenderLoop {
       frameStats.recordFrame(frameMs, clock.playing);
 
       const { quality } = this._ctx;
+      // Feed the refresh-rate calibration on every tick, not just while
+      // playing: idle foreground rAF ticks are clean samples of the same
+      // vsync, and locking early means camera drags get the quantized
+      // dt before the user ever presses Play.  `calibrate()` ignores
+      // stall/hidden-tab intervals itself.
+      quality.calibrate(frameMs);
       if (quality.calibrated) {
         // Calibrated: displays present on vsync boundaries, so the true
         // interval is an integer multiple of the refresh period.  Snap
         // to it — perfectly uniform spring integration (16.67 ms at
         // 60 Hz, 8.33 ms at 120 Hz) with dropped frames still costing
         // their real step count.  See quantizeFrameMs().
-        this._dtSmoothed = quantizeFrameMs(frameMs, quality.baselineMs) / 1000;
+        this._dtSmoothed = quantizeFrameMs(frameMs, quality.displayMs) / 1000;
       } else {
         // Smooth rAF jitter out of the integration dt that drives camera
         // motion.  Alpha 0.2 keeps the signal responsive while suppressing
@@ -292,9 +298,8 @@ export class RenderLoop {
 
   /**
    * Runtime pressure uses rAF-to-rAF interval as the GPU pressure
-   * signal; only fires once the baseline has been calibrated from
-   * play-session frames.  Also feeds the calibration window while
-   * playing.
+   * signal; only fires once the baseline has been calibrated.
+   * Calibration itself is fed unconditionally in `_advanceTiming`.
    *
    * Unlike the old tier system this does NOT change shadow map size,
    * DPR, or PCF type during playback.  Runtime pressure only scales
@@ -303,12 +308,10 @@ export class RenderLoop {
    * casters — none of those paths reallocates GPU resources or
    * recompiles pipelines.
    */
-  _updatePressure(dt, now, frameMs) {
-    const { clock, quality, frameStats } = this._ctx;
+  _updatePressure(dt, now) {
+    const { quality, frameStats } = this._ctx;
     const playFrameRing = frameStats.playFrameRing;
     if (playFrameRing.filled > 0) {
-      // Calibration: only feeds play-session rAF intervals.
-      if (clock.playing) quality.calibrate(frameMs);
       const latestP95 = quality.sampleAq(now, playFrameRing);
       if (latestP95 > 0) quality.updateRuntimePressure(dt, latestP95);
     }

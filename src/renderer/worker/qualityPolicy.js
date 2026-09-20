@@ -157,6 +157,51 @@ export function quantizeFrameMs(frameMs, baselineMs, maxSteps = 4) {
   return Math.abs(frameMs - snapped) < baselineMs * 0.25 ? snapped : frameMs;
 }
 
+/**
+ * Snap a measured refresh interval (the median of the calibration
+ * window) to the nearest standard display rate when it's within
+ * `tolerance` (relative) of one.  The p95 baseline used for the render
+ * budget intentionally tracks worst-case pacing; for *timing* the
+ * modal interval is the right target — a median of 16.9 ms on a 60 Hz
+ * display quantizes correctly against 16.667, whereas the raw value
+ * would leave every frame just outside the snap window.  Returns the
+ * input unchanged when nothing matches closely (unusual displays fall
+ * back to their measured rate).
+ */
+const STANDARD_REFRESH_MS = [
+  1000 / 240, 1000 / 144, 1000 / 120, 1000 / 100, 1000 / 90,
+  1000 / 75, 1000 / 60, 1000 / 50, 1000 / 40, 1000 / 30,
+];
+export function snapToRefreshInterval(ms, tolerance = 0.12) {
+  if (!(ms > 0)) return ms;
+  let best = ms;
+  let bestErr = tolerance;
+  for (const interval of STANDARD_REFRESH_MS) {
+    const err = Math.abs(ms - interval) / interval;
+    if (err < bestErr) {
+      bestErr = err;
+      best = interval;
+    }
+  }
+  return best;
+}
+
+/**
+ * OrbitControls damping is a per-update-call exponential decay
+ * (`sphericalDelta *= 1 - dampingFactor`), so a fixed factor decays
+ * twice as fast at 120 Hz as at 60 Hz — identical drags would have
+ * half the inertia on a ProMotion display.  Rescale the factor per
+ * frame so the decay is a fixed wall-clock time-constant:
+ * `f(dt) = 1 - (1 - base)^(dt / (1/60))`, i.e. `base` retains its
+ * exact meaning at 60 Hz and halves correctly at 120 Hz.
+ */
+export function dampingFactorForDt(baseFactor, dtSeconds) {
+  if (!(baseFactor > 0) || baseFactor >= 1 || !(dtSeconds > 0)) {
+    return baseFactor;
+  }
+  return 1 - Math.pow(1 - baseFactor, dtSeconds * 60);
+}
+
 const _clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**

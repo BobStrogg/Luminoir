@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { smoothDamp } from './smoothDamp.js';
+import { dampingFactorForDt } from '../renderer/worker/qualityPolicy.js';
 
 /**
  * Smooth camera that follows the light balls by updating the
@@ -153,6 +154,17 @@ export class CameraController {
     // stateless w.r.t. user input: each frame it reads the post-update
     // camera offset back into `_currentSpherical`, so inertia and the
     // auto-return spring compose without fighting.
+    //
+    // The worker patches `controls.update` to a no-op so pointer-event
+    // handlers can't consume damping steps at event rate; `syncUpdate`
+    // is the real bound method and runs exactly once per rAF tick from
+    // here.  `_dampingBase` is the configured factor's meaning at 60 Hz
+    // — `update()` rescales it by dt so inertia lasts the same
+    // wall-clock time on every display.
+    this._stepControls = typeof controls.syncUpdate === 'function'
+      ? controls.syncUpdate
+      : (dt) => controls.update(dt);
+    this._dampingBase = controls.dampingFactor || 0.12;
   }
 
   set enabled(v) {
@@ -406,7 +418,13 @@ export class CameraController {
     this._scratchOffset.setFromSpherical(this._nextSpherical);
     this.camera.position.copy(this._controls.target).add(this._scratchOffset);
 
-    this._controls.update();
+    // Damping is per-update-call, so rescale the factor by this frame's
+    // (quantized) dt: identical drags get identical wall-clock inertia
+    // on 60 Hz and 120 Hz displays and across dropped frames.
+    if (this._controls.enableDamping) {
+      this._controls.dampingFactor = dampingFactorForDt(this._dampingBase, h);
+    }
+    this._stepControls(h);
 
     // Capture the final clamped spherical offset for next frame.
     this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
@@ -671,7 +689,7 @@ export class CameraController {
     // spherical with that offset, which we then store as the current spherical.
     this._computeChase();
     this.camera.position.copy(this._controls.target).add(this._chase);
-    this._controls.update();
+    this._stepControls();
     this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
     this._currentSpherical.setFromVector3(this._scratchOffset);
   }

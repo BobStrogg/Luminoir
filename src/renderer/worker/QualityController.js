@@ -5,6 +5,7 @@ import {
   nextQualityStep,
   advancePressure,
   lightIntensityForPressure,
+  snapToRefreshInterval,
 } from './qualityPolicy.js';
 
 /**
@@ -34,8 +35,12 @@ import {
  *   DPR never changes at all — it is always the native value.
  *
  * Calibration:
- *   The baseline rAF interval is measured from the first 30 play-session
- *   ticks for diagnostics.  Runtime pressure itself targets a fixed
+ *   The baseline rAF interval is measured from the first 30 display-rate
+ *   ticks (any frames — idle ticks are valid samples of the same vsync
+ *   and feed the camera's quantized dt before the first play).  Two
+ *   baselines are derived: `baselineMs` (p95, drives the render budget)
+ *   and `displayMs` (median snapped to the nearest standard refresh,
+ *   drives `quantizeFrameMs`).  Runtime pressure targets a fixed
  *   16.67 ms frame budget so a 120 Hz display does not degrade quality
  *   merely because an occasional frame takes two refresh intervals.
  */
@@ -49,9 +54,13 @@ export class QualityController {
     this._ctx = ctx;
   }
 
-  /** Baseline rAF interval (ms) learned from the first play session.
-   *  Set once by `calibrate()` and exposed for diagnostics. */
+  /** Baseline rAF interval (ms) — p95 of the calibration window,
+   *  drives `renderBudgetMs`.  Set once by `calibrate()`. */
   _baselineMs = 16.67;
+  /** Display refresh interval (ms) — median of the calibration window
+   *  snapped to the nearest standard rate, drives `quantizeFrameMs`
+   *  so camera/light-ball dt integrates in exact vsync steps. */
+  _displayMs = 16.67;
   _calibrated = false;
   _calibCount = 0;
   _calibBuf  = new Float64Array(QualityController._CALIB_TICKS);
@@ -95,38 +104,49 @@ export class QualityController {
 
   get pressure() { return this._debugPressure ?? this._runtimePressure; }
   get baselineMs() { return this._baselineMs; }
+  get displayMs() { return this._displayMs; }
   get calibrated() { return this._calibrated; }
   get autoDimEnabled() { return this._autoDimEnabled; }
   get chosenShadowMapSize() { return this._chosenShadowMapSize; }
   get probeMs() { return this.probeMsMeasured; }
   get sceneProbeMs() { return this._sceneProbeMsMeasured; }
 
-  /** Feed one rAF interval sample.  Locks `_baselineMs` after
-   *  `_CALIB_TICKS` samples using the p95 of the collected window.  The
-   *  value is diagnostic; runtime pressure uses a fixed 60 fps target.
-   *  Keeping p95 here makes the diagnostic directly comparable with the
-   *  live p95 signal and ignores one isolated maximum-value stall. */
+  /** Feed one rAF interval sample.  Locks `_baselineMs` / `_displayMs`
+   *  after `_CALIB_TICKS` samples.  Samples above 40 ms are rejected:
+   *  no real display refreshes slower than ~25 Hz, so anything larger
+   *  is a hidden-tab throttle or a stall, not a vsync interval — and
+   *  this now runs on EVERY rAF tick (not just play-session ones), so
+   *  idle-background intervals must not poison the window.  The p95
+   *  keeps the render budget comparable with the live p95 signal; the
+   *  snapped median gives `quantizeFrameMs` the true vsync period even
+   *  when the window caught a few dropped frames. */
   calibrate(frameMs) {
-    if (this._calibrated || frameMs <= 0 || frameMs >= 2000) return;
+    if (this._calibrated || frameMs <= 0 || frameMs >= 40) return;
     this._calibBuf[this._calibCount++] = frameMs;
     if (this._calibCount >= QualityController._CALIB_TICKS) {
       this._calibSort.set(this._calibBuf);
       this._calibSort.sort();
+      const ticks = QualityController._CALIB_TICKS;
       // Clamp to a sane range in case the tab is throttled, vsync is
       // locked, or the calibration window caught a multi-spike burst
       // (upper bound covers 60 Hz p95 ≈ 17–18 ms with margin).
       this._baselineMs = Math.max(6, Math.min(25,
-        this._calibSort[Math.floor(QualityController._CALIB_TICKS * 0.95)]));
+        this._calibSort[Math.floor(ticks * 0.95)]));
+      this._displayMs = snapToRefreshInterval(this._calibSort[ticks >> 1]);
       this._calibrated = true;
     }
   }
 
-  /** Reset calibration — call on play-start so baseline re-measures
-   *  from the fresh play context, not stale idle intervals. */
+  /** Reset calibration — call when the existing baseline may be stale
+   *  (e.g. re-enabling autoDegrade after a disabled period).  NOT on
+   *  play-start: the refresh rate doesn't change when music starts,
+   *  and discarding a good idle-measured baseline to re-measure during
+   *  the heaviest frames of a play session only risks a worse value. */
   resetCalibration() {
     this._calibCount = 0;
     this._calibBuf.fill(0);
     this._baselineMs = 16.67;
+    this._displayMs = 16.67;
     this._calibrated = false;
     this._lastAqSampleMs = 0;
     this._latestAqP95 = 0;
