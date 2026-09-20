@@ -10,6 +10,15 @@ import { shadowIntervalMs } from './qualityPolicy.js';
  *  bias so notation casts a visible cast-shadow toward the camera. */
 const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
 
+/** Scratch vectors for `fitToScore`'s light-space projection — module
+ *  scope so the load-time fit allocates nothing per call. */
+const _corner = new THREE.Vector3();
+const _eye = new THREE.Vector3();
+const _zAxis = new THREE.Vector3();
+const _xAxis = new THREE.Vector3();
+const _yAxis = new THREE.Vector3();
+const _UP = new THREE.Vector3(0, 1, 0);
+
 /** Delay (ms) between shadow re-renders.  At 0 pressure the static
  *  shadow coverage refreshes at no more than 30 Hz; full pressure
  *  stretches that interval to 150 ms, or roughly 7 Hz.
@@ -78,10 +87,18 @@ export class KeyLightRig {
    *  devices where each re-render is the dominant periodic hitch. */
   _recenterDistance = _SHADOW_RECENTER_DISTANCE;
 
+  /** When true (constrained platforms), `fitToScore()` sizes the
+   *  shadow frustum to cover the entire score once at load and
+   *  `update()` never recenters — every caster is static, so the
+   *  shadow map renders exactly once behind the loading overlay and
+   *  never again during playback. */
+  _frozen = false;
+
   get light() { return this._keyLight; }
   get texelSize() { return this._keyLightTexelSize; }
   get shadowUpdates() { return this._shadowUpdates; }
   get shadowThrottled() { return this._shadowThrottled; }
+  get frozen() { return this._frozen; }
   get needsShadowUpdate() { return this._keyLight?.shadow?.needsUpdate; }
 
   /** Clear the snapped position + throttle timestamp so the next
@@ -107,6 +124,7 @@ export class KeyLightRig {
     this._recenterDistance = isConstrained
       ? _SHADOW_RECENTER_DISTANCE_CONSTRAINED
       : _SHADOW_RECENTER_DISTANCE;
+    this._frozen = isConstrained;
     // Bright neutral ambient so the white-ish paper reads as actually
     // lit-from-everywhere — the dark-theme value of 0.6 was tuned for
     // a near-black page and looked flat against the cream background.
@@ -181,6 +199,88 @@ export class KeyLightRig {
     rim.position.set(0, -3, 5); scene.add(rim);
   }
 
+  /**
+   * Fit the shadow frustum to the entire score and pin the light over
+   * its centre — the constrained-platform path.  Every caster in the
+   * scene (notation, paper, title) is static, so a single shadow render
+   * at load replaces per-frame recentering entirely: zero shadow passes
+   * during playback, which removes the dominant periodic GPU spike on
+   * iPhone-class GPUs.  Called from `SceneHost.buildScene` while
+   * `_compiling` still holds the loading overlay up.
+   *
+   * The bounds arrive in score-local coordinates; `contentRoot`'s
+   * −π/2 X rotation maps local X → world X and local Y → world −Z.
+   *
+   * @param {{ contentMinX:number, contentMinY:number, totalWidth:number, totalHeight:number }} parsed
+   */
+  fitToScore(parsed) {
+    const light = this._keyLight;
+    if (!light || !parsed) return;
+    const { contentMinX, contentMinY, totalWidth, totalHeight } = parsed;
+    if (!Number.isFinite(totalWidth) || !Number.isFinite(totalHeight)) {
+      // Malformed bounds — fall back to ordinary recentering rather
+      // than leaving the default origin-centred frustum frozen.
+      this._frozen = false;
+      return;
+    }
+
+    const margin = 2;   // wu of slack beyond the outermost casters
+    const minX = contentMinX - margin;
+    const maxX = contentMinX + totalWidth + margin;
+    const minZ = -(contentMinY + totalHeight) - margin;
+    const maxZ = -contentMinY + margin;
+    const cx = (minX + maxX) / 2;
+    const cz = (minZ + maxZ) / 2;
+
+    // Camera basis for a viewer at `eye` looking at the score centre —
+    // mirrors what DirectionalLightShadow.updateMatrices computes.
+    _eye.set(cx + _KEY_LIGHT_OFFSET.x, _KEY_LIGHT_OFFSET.y, cz + _KEY_LIGHT_OFFSET.z);
+    _corner.set(cx, 0, cz);
+    _zAxis.subVectors(_eye, _corner).normalize();      // toward the eye
+    _xAxis.crossVectors(_UP, _zAxis).normalize();      // camera right
+    _yAxis.crossVectors(_zAxis, _xAxis);               // camera up
+
+    // Project the content box (y = 0…0.3 wu covers notation/title
+    // elevation) into light space and take the tight ortho extents.
+    let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+    let dMin = Infinity, dMax = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      _corner.set(
+        i & 1 ? maxX : minX,
+        i & 2 ? 0.3 : 0,
+        i & 4 ? maxZ : minZ,
+      ).sub(_eye);
+      const u = _corner.dot(_xAxis);
+      const v = _corner.dot(_yAxis);
+      const d = -_corner.dot(_zAxis);   // distance along the view dir
+      if (u < uMin) uMin = u; if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v; if (v > vMax) vMax = v;
+      if (d < dMin) dMin = d; if (d > dMax) dMax = d;
+    }
+
+    const shadowCam = light.shadow.camera;
+    shadowCam.left = uMin - 1;
+    shadowCam.right = uMax + 1;
+    shadowCam.top = vMax + 1;
+    shadowCam.bottom = vMin - 1;
+    shadowCam.near = Math.max(0.1, dMin - 2);
+    shadowCam.far = dMax + 2;
+    shadowCam.updateProjectionMatrix();
+
+    light.target.position.set(cx, 0, cz);
+    light.position.copy(_eye);
+    light.target.updateMatrixWorld();
+    this._keyLightTexelSize.set(
+      (shadowCam.right - shadowCam.left) / light.shadow.mapSize.width,
+      (shadowCam.top - shadowCam.bottom) / light.shadow.mapSize.height,
+    );
+    light.shadow.autoUpdate = false;
+    // The one and only shadow render — it happens during the precompile
+    // warm-up, still behind the loading overlay.
+    light.shadow.needsUpdate = true;
+    this._lastShadowUpdateMs = 0;
+  }
+
   /** Slide the key directional light and its target to the given world
    *  XZ position (Y = 0 since the paper plane sits there after the
    *  contentRoot rotation).  Called every frame from the render loop
@@ -201,10 +301,6 @@ export class KeyLightRig {
    *  resolution and frustum dimensions in `SceneConfig.shadow`. */
   update(x, z, frameNow = performance.now(), pressure = 0) {
     if (!this._keyLight || !SceneConfig.shadow.enabled) return;
-    const tx = this._keyLightTexelSize.x;
-    const tz = this._keyLightTexelSize.y;
-    const xs = Math.round(x / tx) * tx;
-    const zs = Math.round(z / tz) * tz;
 
     // Disable automatic per-frame shadow re-render so we can drive it
     // manually.  This is set once on the first call; Three.js WebGPU's
@@ -217,6 +313,15 @@ export class KeyLightRig {
       // the camera pans for the first time).
       this._keyLight.shadow.needsUpdate = true;
     }
+
+    // Frozen (constrained): `fitToScore` covered the whole score at
+    // load and every caster is static — the map never re-renders.
+    if (this._frozen) return;
+
+    const tx = this._keyLightTexelSize.x;
+    const tz = this._keyLightTexelSize.y;
+    const xs = Math.round(x / tx) * tx;
+    const zs = Math.round(z / tz) * tz;
 
     // Keep the shadow projection completely static while the camera target
     // remains inside a small dead zone.  The orthographic shadow frustum is

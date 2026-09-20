@@ -493,6 +493,7 @@ function handleProbe({ id }) {
         chunking: OPTIMIZATIONS.CHUNK_BUCKETS_BY_X,
         shadowUpdates: keyLightRig.shadowUpdates,
         shadowThrottled: keyLightRig.shadowThrottled,
+        shadowFrozen: keyLightRig.frozen,
       },
       lod: {
         managed: lod.managedCount,
