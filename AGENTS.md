@@ -169,8 +169,13 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - A 0→1 float driven by the recent p95 rAF interval against a fixed 16.67 ms (60 fps)
   target.  This avoids degrading a healthy 120 Hz session merely because an occasional
   frame takes two display refreshes.
+- The p95 samples the **all-frames** ring, not just play-session ticks: a paused
+  camera drag submits the same heavy render every dirty frame, and on a saturated
+  GPU that's exactly when the actuators must engage.  Idle ticks are ~16.7 ms only
+  because nothing renders — they can't mask real pressure.
 - The p95 ring is sorted at 4 Hz, not every rAF tick; pressure itself still eases every
-  frame.  The 30-tick p95 calibration remains diagnostic only.
+  frame.  The 30-tick calibration feeds the render budget (`baselineMs`, p95) and the
+  dt quantizer (`displayMs`, snapped median); it is NOT reset on play.
 - Rises toward 1 after sustained p95 ≥ 19.17 ms and falls with p95 ≤ 17.5 ms.
 - Five actuators:
   1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
