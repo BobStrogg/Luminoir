@@ -147,10 +147,12 @@ export class CameraController {
   constructor(camera, controls) {
     this.camera = camera;
     this._controls = controls;
-    // We drive camera position manually and only let `controls.update()`
-    // apply the user's rotate gesture and clamp the orbit, so damping and
-    // auto-return don't fight.
-    controls.enableDamping = false;
+    // We drive camera position manually; `controls.update()` applies the
+    // user's (damped) rotate/zoom gesture and clamps the orbit.  Damping
+    // stays enabled — set in handleInit — because the controller is
+    // stateless w.r.t. user input: each frame it reads the post-update
+    // camera offset back into `_currentSpherical`, so inertia and the
+    // auto-return spring compose without fighting.
   }
 
   set enabled(v) {

@@ -138,6 +138,25 @@ export function castersSuppressedFor(prevSuppressed, pressure) {
   return prevSuppressed;
 }
 
+/**
+ * Snap a measured rAF interval to the nearest whole multiple of the
+ * calibrated refresh interval (`baselineMs`).  Displays present on
+ * vsync boundaries, so true frame intervals ARE integer multiples of
+ * the refresh period; sub-millisecond jitter around that cadence is
+ * timer noise.  Feeding snapped intervals to the camera/light-ball
+ * springs makes their integration perfectly uniform — 16.67 ms steps
+ * on 60 Hz, 8.33 ms on 120 Hz — while a dropped frame still counts as
+ * its real 2-step cost.  Returns `frameMs` unchanged when the measured
+ * interval isn't within 25 % of a multiple (protects against a bad
+ * baseline estimate or a genuinely irregular frame).
+ */
+export function quantizeFrameMs(frameMs, baselineMs, maxSteps = 4) {
+  if (!(baselineMs > 0) || !(frameMs > 0)) return frameMs;
+  const k = Math.min(Math.max(Math.round(frameMs / baselineMs), 1), maxSteps);
+  const snapped = k * baselineMs;
+  return Math.abs(frameMs - snapped) < baselineMs * 0.25 ? snapped : frameMs;
+}
+
 const _clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**
