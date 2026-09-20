@@ -187,7 +187,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   const elementProxy = ctx.elementProxy = new ElementProxy();
   elementProxy.setRect(rect);
   const controls = ctx.controls = new OrbitControls(camera, elementProxy);
-  controls.enableDamping = false;  // CameraController drives via sphericalDelta
+  // Drag inertia: OrbitControls decays sphericalDelta by dampingFactor
+  // each update, so a flicked drag glides to a stop instead of freezing
+  // on pointer-up.  Safe to combine with CameraController's springs —
+  // the controller is stateless w.r.t. user input (it reads the
+  // post-update camera offset back into _currentSpherical every frame),
+  // and auto-return only engages seconds after release anyway.
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.12;
   controls.enablePan = false;
   controls.minDistance = 0.3;
   controls.maxDistance = 100;

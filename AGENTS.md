@@ -342,6 +342,19 @@ cadence under 60 Hz animation (visible judder).
 **Note-glow fade by distance** (`setPlayheadX`): `glowTrailLength` in SceneConfig (default 4.0
 world units) determines how far behind the playhead notes keep their emissive.
 
+**Drag damping + quantized dt**: OrbitControls damping is ON
+(`dampingFactor = 0.12`, set in `handleInit`) — it gives drag inertia and
+smooth wheel/pinch zoom.  It composes safely with `CameraController`
+because the controller is stateless w.r.t. user input: every frame it
+reads the post-`controls.update()` camera offset back into
+`_currentSpherical`, and auto-return only engages seconds after release.
+Do NOT set `controls.enableDamping = false` — an earlier refactor did,
+losing inertia entirely.  For integration smoothness, `_advanceTiming`
+snaps the rAF interval to the calibrated refresh multiple
+(`quantizeFrameMs`, only once `quality.calibrated`): springs integrate in
+perfectly uniform display steps (16.67 ms @ 60 Hz, 8.33 ms @ 120 Hz)
+with dropped frames counting their real step cost.
+
 **Jitter diagnostics** (`probe().jitter`): frame intervals are correlated with the work from
 preceding frames (shadow pass, note-colour upload, stats heartbeat, budget skip) and include
 worker CPU time plus >12/16/20/33ms counts.  Measurements showed rare Chromium WebGPU

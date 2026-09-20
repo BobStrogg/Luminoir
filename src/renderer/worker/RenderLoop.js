@@ -3,7 +3,7 @@ import { SceneConfig } from '../../rendering/SceneConfig.js';
 import { setPlayheadX } from '../../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
 import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './FrameStats.js';
-import { renderBudgetMs } from './qualityPolicy.js';
+import { quantizeFrameMs, renderBudgetMs } from './qualityPolicy.js';
 
 /**
  * Frame-budget rendering.
@@ -150,14 +150,24 @@ export class RenderLoop {
     if (frameMs > 0 && frameMs < 2000) {
       frameStats.recordFrame(frameMs, clock.playing);
 
-      // Smooth rAF jitter out of the integration dt that drives camera
-      // motion.  Alpha 0.2 keeps the signal responsive while suppressing
-      // the ±0.5 ms vsync noise we see on Safari.
-      const alpha = Math.max(0, Math.min(1, SceneConfig.dtSmoothAlpha ?? 0.2));
-      if (alpha <= 0 || this._dtSmoothed === 0) {
-        this._dtSmoothed = rawDt;
+      const { quality } = this._ctx;
+      if (quality.calibrated) {
+        // Calibrated: displays present on vsync boundaries, so the true
+        // interval is an integer multiple of the refresh period.  Snap
+        // to it — perfectly uniform spring integration (16.67 ms at
+        // 60 Hz, 8.33 ms at 120 Hz) with dropped frames still costing
+        // their real step count.  See quantizeFrameMs().
+        this._dtSmoothed = quantizeFrameMs(frameMs, quality.baselineMs) / 1000;
       } else {
-        this._dtSmoothed = this._dtSmoothed * (1 - alpha) + rawDt * alpha;
+        // Smooth rAF jitter out of the integration dt that drives camera
+        // motion.  Alpha 0.2 keeps the signal responsive while suppressing
+        // the ±0.5 ms vsync noise we see on Safari.
+        const alpha = Math.max(0, Math.min(1, SceneConfig.dtSmoothAlpha ?? 0.2));
+        if (alpha <= 0 || this._dtSmoothed === 0) {
+          this._dtSmoothed = rawDt;
+        } else {
+          this._dtSmoothed = this._dtSmoothed * (1 - alpha) + rawDt * alpha;
+        }
       }
       // Enforce a non-zero minimum so the integration formulas never
       // see an exact zero dt on the first frame or a long pause.

@@ -7,6 +7,7 @@ import {
   shadowIntervalMs,
   fxaaSuppressedFor,
   castersSuppressedFor,
+  quantizeFrameMs,
   lodDetailThreshold,
   lodSubPixelFactor,
   renderBudgetMs,
@@ -106,6 +107,27 @@ describe('castersSuppressedFor', () => {
     expect(castersSuppressedFor(false, 0.45)).toBe(false);
     expect(castersSuppressedFor(true, 0.45)).toBe(true);
     expect(castersSuppressedFor(true, 0.30)).toBe(false);
+  });
+});
+
+describe('quantizeFrameMs', () => {
+  it('snaps to refresh multiples at 60 Hz and 120 Hz', () => {
+    expect(quantizeFrameMs(16.5, 16.67)).toBeCloseTo(16.67);
+    expect(quantizeFrameMs(17.0, 16.67)).toBeCloseTo(16.67);
+    expect(quantizeFrameMs(8.2, 8.33)).toBeCloseTo(8.33);
+    // A dropped frame still counts its full two-step cost.
+    expect(quantizeFrameMs(33.4, 16.67)).toBeCloseTo(33.34);
+  });
+
+  it('keeps the raw interval when it is not near a multiple', () => {
+    expect(quantizeFrameMs(12, 16.67)).toBe(12);      // 25 % tolerance
+    expect(quantizeFrameMs(80, 16.67)).toBe(80);      // beyond maxSteps
+  });
+
+  it('passes through degenerate inputs', () => {
+    expect(quantizeFrameMs(0, 16.67)).toBe(0);
+    expect(quantizeFrameMs(16.7, 0)).toBe(16.7);
+    expect(quantizeFrameMs(NaN, 16.67)).toBeNaN();
   });
 });
 
