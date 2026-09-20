@@ -359,7 +359,11 @@ inertia is a fixed wall-clock time-constant at 60 Hz and 120 Hz;
 multiple (`quantizeFrameMs` against `quality.displayMs`, the snapped
 median — fed every tick, so it locks before first play): springs
 integrate in perfectly uniform display steps with dropped frames
-counting their real step cost.
+counting their real step cost.  Separately, `CameraController` detects
+rAF starvation (update gap > 500 ms) and temporarily tightens the look
+spring's smoothTime for ~1.5 s — after a stall the wall-clock playhead
+is far ahead, and a 3 s smoothTime would make the camera visibly sprint
+for seconds.
 
 **Jitter diagnostics** (`probe().jitter`): frame intervals are correlated with the work from
 preceding frames (shadow pass, note-colour upload, stats heartbeat, budget skip) and include

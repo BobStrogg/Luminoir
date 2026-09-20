@@ -58,6 +58,18 @@ export class CameraController {
   _lookSpring = { x: 0, v: 0 };
   _lookSpringReady = false;
 
+  // Post-stall catch-up: `_lastTickNow` records the rAF timestamp of the
+  // previous update().  A gap > 500 ms means the worker's rAF starved
+  // (GPU backpressure, tab throttle) while the wall-clock music time kept
+  // running — the playhead is then far ahead, and a 3 s smoothTime makes
+  // the camera visibly sprint for seconds.  `_catchUpUntil` engages a
+  // tightened smoothTime for ~1.5 s so recovery is a fast glide instead.
+  // Switching smoothTime mid-flight never jerks position — it only
+  // changes the spring's responsiveness — so this is invisible during
+  // normal playback (gaps are ≤ 33 ms even at 30 fps).
+  _lastTickNow = 0;
+  _catchUpUntil = 0;
+
   // World-space offset from the look-ahead target to the camera's "chase"
   // pose.  Set by _computeChase() and used by both the base orbit and the
   // smart-camera overlay.
@@ -373,7 +385,12 @@ export class CameraController {
     // driving position via `sphericalDelta` lets user drag and the
     // auto-return spring share the same state.
     const smoothTime = SceneConfig.camera.smoothTime ?? 3.0;
-    smoothDamp(this._lookSpring, desiredLookX, smoothTime, h);
+    if (this._lastTickNow > 0 && now - this._lastTickNow > 500) {
+      this._catchUpUntil = now + 1500;
+    }
+    this._lastTickNow = now;
+    smoothDamp(this._lookSpring, desiredLookX,
+      now < this._catchUpUntil ? Math.min(smoothTime, 0.9) : smoothTime, h);
 
     // The orbit target follows the music.  Read the current camera offset
     // (which may have been updated by OrbitControls user events since the
