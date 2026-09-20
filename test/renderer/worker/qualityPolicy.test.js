@@ -8,6 +8,8 @@ import {
   fxaaSuppressedFor,
   castersSuppressedFor,
   quantizeFrameMs,
+  snapToRefreshInterval,
+  dampingFactorForDt,
   lodDetailThreshold,
   lodSubPixelFactor,
   renderBudgetMs,
@@ -128,6 +130,43 @@ describe('quantizeFrameMs', () => {
     expect(quantizeFrameMs(0, 16.67)).toBe(0);
     expect(quantizeFrameMs(16.7, 0)).toBe(16.7);
     expect(quantizeFrameMs(NaN, 16.67)).toBeNaN();
+  });
+});
+
+describe('snapToRefreshInterval', () => {
+  it('snaps near-standard medians to exact refresh periods', () => {
+    expect(snapToRefreshInterval(16.9)).toBeCloseTo(1000 / 60);
+    expect(snapToRefreshInterval(8.4)).toBeCloseTo(1000 / 120);
+    expect(snapToRefreshInterval(33.2)).toBeCloseTo(1000 / 30);
+    expect(snapToRefreshInterval(6.8)).toBeCloseTo(1000 / 144);
+  });
+
+  it('passes through non-standard rates and degenerate inputs', () => {
+    expect(snapToRefreshInterval(39)).toBe(39);   // ~26 Hz — outside every band
+    expect(snapToRefreshInterval(0)).toBe(0);
+    expect(snapToRefreshInterval(NaN)).toBeNaN();
+  });
+});
+
+describe('dampingFactorForDt', () => {
+  it('returns the base factor at exactly 60 Hz', () => {
+    expect(dampingFactorForDt(0.12, 1 / 60)).toBeCloseTo(0.12);
+  });
+
+  it('gives equal wall-clock decay at any refresh rate', () => {
+    // Two 120 Hz frames must decay the same residual delta as one 60 Hz
+    // frame: (1 - f120)² ≈ (1 - f60).
+    const f60 = dampingFactorForDt(0.12, 1 / 60);
+    const f120 = dampingFactorForDt(0.12, 1 / 120);
+    expect((1 - f120) * (1 - f120)).toBeCloseTo(1 - f60, 5);
+    // A dropped frame (33 ms) decays more per frame, matching elapsed time.
+    expect(dampingFactorForDt(0.12, 1 / 30)).toBeGreaterThan(f60);
+  });
+
+  it('passes through degenerate inputs', () => {
+    expect(dampingFactorForDt(0.12, 0)).toBe(0.12);
+    expect(dampingFactorForDt(0, 1 / 60)).toBe(0);
+    expect(dampingFactorForDt(1, 1 / 60)).toBe(1);
   });
 });
 

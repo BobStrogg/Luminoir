@@ -195,6 +195,18 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // and auto-return only engages seconds after release anyway.
   controls.enableDamping = true;
   controls.dampingFactor = 0.12;
+  // OrbitControls calls `this.update()` synchronously inside EVERY
+  // pointer-move / wheel / key handler, and each call consumes a full
+  // damping step — so residual inertia decayed at pointer-event rate
+  // (up to ~1 kHz on gaming mice) rather than frame rate, making the
+  // same gesture feel different on every device.  Replace the public
+  // `update` with a no-op so event handlers only accumulate deltas;
+  // `CameraController` invokes `syncUpdate(dt)` exactly once per rAF
+  // tick, giving damping a fixed, dt-scaled cadence identical on every
+  // display.  Deltas already aggregate in `_sphericalDelta`, so nothing
+  // is lost — the summed gesture applies on the next frame.
+  controls.syncUpdate = controls.update.bind(controls);
+  controls.update = () => {};
   controls.enablePan = false;
   controls.minDistance = 0.3;
   controls.maxDistance = 100;
@@ -311,13 +323,14 @@ function handleSnapCamera({ x, y }) {
 /* ------------------------------------------------------------------ */
 
 function handleClock({ state, musicTime, tempoScale }) {
-  const { clock, host, quality, frameStats } = ctx;
+  const { clock, host, frameStats } = ctx;
   clock.set(state, musicTime, tempoScale);
   if (state === 'playing') {
     if (host.lightBalls) host.lightBalls.play();
-    // Reset the baseline calibration so it re-measures from the first
-    // frames of this play session — not from stale idle-period rAF ticks.
-    quality.resetCalibration();
+    // NOTE: no calibration reset here — the display's refresh rate is
+    // identical before and during playback, and idle foreground ticks
+    // measure it more cleanly than the heaviest frames of a play
+    // session.  Calibration is fed every rAF tick in RenderLoop.
     // Also flush the play-frame ring so old intervals from before this
     // play session don't distort the p95 pressure signal.
     frameStats.resetForPlay();
@@ -496,6 +509,7 @@ function handleProbe({ id }) {
         pixelRatio: renderer && renderer.getPixelRatio ? renderer.getPixelRatio() : 0,
         pressure: quality.pressure,
         baselineMs: quality.baselineMs,
+        displayMs: quality.displayMs,
         calibrated: quality.calibrated,
         chunking: OPTIMIZATIONS.CHUNK_BUCKETS_BY_X,
         shadowUpdates: keyLightRig.shadowUpdates,
