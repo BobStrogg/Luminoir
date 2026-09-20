@@ -26,12 +26,20 @@ const _KEY_LIGHT_OFFSET = new THREE.Vector3(-5, 12, 8);
  *  pressure system fires.
  *
  *  Constrained platforms (mobile / Tesla legacy WebGL) get a deeper
- *  400 ms floor: their shadow passes are disproportionately
+ *  800 ms floor: their shadow passes are disproportionately
  *  expensive, so sustained pressure trades coverage lag harder. */
 const _SHADOW_RECENTER_DISTANCE = 2;
+/** On constrained devices the dead zone is much wider.  Every exit
+ *  costs one full shadow-map re-render stacked on top of an already-
+ *  heavy native-DPR main pass — on iPhone that single frame is the
+ *  "pause every few seconds" users report while the camera chases the
+ *  playhead (~every 2-6 s at 2 wu).  8 wu is still well under the
+ *  20 wu frustum half-width, so coverage keeps a ≥12 wu margin around
+ *  the camera target. */
+const _SHADOW_RECENTER_DISTANCE_CONSTRAINED = 8;
 const _SHADOW_UPDATE_MIN_MS = 1000 / 30;
 const _SHADOW_THROTTLE_MAX_DESKTOP_MS = 150;
-const _SHADOW_THROTTLE_MAX_CONSTRAINED_MS = 400;
+const _SHADOW_THROTTLE_MAX_CONSTRAINED_MS = 800;
 
 /**
  * The shadow-casting key directional light plus its texel-snapping /
@@ -65,6 +73,11 @@ export class KeyLightRig {
    *  constrained platforms where shadow passes cost the most. */
   _shadowThrottleMaxMs = _SHADOW_THROTTLE_MAX_DESKTOP_MS;
 
+  /** Dead-zone radius (world units) before the shadow frustum slides.
+   *  Set per-platform in `setupLighting()` — wider on constrained
+   *  devices where each re-render is the dominant periodic hitch. */
+  _recenterDistance = _SHADOW_RECENTER_DISTANCE;
+
   get light() { return this._keyLight; }
   get texelSize() { return this._keyLightTexelSize; }
   get shadowUpdates() { return this._shadowUpdates; }
@@ -91,6 +104,9 @@ export class KeyLightRig {
     this._shadowThrottleMaxMs = isConstrained
       ? _SHADOW_THROTTLE_MAX_CONSTRAINED_MS
       : _SHADOW_THROTTLE_MAX_DESKTOP_MS;
+    this._recenterDistance = isConstrained
+      ? _SHADOW_RECENTER_DISTANCE_CONSTRAINED
+      : _SHADOW_RECENTER_DISTANCE;
     // Bright neutral ambient so the white-ish paper reads as actually
     // lit-from-everywhere — the dark-theme value of 0.6 was tuned for
     // a near-black page and looked flat against the cream background.
@@ -206,9 +222,11 @@ export class KeyLightRig {
     // remains inside a small dead zone.  The orthographic shadow frustum is
     // 40×30 world units, so a 2-unit lag leaves ample coverage while turning
     // a 6144² re-render from a 30 Hz cost into an occasional recenter.
+    // `_recenterDistance` is 8 wu on constrained platforms — every exit
+    // is one full shadow pass, so they get a much wider zone.
     if (this._lastKeyLightSnapped.x !== null
-        && Math.abs(x - this._lastKeyLightSnapped.x) < _SHADOW_RECENTER_DISTANCE
-        && Math.abs(z - this._lastKeyLightSnapped.z) < _SHADOW_RECENTER_DISTANCE) return;
+        && Math.abs(x - this._lastKeyLightSnapped.x) < this._recenterDistance
+        && Math.abs(z - this._lastKeyLightSnapped.z) < this._recenterDistance) return;
     if (xs === this._lastKeyLightSnapped.x && zs === this._lastKeyLightSnapped.z) return;
 
     // Pressure-driven shadow throttle: under sustained GPU pressure,

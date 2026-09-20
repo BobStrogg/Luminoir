@@ -221,6 +221,9 @@ export class RenderLoop {
         quality.pressure)) {
         this.markDirty();
       }
+      // Pressure-gated shadow-caster suppression (no-op on constrained
+      // platforms — detail casters are already permanently off there).
+      lod.updateCasters(quality.pressure);
     }
     // Feed the current playhead X into the glow-falloff uniform so the
     // noteHead shader can fade out emissive glow on distant played notes.
@@ -285,8 +288,10 @@ export class RenderLoop {
    *
    * Unlike the old tier system this does NOT change shadow map size,
    * DPR, or PCF type during playback.  Runtime pressure only scales
-   * light-ball intensity and increases the shadow refresh interval;
-   * neither path reallocates GPU resources.
+   * light-ball intensity, increases the shadow refresh interval,
+   * shrinks LOD distances, suppresses FXAA, and gates detail shadow
+   * casters — none of those paths reallocates GPU resources or
+   * recompiles pipelines.
    */
   _updatePressure(dt, now, frameMs) {
     const { clock, quality, frameStats } = this._ctx;
