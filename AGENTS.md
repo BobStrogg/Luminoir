@@ -178,7 +178,8 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
      refreshes at most 30 Hz at zero pressure and stretches toward 150 ms (~7 Hz) at
      full pressure — 800 ms on constrained platforms.  Translating the DirectionalLight
      never changes shadow direction; it only slides the 40 wu-wide coverage frustum,
-     so this is visually stable.
+     so this is visually stable.  (On constrained platforms this actuator is dormant —
+     the frustum is frozen over the whole score, see "Shadow / key light".)
   3. **LOD pressure actuator** (`LodGate.apply`): the detail-hide distance shrinks
      toward 30 % of base (≈3.6 wu) and the sub-pixel cutoff rises from ~0.7 to ~2
      device px at full pressure — real GPU savings with no pipeline recompiles.
@@ -306,11 +307,17 @@ under `contentRoot`.  Direct scene children (lights) use world coordinates.
 - `_keyLight` is a `DirectionalLight` whose direction stays constant while its orthographic
   coverage follows the camera target.
 - `_updateKeyLight(x, z)` keeps that coverage completely static inside a recenter dead
-  zone — 2 wu on full GPUs, **8 wu on constrained platforms** (each exit costs a full
-  shadow-map re-render on top of a native-DPR frame — the "pause every few seconds"
-  hitch on iPhone; 8 wu still leaves ≥7 wu coverage margin on the 15 wu half-height
-  axis).  After exit, the move is texel-aligned.  The 40×30 frustum still has
-  ample coverage, while expensive 6144² shadow passes fall from ~26 Hz to ~3 Hz on Jupiter.
+  zone — 2 wu on full GPUs (the constrained fallback is 8 wu, used only if
+  `fitToScore` gets malformed bounds).  After exit, the move is texel-aligned.
+  The 40×30 frustum still has ample coverage, while expensive 6144² shadow passes
+  fall from ~26 Hz to ~3 Hz on Jupiter.
+- **Constrained platforms freeze the frustum entirely** (`KeyLightRig.fitToScore`,
+  called from `SceneHost.buildScene`): the ortho bounds are projected around the
+  whole score in light space, the light is pinned over the score centre, and the
+  map renders exactly once during the precompile warm-up — zero shadow passes
+  during playback.  Valid because every caster (notation, paper, title) is static;
+  `light.castShadow`/`light.visible` are never touched at runtime.  Trade-off:
+  texel density drops on long scores, so shadows are softer.
 - Texel-grid snapping (`_keyLightTexelSize`) prevents shadow-edge crawling at recenter time.
 - `_KEY_LIGHT_OFFSET` = `(-5, 12, 8)` gives an upper-left-front incident angle.
 

@@ -113,6 +113,11 @@ export class SceneHost {
     // Collect the LOD-tagged meshes for the runtime visibility pass
     // (LOD_DISTANT_ELEMENTS / DISTANCE_CLIP_GLYPHS).
     lod.collect(root);
+    // Constrained platforms: fit the shadow frustum to the whole score
+    // once — every caster is static, so the map renders a single time
+    // (during the precompile warm-up, under the loading overlay) and
+    // never again during playback.
+    if (keyLightRig.frozen) keyLightRig.fitToScore(parsed);
     colorizer.setScene(noteMeshMap);
 
     // Create / reset light balls for this score.  `setEvents()` below
