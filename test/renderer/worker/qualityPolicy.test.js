@@ -6,6 +6,7 @@ import {
   lightIntensityForPressure,
   shadowIntervalMs,
   fxaaSuppressedFor,
+  castersSuppressedFor,
   lodDetailThreshold,
   lodSubPixelFactor,
   renderBudgetMs,
@@ -96,6 +97,15 @@ describe('fxaaSuppressedFor', () => {
     expect(fxaaSuppressedFor(false, 0.5)).toBe(false);
     expect(fxaaSuppressedFor(true, 0.5)).toBe(true);
     expect(fxaaSuppressedFor(true, 0.25)).toBe(false);
+  });
+});
+
+describe('castersSuppressedFor', () => {
+  it('suppresses at 0.55 and restores at 0.30 with hysteresis between', () => {
+    expect(castersSuppressedFor(false, 0.55)).toBe(true);
+    expect(castersSuppressedFor(false, 0.45)).toBe(false);
+    expect(castersSuppressedFor(true, 0.45)).toBe(true);
+    expect(castersSuppressedFor(true, 0.30)).toBe(false);
   });
 });
 

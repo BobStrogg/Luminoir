@@ -122,6 +122,22 @@ export function fxaaSuppressedFor(prevSuppressed, pressure) {
   return prevSuppressed;
 }
 
+/**
+ * Detail-caster suppression hysteresis for the shadow pass: stems,
+ * flags and ledger lines (the `lodDetail` buckets — the most numerous
+ * instances in the scene) stop casting shadows once pressure reaches
+ * 0.55 and cast again below 0.30.  Toggling `mesh.castShadow` only
+ * filters the shadow render list — no pipeline recompile — so this is
+ * a free, reversible way to shrink the single heaviest periodic GPU
+ * event (a shadow-map re-render) roughly in half on dense scores.
+ * Engages earlier than FXAA suppression because it is the bigger lever.
+ */
+export function castersSuppressedFor(prevSuppressed, pressure) {
+  if (pressure >= 0.55) return true;
+  if (pressure <= 0.30) return false;
+  return prevSuppressed;
+}
+
 const _clamp01 = (v) => Math.min(1, Math.max(0, v));
 
 /**

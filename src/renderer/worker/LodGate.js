@@ -1,5 +1,5 @@
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
-import { lodDetailThreshold, lodSubPixelFactor } from './qualityPolicy.js';
+import { castersSuppressedFor, lodDetailThreshold, lodSubPixelFactor } from './qualityPolicy.js';
 
 /**
  * Distance-driven visibility gating for the tagged buckets — this is
@@ -42,11 +42,20 @@ export class LodGate {
   /** Detail-hide distance (wu) used at the last evaluation — the
    *  pressure-scaled value actually applied, exposed for probe. */
   _effectiveThreshold = OPTIMIZATIONS.LOD_DISTANCE_THRESHOLD || 12;
+  /** Set at worker init for mobile/Tesla: detail meshes never cast
+   *  shadows on those platforms — see `collect()`. */
+  constrained = false;
+  /** Whether `lodDetail` meshes are currently excluded from the shadow
+   *  pass.  On constrained platforms this is permanently true (set in
+   *  `collect`); elsewhere `updateCasters` toggles it under sustained
+   *  runtime pressure with hysteresis. */
+  _castersHidden = false;
 
   get managedCount() { return this._lodMeshes.length; }
   get hiddenCount() { return this._lodMeshes.reduce((n, m) => n + (m.visible ? 0 : 1), 0); }
   get lastDistance() { return this._lodLastDistance; }
   get effectiveThreshold() { return this._effectiveThreshold; }
+  get castersHidden() { return this._castersHidden; }
 
   /** Collect the LOD-managed meshes from a freshly-built scene root.
    *  Called from SceneHost.buildScene after the root is attached. */
@@ -54,12 +63,26 @@ export class LodGate {
     this._lodMeshes.length = 0;
     this._lodLastDistance = -1;
     this._lodLastPressure = 0;
+    this._castersHidden = false;
     if (!OPTIMIZATIONS.LOD_DISTANT_ELEMENTS && !OPTIMIZATIONS.DISTANCE_CLIP_GLYPHS) return;
     root.traverse((n) => {
       if (n.isMesh && n.userData && (n.userData.lodSize > 0 || n.userData.lodDetail)) {
         this._lodMeshes.push(n);
       }
     });
+    // Constrained platforms: detail meshes never cast shadows at all.
+    // Stems/flags/ledger lines are the most numerous instance class —
+    // at 1024-2048² map resolution each casts a sub-texel sliver nobody
+    // can see, but they dominate the shadow pass's primitive count.
+    // Excluding them makes every periodic shadow re-render roughly
+    // half the cost.  `castShadow` toggles are render-list filters,
+    // not pipeline changes, so this is safe to do before precompile.
+    if (this.constrained) {
+      for (const mesh of this._lodMeshes) {
+        if (mesh.userData.lodDetail) mesh.castShadow = false;
+      }
+      this._castersHidden = true;
+    }
   }
 
   /** Force re-evaluation on the next `apply` (viewport/DPR changed). */
@@ -71,6 +94,24 @@ export class LodGate {
     this._lodMeshes.length = 0;
     this._lodLastDistance = -1;
     this._lodLastPressure = 0;
+    this._castersHidden = false;
+  }
+
+  /**
+   * Pressure-gated shadow-caster suppression for non-constrained
+   * platforms (constrained ones already dropped detail casters in
+   * `collect`).  Engages once pressure reaches 0.55, restores below
+   * 0.30 — pure policy lives in `qualityPolicy.castersSuppressedFor`.
+   * Called every frame; the mesh pass only runs on a state change.
+   */
+  updateCasters(pressure) {
+    if (this.constrained || this._lodMeshes.length === 0) return;
+    const want = castersSuppressedFor(this._castersHidden, pressure);
+    if (want === this._castersHidden) return;
+    this._castersHidden = want;
+    for (const mesh of this._lodMeshes) {
+      if (mesh.userData.lodDetail) mesh.castShadow = !want;
+    }
   }
 
   /**

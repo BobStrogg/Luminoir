@@ -172,17 +172,21 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - The p95 ring is sorted at 4 Hz, not every rAF tick; pressure itself still eases every
   frame.  The 30-tick p95 calibration remains diagnostic only.
 - Rises toward 1 after sustained p95 ≥ 19.17 ms and falls with p95 ≤ 17.5 ms.
-- Four actuators:
+- Five actuators:
   1. `SceneConfig.lightBall.intensity` (= `_baseLightIntensity × (1 − pressure × 0.85)`).
   2. **Shadow-update throttle** (`_updateKeyLight`): static directional-shadow coverage
      refreshes at most 30 Hz at zero pressure and stretches toward 150 ms (~7 Hz) at
-     full pressure — 400 ms on constrained platforms.  Translating the DirectionalLight
+     full pressure — 800 ms on constrained platforms.  Translating the DirectionalLight
      never changes shadow direction; it only slides the 40 wu-wide coverage frustum,
      so this is visually stable.
   3. **LOD pressure actuator** (`LodGate.apply`): the detail-hide distance shrinks
      toward 30 % of base (≈3.6 wu) and the sub-pixel cutoff rises from ~0.7 to ~2
      device px at full pressure — real GPU savings with no pipeline recompiles.
   4. **FXAA suppression** hysteresis (suppress ≥ 0.7, restore ≤ 0.25).
+  5. **Detail-caster suppression** (`LodGate.updateCasters`): `lodDetail` meshes stop
+     casting shadows above pressure 0.55 and cast again below 0.30 — `castShadow`
+     toggles are render-list filters, not pipeline changes.  Shrinks the periodic
+     shadow-map re-render, the heaviest single-frame event, roughly in half.
 - Controlled by `autoDegrade`; disabling restores full intensity immediately.
 - Settings shows a pressure dot (green → amber → red).
 
@@ -199,6 +203,10 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
   shifts ≥ 0.05 — pressure scales both thresholds (see actuators above).
 - Staff lines, bar lines, beams, and noteheads are never distance-hidden (structure);
   noteheads only go sub-pixel past d ≈ 100 (controls maxDistance = 100).
+- `lodDetail` meshes also stop casting shadows entirely on constrained platforms
+  (set once in `LodGate.collect` — their shadows are sub-texel at 1024–2048² anyway)
+  and are pressure-gated elsewhere (actuator 5 above).  This roughly halves the
+  cost of each shadow re-render on dense scores.
 - Mesh `.visible` toggling does NOT recompile WebGPU pipelines (unlike light `.visible`)
   and all pipelines are pre-warmed by `precompilePipelines` regardless of visibility.
 
@@ -297,8 +305,11 @@ under `contentRoot`.  Direct scene children (lights) use world coordinates.
 
 - `_keyLight` is a `DirectionalLight` whose direction stays constant while its orthographic
   coverage follows the camera target.
-- `_updateKeyLight(x, z)` keeps that coverage completely static inside a 2-world-unit
-  recenter dead zone, then moves by a texel-aligned amount.  The 40×30 frustum still has
+- `_updateKeyLight(x, z)` keeps that coverage completely static inside a recenter dead
+  zone — 2 wu on full GPUs, **8 wu on constrained platforms** (each exit costs a full
+  shadow-map re-render on top of a native-DPR frame — the "pause every few seconds"
+  hitch on iPhone; 8 wu still leaves ≥7 wu coverage margin on the 15 wu half-height
+  axis).  After exit, the move is texel-aligned.  The 40×30 frustum still has
   ample coverage, while expensive 6144² shadow passes fall from ~26 Hz to ~3 Hz on Jupiter.
 - Texel-grid snapping (`_keyLightTexelSize`) prevents shadow-edge crawling at recenter time.
 - `_KEY_LIGHT_OFFSET` = `(-5, 12, 8)` gives an upper-left-front incident angle.

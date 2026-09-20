@@ -214,6 +214,11 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   ctx.quality.runSceneProbe = isMobile || isSafari || isTesla;
   ctx.quality.allowVeryLowQuality = isConstrained;
   ctx.quality.sceneGpuBudgetMs = 14;
+  // Constrained platforms never let detail meshes (stems/flags/ledger
+  // lines — the most numerous instance class) cast shadows; their
+  // shadows are sub-texel anyway and excluding them roughly halves the
+  // periodic shadow-pass cost.  Set before the first `lod.collect()`.
+  ctx.lod.constrained = isConstrained;
   const probeMs = await ctx.quality.probeGpuCost(5);
   ctx.quality.probeMsMeasured = probeMs;
   ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
@@ -494,6 +499,7 @@ function handleProbe({ id }) {
         hidden: lod.hiddenCount,
         lastDistance: lod.lastDistance,
         effectiveThreshold: lod.effectiveThreshold,
+        castersHidden: lod.castersHidden,
       },
     },
   });
