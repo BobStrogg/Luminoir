@@ -49,6 +49,11 @@ async function main() {
 
   const app = new LuminoirApp();
   window.__luminoirApp = app; // expose for debugging
+  // Bench harness toggled by URL: ?bench=1[&score=<id>][&auto=play][&durationSec=30]
+  const benchMode = new URLSearchParams(window.location.search).get('bench') === '1';
+  const benchScore = new URLSearchParams(window.location.search).get('score') || null;
+  const benchDuration = parseFloat(new URLSearchParams(window.location.search).get('durationSec') || '0') || 0;
+  const benchAuto = new URLSearchParams(window.location.search).get('auto') === 'play';
   /**
    * Drag the camera to a position you like, then run
    * `__captureCameraDefaults()` in the console.  Prints values to
@@ -135,6 +140,27 @@ async function main() {
     console.log(
       `[Luminoir] Ready — renderer: ${app.render.rendererKind}`,
     );
+    // Optional: load a specific score for bench runs (overrides default)
+    if (benchMode && benchScore) {
+      await app.loadDemoScore(benchScore);
+    }
+    if (benchMode) {
+      // Start worker-side aggregation, then auto-play
+      app.render.benchmarkStart(benchDuration > 0 ? benchDuration : undefined);
+      if (benchAuto) await app.play();
+      // Stop after duration or on explicit stop; if duration==0, wait for playback to finish
+      const done = new Promise((resolve) => {
+        if (benchDuration > 0) {
+          setTimeout(resolve, benchDuration * 1000 + 500);
+        } else {
+          app.onStateChange = (p) => { if (!p) resolve(); };
+        }
+      });
+      await done;
+      const result = await app.render.awaitBenchmarkResult();
+      // Surface machine-readable marker for external runners
+      console.log('__BENCH_RESULT__' + JSON.stringify({ score: benchScore, renderer: app.render.rendererKind, result }));
+    }
 
     // Now that the worker is alive and the first scene is built,
     // render the panel UI and sync live-applyable settings to the
