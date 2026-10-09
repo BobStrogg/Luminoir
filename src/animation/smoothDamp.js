@@ -9,9 +9,10 @@
  * @returns {{ x: number, v: number }} The same `state` object.
  */
 export function smoothDamp(state, target, smoothTime, dt) {
-  const omega = 2 / smoothTime;
+  const st = Math.max(1e-6, smoothTime);
+  const omega = 2 / st;
   const xw = omega * dt;
-  const exp = 1 / (1 + xw + 0.48 * xw * xw + 0.235 * xw * xw * xw);
+  const exp = Math.exp(-xw);
   const change = state.x - target;
   const temp = (state.v + omega * change) * dt;
   state.v = (state.v - omega * temp) * exp;
