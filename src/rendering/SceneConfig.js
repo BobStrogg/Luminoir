@@ -357,6 +357,10 @@ export const SceneConfig = {
     smoothTime: 3.0,
     returnTime: 2.0,
     contentHeadroom: 0.55,
+    // Use a C1-continuous Hermite interpolation for the time→x track
+    // that the camera follows.  Keeps velocity continuous across notes
+    // while preserving exact note positions and overall timing.
+    smoothTargetTrack: true,
   },
 
   /**
