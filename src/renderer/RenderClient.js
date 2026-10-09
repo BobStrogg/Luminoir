@@ -198,6 +198,13 @@ export class RenderClient {
    * since the worker will clamp to xs[0] if omitted.
    */
   setTimeline(timeline, contentMinY, contentMaxY, firstNote) {
+    try {
+      // Expose for offline/CI timeline export in bench flows
+      if (typeof window !== 'undefined') {
+        window.__luminoirLastTimeline = timeline;
+        window.__luminoirLastFraming = { contentMinY, contentMaxY, firstNote };
+      }
+    } catch {}
     this._worker.postMessage({
       type: 'setTimeline',
       timeline,
