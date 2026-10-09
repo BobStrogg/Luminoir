@@ -331,7 +331,10 @@ export class KeyLightRig {
     // is one full shadow pass, so they get a much wider zone.
     // Widen the dead zone slightly under runtime pressure to avoid frequent
     // recenter-triggered shadow renders on stressed GPUs.
-    const dynamicDeadZone = this._recenterDistance * (1 + Math.max(0, Math.min(1, pressure)) * 0.5);
+    const useDynamic = !!SceneConfig.shadow?.dynamicDeadZoneEnabled;
+    const dynamicDeadZone = useDynamic
+      ? this._recenterDistance * (1 + Math.max(0, Math.min(1, pressure)) * 0.5)
+      : this._recenterDistance;
     if (this._lastKeyLightSnapped.x !== null
         && Math.abs(x - this._lastKeyLightSnapped.x) < dynamicDeadZone
         && Math.abs(z - this._lastKeyLightSnapped.z) < dynamicDeadZone) return;
