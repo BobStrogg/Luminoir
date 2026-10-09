@@ -62,7 +62,7 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
     await delay(500);
   }
   if (!result) {
-    // Fallback: ask the page to return the benchmark result directly
+    // Fallback 1: ask the page to return the benchmark result directly
     try {
       result = await page.evaluate(async () => {
         const app = window.__luminoirApp;
@@ -73,6 +73,22 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
       });
     } catch {}
   }
+  if (result && !result.result?.cameraJitter) {
+    // Fallback 2: use a probe to fetch cameraJitter from the worker snapshot
+    try {
+      const probe = await page.evaluate(async () => {
+        const app = window.__luminoirApp;
+        if (app?.render?.probe) {
+          return await app.render.probe();
+        }
+        return null;
+      });
+      if (probe?.cameraJitter || probe?.jitter) {
+        const cj = (probe.cameraJitter || probe.jitter);
+        result = { ...(result || {}), result: { ...(result?.result || {}), cameraJitter: { p50: cj.p50, p95: cj.p95, p99: cj.p99, max: cj.max } } };
+      }
+    } catch {}
+  }
   await context.close();
   await launch.close();
   if (!result) throw new Error(`No bench result for score ${score}`);
@@ -80,7 +96,7 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
 }
 
 function summarize(label, r) {
-  const { p50, p95, p99, max, over8_3, over16_7, over33_3, samples, cameraJitter } = r.result ?? {};
+  const { p50, p95, p99, max, over8_3, over16_7, over33_3, samples, cameraJitter, cameraKinematics } = r.result ?? {};
   return {
     label,
     samples,
@@ -89,6 +105,12 @@ function summarize(label, r) {
     camJitP95: cameraJitter?.p95 ?? 0,
     camJitP99: cameraJitter?.p99 ?? 0,
     camJitMax: cameraJitter?.max ?? 0,
+    dist: cameraKinematics?.totalDistance ?? 0,
+    peakSpeed: cameraKinematics?.peakSpeed ?? 0,
+    velP95: cameraKinematics?.velP95 ?? 0,
+    accP95: cameraKinematics?.accP95 ?? 0,
+    jerkP95: cameraKinematics?.jerkP95 ?? 0,
+    pixP95: cameraKinematics?.pixelP95 ?? 0,
   };
 }
 
@@ -124,6 +146,12 @@ async function main() {
       'camJit p95': x.camJitP95?.toFixed?.(5),
       'camJit p99': x.camJitP99?.toFixed?.(5),
       'camJit max': x.camJitMax?.toFixed?.(5),
+      'dist': x.dist?.toFixed?.(3),
+      'peakSpd': x.peakSpeed?.toFixed?.(3),
+      'vel p95': x.velP95?.toFixed?.(3),
+      'acc p95': x.accP95?.toFixed?.(3),
+      'jerk p95': x.jerkP95?.toFixed?.(3),
+      'px p95': x.pixP95?.toFixed?.(2),
     })));
   } finally {
     if (child && !child.killed) child.kill('SIGTERM');

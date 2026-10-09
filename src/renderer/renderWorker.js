@@ -387,14 +387,23 @@ function handleBenchmarkStop() {
   const pick = (q) => n ? arr[Math.min(n - 1, Math.floor(n * q))] : 0;
   const p50 = pick(0.5), p95 = pick(0.95), p99 = pick(0.99);
   const max = n ? arr[n - 1] : 0;
-  // Camera jitter summary from the ring buffer (delta of per-frame motion).
-  const jitterRing = ctx.frameStats._cameraDeltaRing;
-  const jn = jitterRing?.filled ?? 0;
-  let jmax = 0;
-  if (jn > 0) jitterRing.forEach((v) => { if (v > jmax) jmax = v; });
-  const scratch = ctx.frameStats._statsScratch || new Float64Array(120);
-  const jpick = (q) => jn ? jitterRing.percentile(q, jn, scratch) : 0;
-  const jp50 = jpick(0.5), jp95 = jpick(0.95), jp99 = jpick(0.99);
+  // Camera summary from the rings
+  const fs = ctx.frameStats;
+  const jitterRing = fs._cameraDeltaRing;
+  const scratch = fs._statsScratch;
+  const jn = jitterRing.filled;
+  const jmax = jitterRing.max(jn);
+  const jp50 = jitterRing.percentile(0.5, jn, scratch);
+  const jp95 = jitterRing.percentile(0.95, jn, scratch);
+  const jp99 = jitterRing.percentile(0.99, jn, scratch);
+  const velP95 = fs._velRing.percentile(0.95, fs._velRing.filled, scratch);
+  const velP99 = fs._velRing.percentile(0.99, fs._velRing.filled, scratch);
+  const accP95 = fs._accRing.percentile(0.95, fs._accRing.filled, scratch);
+  const accP99 = fs._accRing.percentile(0.99, fs._accRing.filled, scratch);
+  const jerkP95 = fs._jerkRing.percentile(0.95, fs._jerkRing.filled, scratch);
+  const jerkP99 = fs._jerkRing.percentile(0.99, fs._jerkRing.filled, scratch);
+  const pixP95 = fs._pixRing.percentile(0.95, fs._pixRing.filled, scratch);
+  const pixP99 = fs._pixRing.percentile(0.99, fs._pixRing.filled, scratch);
   const result = {
     samples: n,
     p50, p95, p99, max,
@@ -404,6 +413,12 @@ function handleBenchmarkStop() {
     cameraJitter: {
       samples: jn,
       p50: jp50, p95: jp95, p99: jp99, max: jmax,
+    },
+    cameraKinematics: {
+      totalDistance: fs._totalCamDistance ?? 0,
+      peakSpeed: fs._peakCamSpeed ?? 0,
+      velP95, velP99, accP95, accP99, jerkP95, jerkP99,
+      pixelP95: pixP95, pixelP99: pixP99,
     },
   };
   ctx.post({ type: 'benchmarkResult', result });
