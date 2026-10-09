@@ -1,0 +1,46 @@
+{
+  "metrics": {
+    "score": "starTrekFirstContact",
+    "mode": "stalls:50",
+    "hz": 60,
+    "durationSec": 15,
+    "velocity": {
+      "name": "velocity",
+      "p50": 1.352129734258416,
+      "p95": 1.4030439181402445,
+      "p99": 1.4074926439901347,
+      "max": 1.4078709875137918
+    },
+    "acceleration": {
+      "name": "acceleration",
+      "p50": 0.03270442865002051,
+      "p95": 0.6932853761220785,
+      "p99": 1.2583540513428924,
+      "max": 1.4342704472603884
+    },
+    "jerk": {
+      "name": "jerk",
+      "p50": 0.10973898116618215,
+      "p95": 0.9309764066216618,
+      "p99": 1.9782173904019922,
+      "max": 43.5885008913246
+    },
+    "velocityDeltaPeaks": {
+      "count": 879,
+      "top5": [
+        0.023904507454339807,
+        0.023564676061127457,
+        0.023254056375554527,
+        0.022899152082054286,
+        0.022572114105221516
+      ],
+      "p95": 0.011554756268701283,
+      "max": 0.023904507454339807
+    }
+  },
+  "artifacts": {
+    "position": "bench/camera-offline-results/plots/starTrekFirstContact-60hz-stalls:50-position.png",
+    "velocity": "bench/camera-offline-results/plots/starTrekFirstContact-60hz-stalls:50-velocity.png",
+    "acceleration": "bench/camera-offline-results/plots/starTrekFirstContact-60hz-stalls:50-acceleration.png"
+  }
+}
