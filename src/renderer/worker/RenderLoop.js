@@ -149,6 +149,14 @@ export class RenderLoop {
     // submit-time from real GPU-bound frame time.
     if (frameMs > 0 && frameMs < 2000) {
       frameStats.recordFrame(frameMs, clock.playing);
+      // Optional benchmark aggregation (only records while playing)
+      const bench = this._ctx.benchmark;
+      if (bench?.enabled && clock.playing) {
+        bench.frames.push(frameMs);
+        if (frameMs > 8.34) bench.over8++;
+        if (frameMs > 16.67) bench.over16++;
+        if (frameMs > 33.34) bench.over33++;
+      }
 
       const { quality } = this._ctx;
       // Feed the refresh-rate calibration on every tick, not just while

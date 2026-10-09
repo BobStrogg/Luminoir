@@ -148,6 +148,25 @@ export class RenderClient {
       this._worker.postMessage({ type: 'probe', id });
     });
   }
+  /** Start benchmark aggregation in the worker (optional durationSec for auto-stop). */
+  benchmarkStart(durationSec) {
+    if (!this._worker) return;
+    this._worker.postMessage({ type: 'benchmarkStart', durationSec });
+  }
+  /** Stop benchmark and await the aggregated result. */
+  awaitBenchmarkResult() {
+    if (!this._worker) return Promise.resolve(null);
+    return new Promise((res) => {
+      const handler = (e) => {
+        if (e.data?.type === 'benchmarkResult') {
+          this._worker.removeEventListener('message', handler);
+          res(e.data.result);
+        }
+      };
+      this._worker.addEventListener('message', handler);
+      this._worker.postMessage({ type: 'benchmarkStop' });
+    });
+  }
 
   /** Send a freshly-parsed score to the worker to mesh. */
   buildScene(parsedScene) {

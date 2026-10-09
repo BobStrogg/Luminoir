@@ -75,6 +75,14 @@ ctx.colorizer = new PlayedNoteColorizer();
 ctx.loop = new RenderLoop(ctx);
 // Convenience alias — the scene itself lives on the host.
 ctx.scene = ctx.host.scene;
+// Benchmark aggregator (enabled only during explicit bench runs)
+ctx.benchmark = {
+  enabled: false,
+  frames: /** @type {number[]} */([]),
+  over8: 0,
+  over16: 0,
+  over33: 0,
+};
 
 /* ------------------------------------------------------------------ */
 /*  Message plumbing                                                   */
@@ -93,6 +101,8 @@ self.onmessage = async (e) => {
     case 'updateConfig': return handleUpdateConfig(msg);
     case 'dispose':      return handleDispose();
     case 'probe':        return handleProbe(msg);
+    case 'benchmarkStart': return handleBenchmarkStart(msg);
+    case 'benchmarkStop':  return handleBenchmarkStop(msg);
     default:
       console.warn('[renderWorker] unknown message:', msg.type);
   }
@@ -350,6 +360,42 @@ function handleClock({ state, musicTime, tempoScale }) {
 /* ------------------------------------------------------------------ */
 /*  Config / dispose / probe                                            */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/*  Benchmark control                                                   */
+/* ------------------------------------------------------------------ */
+function handleBenchmarkStart({ durationSec }) {
+  ctx.benchmark.enabled = true;
+  ctx.benchmark.frames.length = 0;
+  ctx.benchmark.over8 = 0;
+  ctx.benchmark.over16 = 0;
+  ctx.benchmark.over33 = 0;
+  if (durationSec && Number.isFinite(durationSec) && durationSec > 0) {
+    const t = setTimeout(() => {
+      // Auto-stop; main thread may still call explicit stop.
+      if (ctx.benchmark.enabled) handleBenchmarkStop({});
+    }, durationSec * 1000);
+    // detach timer ref so worker can exit if needed
+    if (t && t.unref) t.unref();
+  }
+}
+
+function handleBenchmarkStop() {
+  const arr = ctx.benchmark.frames.slice().sort((a, b) => a - b);
+  const n = arr.length;
+  const pick = (q) => n ? arr[Math.min(n - 1, Math.floor(n * q))] : 0;
+  const p50 = pick(0.5), p95 = pick(0.95), p99 = pick(0.99);
+  const max = n ? arr[n - 1] : 0;
+  const result = {
+    samples: n,
+    p50, p95, p99, max,
+    over8_3: ctx.benchmark.over8,
+    over16_7: ctx.benchmark.over16,
+    over33_3: ctx.benchmark.over33,
+  };
+  ctx.post({ type: 'benchmarkResult', result });
+  ctx.benchmark.enabled = false;
+}
 
 /**
  * Apply a flat dot-path map of `SceneConfig` updates from the main
