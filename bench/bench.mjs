@@ -42,7 +42,8 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
   const cdp = await context.newCDPSession(page);
   await cdp.send('Emulation.setCPUThrottlingRate', { rate: cpuThrottle });
 
-  const url = `${BASE_URL}/?renderer=webgl&bench=1&score=${encodeURIComponent(score)}&durationSec=${durationSec}&auto=play`;
+  const extra = process.env.BENCH_NOWIDEN === '1' ? '&nowiden=1' : '';
+  const url = `${BASE_URL}/?renderer=webgl&bench=1&score=${encodeURIComponent(score)}&durationSec=${durationSec}&auto=play${extra}`;
   let result = null;
   page.on('console', (msg) => {
     const text = msg.text();
