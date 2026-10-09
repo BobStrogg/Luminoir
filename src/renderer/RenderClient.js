@@ -133,6 +133,13 @@ export class RenderClient {
         }
         break;
       }
+      case 'benchmarkResult': {
+        this._lastBenchmarkResult = msg.result;
+        if (typeof this.onBenchmarkResult === 'function') {
+          try { this.onBenchmarkResult(msg.result); } catch {}
+        }
+        break;
+      }
     }
   }
 
@@ -156,14 +163,13 @@ export class RenderClient {
   /** Stop benchmark and await the aggregated result. */
   awaitBenchmarkResult() {
     if (!this._worker) return Promise.resolve(null);
+    if (this._lastBenchmarkResult) return Promise.resolve(this._lastBenchmarkResult);
     return new Promise((res) => {
-      const handler = (e) => {
-        if (e.data?.type === 'benchmarkResult') {
-          this._worker.removeEventListener('message', handler);
-          res(e.data.result);
-        }
+      const once = (r) => {
+        this.onBenchmarkResult = null;
+        res(r);
       };
-      this._worker.addEventListener('message', handler);
+      this.onBenchmarkResult = once;
       this._worker.postMessage({ type: 'benchmarkStop' });
     });
   }
