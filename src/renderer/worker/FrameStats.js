@@ -59,6 +59,17 @@ export class FrameStats {
   _prevCameraPos = new THREE.Vector3();
   _prevCameraDelta = 0;
   _cameraDeltaRing = new RingBuffer(120);
+  // Kinematics rings (magnitudes): velocity, acceleration, jerk, and pixel motion
+  _velRing = new RingBuffer(120);
+  _accRing = new RingBuffer(120);
+  _jerkRing = new RingBuffer(120);
+  _pixRing = new RingBuffer(120);
+  _prevVelVec = new THREE.Vector3();
+  _prevAccVec = new THREE.Vector3();
+  _havePrevKinematics = false;
+  _totalCamDistance = 0;
+  _peakCamSpeed = 0;
+  _prevTargetX = null;
   // Session-long tail counters (since last reset / scene build)
   _over8Total = 0;
   _over16Total = 0;
@@ -136,18 +147,56 @@ export class FrameStats {
     this._over33Total = 0;
   }
 
-  /** Camera-position change for the `cameraJitter` probe metric.
-   *  Variation here (not absolute motion) is the best proxy we have
-   *  for visible camera jitter caused by rAF dt noise. */
-  recordCameraDelta(cameraPos) {
+  /** Camera kinematics + legacy jitter metric.
+   *  Computes per-frame velocity/acceleration/jerk magnitudes (dt-normalized),
+   *  session totals, and screen-pixel motion based on target X. */
+  recordCameraDelta(cameraPos, target, dtSeconds, camera, pixelRatio, viewportHeightCss) {
     const dx = cameraPos.x - this._prevCameraPos.x;
     const dy = cameraPos.y - this._prevCameraPos.y;
     const dz = cameraPos.z - this._prevCameraPos.z;
-    const delta = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    this._prevCameraPos.copy(cameraPos);
-    const deltaDelta = Math.abs(delta - this._prevCameraDelta);
-    this._prevCameraDelta = delta;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    // Kinematics
+    if (dtSeconds > 0) {
+      const vel = new THREE.Vector3(dx / dtSeconds, dy / dtSeconds, dz / dtSeconds);
+      const acc = new THREE.Vector3();
+      const jerk = new THREE.Vector3();
+      if (this._havePrevKinematics) {
+        acc.copy(vel).sub(this._prevVelVec).divideScalar(dtSeconds);
+        jerk.copy(acc).sub(this._prevAccVec).divideScalar(dtSeconds);
+      } else {
+        acc.set(0, 0, 0);
+        jerk.set(0, 0, 0);
+      }
+      const vMag = vel.length();
+      const aMag = acc.length();
+      const jMag = jerk.length();
+      this._velRing.push(vMag);
+      this._accRing.push(aMag);
+      this._jerkRing.push(jMag);
+      this._totalCamDistance += dist;
+      if (vMag > this._peakCamSpeed) this._peakCamSpeed = vMag;
+      this._prevVelVec.copy(vel);
+      this._prevAccVec.copy(acc);
+      this._havePrevKinematics = true;
+    }
+    // On-screen pixel motion of target X (world→device)
+    if (camera && target && viewportHeightCss > 0) {
+      const d = camera.position.distanceTo(target);
+      const fovRad = (camera.fov * Math.PI) / 180;
+      const viewportDevicePx = Math.max(1, viewportHeightCss * (pixelRatio || 1));
+      const wupp = (2 * d * Math.tan(fovRad / 2)) / viewportDevicePx;
+      if (this._prevTargetX != null && wupp > 0) {
+        const pix = Math.abs(target.x - this._prevTargetX) / wupp;
+        this._pixRing.push(pix);
+      }
+      this._prevTargetX = target.x;
+    }
+    // Legacy jitter as second-difference of travel magnitude
+    const deltaDelta = Math.abs(dist - this._prevCameraDelta);
+    this._prevCameraDelta = dist;
     this._cameraDeltaRing.push(deltaDelta);
+    // Store previous position
+    this._prevCameraPos.copy(cameraPos);
   }
 
   /** Seed the camera-position history used by the cameraJitter probe
@@ -158,6 +207,11 @@ export class FrameStats {
     this._prevCameraDelta = 0;
     this._cameraDeltaRing.reset();
     this._cameraDeltaRing.fill(0);
+    this._velRing.reset(); this._accRing.reset(); this._jerkRing.reset(); this._pixRing.reset();
+    this._havePrevKinematics = false;
+    this._totalCamDistance = 0;
+    this._peakCamSpeed = 0;
+    this._prevTargetX = null;
   }
 
   recordRender(ms) {
