@@ -59,6 +59,10 @@ export class FrameStats {
   _prevCameraPos = new THREE.Vector3();
   _prevCameraDelta = 0;
   _cameraDeltaRing = new RingBuffer(120);
+  // Session-long tail counters (since last reset / scene build)
+  _over8Total = 0;
+  _over16Total = 0;
+  _over33Total = 0;
 
   get playFrameRing() { return this._playFrameMsRing; }
   /** All-frames ring — includes paused/idle ticks.  Used by the runtime
@@ -115,12 +119,21 @@ export class FrameStats {
    *  flags/cpu in the jitter buckets. */
   recordFrame(frameMs, playing) {
     this._frameMsRing.push(frameMs);
+    // Session-long counters
+    if (frameMs > 8.34) this._over8Total++;
+    if (frameMs > 16.67) this._over16Total++;
+    if (frameMs > 33.34) this._over33Total++;
     if (playing) this._recordJitterSample(frameMs, this._lastFrameCpuMs, this._lastFrameFlags);
     // Separate ring for AQ: only record play-session frames so that
     // long idle intervals don't make the p95 look deceptively low.
     if (playing) {
       this._playFrameMsRing.push(frameMs);
     }
+  }
+  resetSessionCounters() {
+    this._over8Total = 0;
+    this._over16Total = 0;
+    this._over33Total = 0;
   }
 
   /** Camera-position change for the `cameraJitter` probe metric.
@@ -233,6 +246,9 @@ export class FrameStats {
       longFramesOver8_3: over8,
       longFramesOver16_7: over16,
       longFramesOver33_3: over33,
+      longFramesOver8_3_total: this._over8Total,
+      longFramesOver16_7_total: this._over16Total,
+      longFramesOver33_3_total: this._over33Total,
       renderMs: rMean,
       renderMsP95: rP95,
       renderMsMax: rMax,

@@ -166,6 +166,11 @@ export class RenderClient {
     if (!this._worker) return;
     this._worker.postMessage({ type: 'benchmarkStart', durationSec });
   }
+  /** Reset session-long stats counters (long-frame totals). */
+  resetStatsCounters() {
+    if (!this._worker) return;
+    this._worker.postMessage({ type: 'statsReset' });
+  }
   /** Stop benchmark and await the aggregated result. */
   awaitBenchmarkResult() {
     if (!this._worker) return Promise.resolve(null);
