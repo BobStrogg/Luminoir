@@ -39,7 +39,18 @@ export async function createRenderer({ canvas, forceWebGL, antialias }) {
   }
   if (!renderer) {
     try {
-      renderer = new THREE.WebGLRenderer({ canvas, antialias, powerPreference: 'high-performance' });
+      // Disable stencil to reduce tile memory/bandwidth on mobile/Tesla WebGL.
+      // We do not rely on the stencil buffer anywhere in this project.
+      renderer = new THREE.WebGLRenderer({
+        canvas,
+        antialias,
+        powerPreference: 'high-performance',
+        alpha: false,
+        stencil: false,
+        depth: true,
+        premultipliedAlpha: false,
+        preserveDrawingBuffer: false,
+      });
     } catch (e) {
       return { renderer: null, usingWebGPU: false, error: e };
     }
