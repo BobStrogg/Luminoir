@@ -80,12 +80,15 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
 }
 
 function summarize(label, r) {
-  const { p50, p95, p99, max, over8_3, over16_7, over33_3, samples } = r.result ?? {};
+  const { p50, p95, p99, max, over8_3, over16_7, over33_3, samples, cameraJitter } = r.result ?? {};
   return {
     label,
     samples,
     p50, p95, p99, max,
     over8_3, over16_7, over33_3,
+    camJitP95: cameraJitter?.p95 ?? 0,
+    camJitP99: cameraJitter?.p99 ?? 0,
+    camJitMax: cameraJitter?.max ?? 0,
   };
 }
 
@@ -118,6 +121,9 @@ async function main() {
       '>8.3ms': x.over8_3,
       '>16.7ms': x.over16_7,
       '>33.3ms': x.over33_3,
+      'camJit p95': x.camJitP95?.toFixed?.(5),
+      'camJit p99': x.camJitP99?.toFixed?.(5),
+      'camJit max': x.camJitMax?.toFixed?.(5),
     })));
   } finally {
     if (child && !child.killed) child.kill('SIGTERM');
