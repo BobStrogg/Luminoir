@@ -1,0 +1,46 @@
+{
+  "metrics": {
+    "score": "jupiter",
+    "mode": "stalls:50",
+    "hz": 60,
+    "durationSec": 15,
+    "velocity": {
+      "name": "velocity",
+      "p50": 1.3521482803409524,
+      "p95": 1.4030662121904771,
+      "p99": 1.4075151929142493,
+      "max": 1.4078960830126974
+    },
+    "acceleration": {
+      "name": "acceleration",
+      "p50": 0.032804399184272214,
+      "p95": 0.6961845238916695,
+      "p99": 1.2582727599117058,
+      "max": 1.4341157530973092
+    },
+    "jerk": {
+      "name": "jerk",
+      "p50": 0.11010345045293321,
+      "p95": 1.0136350119260826,
+      "p99": 6.2717327610092255,
+      "max": 43.69384500670748
+    },
+    "velocityDeltaPeaks": {
+      "count": 879,
+      "top5": [
+        0.023901929218288487,
+        0.02356221282199479,
+        0.023227357999404646,
+        0.022896771451641484,
+        0.022569872395123966
+      ],
+      "p95": 0.011603075398194385,
+      "max": 0.023901929218288487
+    }
+  },
+  "artifacts": {
+    "position": "bench/camera-offline-results/plots/jupiter-60hz-stalls:50-position.png",
+    "velocity": "bench/camera-offline-results/plots/jupiter-60hz-stalls:50-velocity.png",
+    "acceleration": "bench/camera-offline-results/plots/jupiter-60hz-stalls:50-acceleration.png"
+  }
+}

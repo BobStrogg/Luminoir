@@ -1,5 +1,6 @@
 import { PNG } from 'pngjs';
 import fs from 'node:fs';
+import path from 'node:path';
 
 function clamp01(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
@@ -116,7 +117,7 @@ export function plotSeries({ width = 1200, height = 600, margin = { top: 20, rig
       drawLine(png, xScale(p0.t), yScale(p0.y), xScale(p1.t), yScale(p1.y), color);
     }
   }
-  fs.mkdirSync(require('node:path').dirname(outPath), { recursive: true });
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, PNG.sync.write(png));
 }
 

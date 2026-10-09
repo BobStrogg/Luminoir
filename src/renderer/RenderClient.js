@@ -203,6 +203,12 @@ export class RenderClient {
       if (typeof window !== 'undefined') {
         window.__luminoirLastTimeline = timeline;
         window.__luminoirLastFraming = { contentMinY, contentMaxY, firstNote };
+        if (String(window.location && window.location.search || '').includes('exportTimeline=1')) {
+          // Print a single machine-readable line for Playwright to scrape
+          console.log('__TIMELINE_EXPORT__' + JSON.stringify({
+            timeline, contentMinY, contentMaxY, firstNote,
+          }));
+        }
       }
     } catch {}
     this._worker.postMessage({
