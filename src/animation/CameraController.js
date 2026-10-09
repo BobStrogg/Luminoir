@@ -406,16 +406,14 @@ export class CameraController {
    */
   update(dt, now = performance.now()) {
     if (!this._enabled || !this._controls) return;
-    // Integrate large dt in smaller fixed sub-steps so a dropped
-    // frame doesn't produce a single oversized spring step that
-    // manifests as an acceleration/jerk spike. Use ~120 Hz base
-    // step with a hard cap on iteration count.
-    const dtClamped = Math.max(dt, 0.0001);
+    // Exact critically-damped integration. Split long frames into equal
+    // substeps to reduce jerk spikes from jittery dt without leaving a
+    // variable-size remainder.
+    const H = Math.max(dt, 0.0001);
     const baseStep = 1 / 240; // seconds
-    let steps = Math.max(1, Math.ceil(dtClamped / baseStep));
+    let steps = Math.max(1, Math.ceil(H / baseStep));
     steps = Math.min(steps, 24);
-    const h = dtClamped / steps;
-    const H = dtClamped; // total dt this frame
+    const h = H / steps;
 
     const desiredLookX = this._lookTarget.x;
     const desiredY = this._lookTarget.y;
