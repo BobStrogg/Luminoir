@@ -135,6 +135,12 @@ export class RenderClient {
       }
       case 'benchmarkResult': {
         this._lastBenchmarkResult = msg.result;
+        try {
+          // Surface to console for external harnesses to scrape
+          // (only fires during explicit bench runs)
+          // eslint-disable-next-line no-console
+          console.log('__BENCH_RESULT__' + JSON.stringify(msg.result));
+        } catch {}
         if (typeof this.onBenchmarkResult === 'function') {
           try { this.onBenchmarkResult(msg.result); } catch {}
         }
