@@ -2,6 +2,7 @@ import { LuminoirApp } from './LuminoirApp.js';
 import { initControls } from './ui/Controls.js';
 import { SettingsPanel } from './ui/SettingsPanel.js';
 import { SceneConfig } from './rendering/SceneConfig.js';
+import { StatsOverlay } from './ui/StatsOverlay.js';
 
 /**
  * Entry point — bootstraps the Luminoir WebGPU app.
@@ -55,6 +56,7 @@ async function main() {
   const benchDuration = parseFloat(new URLSearchParams(window.location.search).get('durationSec') || '0') || 0;
   const benchAuto = new URLSearchParams(window.location.search).get('auto') === 'play';
   const benchNoWiden = new URLSearchParams(window.location.search).get('nowiden') === '1';
+  const statsOverlay = new URLSearchParams(window.location.search).get('stats') === '1';
   /**
    * Drag the camera to a position you like, then run
    * `__captureCameraDefaults()` in the console.  Prints values to
@@ -177,6 +179,10 @@ async function main() {
     const popover = document.getElementById('settings-popover');
     if (gearBtn && popover) {
       settingsPanel.attach(app, gearBtn, popover);
+    }
+    if (statsOverlay) {
+      // Overlay that listens to RenderClient.onStats (2 Hz from worker)
+      new StatsOverlay(app.render, canvas);
     }
   } catch (err) {
     console.error('[Luminoir] Initialization failed:', err);
