@@ -147,7 +147,11 @@ async function main() {
     if (benchMode) {
       // Start worker-side aggregation, then auto-play
       app.render.benchmarkStart(benchDuration > 0 ? benchDuration : undefined);
-      if (benchAuto) await app.play();
+      if (benchAuto) {
+        try { await app.play(); } catch {}
+        // Force the worker clock to playing state even if browser blocks audio autoplay
+        app.render.setClock('playing', app.midiPlayer.currentTime, app.midiPlayer.tempoScale);
+      }
       // Stop after duration or on explicit stop; if duration==0, wait for playback to finish
       const done = new Promise((resolve) => {
         if (benchDuration > 0) {
