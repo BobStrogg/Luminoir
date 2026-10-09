@@ -387,12 +387,24 @@ function handleBenchmarkStop() {
   const pick = (q) => n ? arr[Math.min(n - 1, Math.floor(n * q))] : 0;
   const p50 = pick(0.5), p95 = pick(0.95), p99 = pick(0.99);
   const max = n ? arr[n - 1] : 0;
+  // Camera jitter summary from the ring buffer (delta of per-frame motion).
+  const jitterRing = ctx.frameStats._cameraDeltaRing;
+  const jn = jitterRing?.filled ?? 0;
+  let jmax = 0;
+  if (jn > 0) jitterRing.forEach((v) => { if (v > jmax) jmax = v; });
+  const scratch = ctx.frameStats._statsScratch || new Float64Array(120);
+  const jpick = (q) => jn ? jitterRing.percentile(q, jn, scratch) : 0;
+  const jp50 = jpick(0.5), jp95 = jpick(0.95), jp99 = jpick(0.99);
   const result = {
     samples: n,
     p50, p95, p99, max,
     over8_3: ctx.benchmark.over8,
     over16_7: ctx.benchmark.over16,
     over33_3: ctx.benchmark.over33,
+    cameraJitter: {
+      samples: jn,
+      p50: jp50, p95: jp95, p99: jp99, max: jmax,
+    },
   };
   ctx.post({ type: 'benchmarkResult', result });
   ctx.benchmark.enabled = false;
