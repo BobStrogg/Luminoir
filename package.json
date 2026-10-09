@@ -15,7 +15,9 @@
     "lint": "eslint src",
     "bench": "node bench/bench.mjs",
     "bench:camera": "node bench/camera-offline.mjs",
-    "bench:camera:all": "node bench/camera-offline.mjs --all"
+    "bench:camera:all": "node bench/camera-offline.mjs --all",
+    "bench:export-timeline": "node bench/export-timeline.mjs",
+    "bench:export-page": "node bench/export-from-page.mjs"
   },
   "dependencies": {
     "smplr": "^0.19.0",

@@ -49,6 +49,20 @@ async function loadScore(verovio, absPath) {
   return { svg, timemap };
 }
 
+function tryLoadExported(scoreKey) {
+  const p = path.resolve('bench', 'timelines', `${scoreKey}.json`);
+  if (fs.existsSync(p)) {
+    const j = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    return {
+      timeline: j.timeline || [],
+      contentMinY: j.contentMinY ?? 0,
+      contentMaxY: j.contentMaxY ?? 0,
+      firstNote: j.firstNote || null,
+    };
+  }
+  return null;
+}
+
 function buildTimeline(parsed, timemap) {
   // Copied from LuminoirApp._buildNoteTimeline (kept in sync)
   const timeline = [];
@@ -168,12 +182,23 @@ async function runOne({ scoreKey, outDir, hz, mode, durationSec }) {
     xmlIdSeed: 1,
   });
 
-  const mxlPath = path.resolve(__dirname, '..', SCORES[scoreKey]);
-  const { svg, timemap } = await loadScore(verovio, mxlPath);
-
-  // Parse SVG to structured scene
-  const parsed = await new SVGSceneParser().parse(svg);
-  const timeline = buildTimeline(parsed, timemap);
+  const exported = tryLoadExported(scoreKey);
+  let timeline, contentMinY = 0, contentMaxY = 0, firstNote = null;
+  if (exported) {
+    timeline = exported.timeline;
+    contentMinY = exported.contentMinY;
+    contentMaxY = exported.contentMaxY;
+    firstNote = exported.firstNote;
+  } else {
+    const mxlPath = path.resolve(__dirname, '..', SCORES[scoreKey]);
+    const { svg, timemap } = await loadScore(verovio, mxlPath);
+    // Parse SVG to structured scene
+    const parsed = await new SVGSceneParser().parse(svg);
+    timeline = buildTimeline(parsed, timemap);
+    contentMinY = parsed.contentMinY;
+    contentMaxY = parsed.contentMaxY;
+    firstNote = timeline.length ? { x: timeline[0].x, y: timeline[0].y } : null;
+  }
   // Prepare camera and controller (stub controls)
   const camera = new THREE.PerspectiveCamera(SceneConfig.camera.fov, 16 / 9, SceneConfig.camera.near, SceneConfig.camera.far);
   const controls = {
@@ -184,12 +209,9 @@ async function runOne({ scoreKey, outDir, hz, mode, durationSec }) {
     update: () => {},
   };
   const ctrl = new CameraController(camera, controls);
-  ctrl.configureForScore(parsed.contentMinY, parsed.contentMaxY);
+  ctrl.configureForScore(contentMinY, contentMaxY);
   ctrl.setTimeTrack(timeline);
-  if (timeline.length > 0) {
-    const first = timeline[0];
-    ctrl.snapToTarget(new THREE.Vector3(first.x, 0, 0), first.x);
-  }
+  if (firstNote) ctrl.snapToTarget(new THREE.Vector3(firstNote.x, 0, 0), firstNote.x);
 
   // Disable smart camera for pure follow metrics
   if (SceneConfig.smartCamera) SceneConfig.smartCamera.enabled = false;

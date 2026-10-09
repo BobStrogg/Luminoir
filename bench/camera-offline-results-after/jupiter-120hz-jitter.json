@@ -1,0 +1,46 @@
+{
+  "metrics": {
+    "score": "jupiter",
+    "mode": "jitter",
+    "hz": 120,
+    "durationSec": 15,
+    "velocity": {
+      "name": "velocity",
+      "p50": 1.3516486249752815,
+      "p95": 1.402322309183442,
+      "p99": 1.4071681869228438,
+      "max": 1.4075619708902865
+    },
+    "acceleration": {
+      "name": "acceleration",
+      "p50": 0.03225952411371876,
+      "p95": 0.711051570834422,
+      "p99": 1.2834028398673,
+      "max": 1.9154355842355826
+    },
+    "jerk": {
+      "name": "jerk",
+      "p50": 1.5974316981522063,
+      "p95": 22.683556213027906,
+      "p99": 59.6615976867714,
+      "max": 176.97917551112968
+    },
+    "velocityDeltaPeaks": {
+      "count": 1799,
+      "top5": [
+        0.01360211570899918,
+        0.013501783986046761,
+        0.013329886858225101,
+        0.012541269275451655,
+        0.011957128477453005
+      ],
+      "p95": 0.005519127755539532,
+      "max": 0.01360211570899918
+    }
+  },
+  "artifacts": {
+    "position": "bench/camera-offline-results/plots/jupiter-120hz-jitter-position.png",
+    "velocity": "bench/camera-offline-results/plots/jupiter-120hz-jitter-velocity.png",
+    "acceleration": "bench/camera-offline-results/plots/jupiter-120hz-jitter-acceleration.png"
+  }
+}
