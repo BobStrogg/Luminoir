@@ -99,6 +99,8 @@ export class CameraController {
    * @type {{ times: Float64Array, xs: Float64Array }}
    */
   _track = { times: new Float64Array(0), xs: new Float64Array(0) };
+  /** Optional C1-continuous derivatives per knot for Hermite interpolation. */
+  _trackMs = null;
   /** Cached monotonic index into _track for O(1) lookup during playback. */
   _trackIdx = 0;
   _lookTrackIdx = 0;
@@ -273,6 +275,7 @@ export class CameraController {
     this._lookTrackIdx = 0;
     if (!timeline || timeline.length === 0) {
       this._track = { times: new Float64Array(0), xs: new Float64Array(0) };
+      this._trackMs = null;
       return;
     }
     // Collapse notes sharing a time instant into a single knot at the
@@ -298,6 +301,29 @@ export class CameraController {
       xs[i] = xsByTime[i];
     }
     this._track = { times: ts, xs };
+    // Precompute Hermite derivatives (simple central-difference, time-aware).
+    if (SceneConfig.camera && SceneConfig.camera.smoothTargetTrack) {
+      const ms = new Float64Array(n);
+      if (n === 1) {
+        ms[0] = 0;
+      } else {
+        const h0 = ts[1] - ts[0];
+        ms[0] = (xs[1] - xs[0]) / Math.max(1e-6, h0);
+        const hn_1 = ts[n - 1] - ts[n - 2];
+        ms[n - 1] = (xs[n - 1] - xs[n - 2]) / Math.max(1e-6, hn_1);
+        for (let i = 1; i < n - 1; i++) {
+          const hm = ts[i] - ts[i - 1];
+          const hp = ts[i + 1] - ts[i];
+          const dm = (xs[i] - xs[i - 1]) / Math.max(1e-6, hm);
+          const dp = (xs[i + 1] - xs[i]) / Math.max(1e-6, hp);
+          // If slopes flip sign (rare with monotone x), keep derivative small to avoid overshoot.
+          ms[i] = (Math.sign(dm) === Math.sign(dp)) ? (dm * hp + dp * hm) / Math.max(1e-6, hm + hp) : 0;
+        }
+      }
+      this._trackMs = ms;
+    } else {
+      this._trackMs = null;
+    }
   }
 
   /**
@@ -328,8 +354,22 @@ export class CameraController {
     else this._trackIdx = i;
     const t0 = times[i];
     const t1 = times[i + 1];
-    const u = (time - t0) / (t1 - t0);
-    return xs[i] + (xs[i + 1] - xs[i]) * u;
+    const h = Math.max(1e-6, t1 - t0);
+    const u = (time - t0) / h;
+    if (this._trackMs && SceneConfig.camera && SceneConfig.camera.smoothTargetTrack) {
+      // Cubic Hermite: x(u) = h00*x0 + h10*h*m0 + h01*x1 + h11*h*m1
+      const x0 = xs[i], x1 = xs[i + 1];
+      const m0 = this._trackMs[i], m1 = this._trackMs[i + 1];
+      const u2 = u * u;
+      const u3 = u2 * u;
+      const h00 = 2 * u3 - 3 * u2 + 1;
+      const h10 = u3 - 2 * u2 + u;
+      const h01 = -2 * u3 + 3 * u2;
+      const h11 = u3 - u2;
+      return h00 * x0 + h10 * h * m0 + h01 * x1 + h11 * h * m1;
+    } else {
+      return xs[i] + (xs[i + 1] - xs[i]) * u;
+    }
   }
 
   /**
