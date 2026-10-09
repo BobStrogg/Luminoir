@@ -410,9 +410,9 @@ export class CameraController {
     // substeps to reduce jerk spikes from jittery dt without leaving a
     // variable-size remainder.
     const H = Math.max(dt, 0.0001);
-    const baseStep = 1 / 240; // seconds
+    const baseStep = 1 / 360; // seconds
     let steps = Math.max(1, Math.ceil(H / baseStep));
-    steps = Math.min(steps, 24);
+    steps = Math.min(steps, 36);
     const h = H / steps;
 
     const desiredLookX = this._lookTarget.x;

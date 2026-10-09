@@ -1,5 +1,5 @@
-{
-  "metrics": {
+[
+  {
     "score": "starTrekFirstContact",
     "mode": "jitter",
     "hz": 120,
@@ -37,10 +37,5 @@
       "p95": 0.002381579779700216,
       "max": 0.012946815951142027
     }
-  },
-  "artifacts": {
-    "position": "bench/camera-offline-results/plots/starTrekFirstContact-120hz-jitter-position.png",
-    "velocity": "bench/camera-offline-results/plots/starTrekFirstContact-120hz-jitter-velocity.png",
-    "acceleration": "bench/camera-offline-results/plots/starTrekFirstContact-120hz-jitter-acceleration.png"
   }
-}
+]
