@@ -406,9 +406,16 @@ export class CameraController {
    */
   update(dt, now = performance.now()) {
     if (!this._enabled || !this._controls) return;
-    // Clamp crazy dt so a dropped frame can't kick the spring into a
-    // multi-unit jump.
-    const h = Math.min(Math.max(dt, 0.0001), 0.1);
+    // Integrate large dt in smaller fixed sub-steps so a dropped
+    // frame doesn't produce a single oversized spring step that
+    // manifests as an acceleration/jerk spike. Use ~120 Hz base
+    // step with a hard cap on iteration count.
+    const dtClamped = Math.max(dt, 0.0001);
+    const baseStep = 1 / 240; // seconds
+    let steps = Math.max(1, Math.ceil(dtClamped / baseStep));
+    steps = Math.min(steps, 24);
+    const h = dtClamped / steps;
+    const H = dtClamped; // total dt this frame
 
     const desiredLookX = this._lookTarget.x;
     const desiredY = this._lookTarget.y;
@@ -420,17 +427,17 @@ export class CameraController {
       this._lookSpringReady = true;
     }
 
-    // Critically-damped spring for the look-ahead target.  The camera
-    // position is an OrbitControls spherical offset around this target;
-    // driving position via `sphericalDelta` lets user drag and the
-    // auto-return spring share the same state.
+    // Critically-damped spring for the look-ahead target. Substep
+    // integration keeps velocity/acceleration continuous.
     const smoothTime = SceneConfig.camera.smoothTime ?? 3.0;
     if (this._lastTickNow > 0 && now - this._lastTickNow > 500) {
       this._catchUpUntil = now + 1500;
     }
     this._lastTickNow = now;
-    smoothDamp(this._lookSpring, desiredLookX,
-      now < this._catchUpUntil ? Math.min(smoothTime, 0.9) : smoothTime, h);
+    const activeSmooth = now < this._catchUpUntil ? Math.min(smoothTime, 0.9) : smoothTime;
+    for (let s = 0; s < steps; s++) {
+      smoothDamp(this._lookSpring, desiredLookX, activeSmooth, h);
+    }
 
     // The orbit target follows the music.  Read the current camera offset
     // (which may have been updated by OrbitControls user events since the
@@ -458,7 +465,7 @@ export class CameraController {
     const returnActive = !this._userInteracting && !inCooldown;
     if (returnActive) {
       const returnTime = SceneConfig.camera.returnTime ?? 2.0;
-      const k = 1 - Math.exp(-h / returnTime);
+      const k = 1 - Math.exp(-H / returnTime);
       const desiredSpherical = this._desiredSphericalActive
         ? this._desiredSpherical
         : this._baseSpherical;
@@ -479,9 +486,9 @@ export class CameraController {
     // (quantized) dt: identical drags get identical wall-clock inertia
     // on 60 Hz and 120 Hz displays and across dropped frames.
     if (this._controls.enableDamping) {
-      this._controls.dampingFactor = dampingFactorForDt(this._dampingBase, h);
+      this._controls.dampingFactor = dampingFactorForDt(this._dampingBase, H);
     }
-    this._stepControls(h);
+    this._stepControls(H);
 
     // Capture the final clamped spherical offset for next frame.
     this._scratchOffset.copy(this.camera.position).sub(this._controls.target);
