@@ -103,6 +103,7 @@ self.onmessage = async (e) => {
     case 'probe':        return handleProbe(msg);
     case 'benchmarkStart': return handleBenchmarkStart(msg);
     case 'benchmarkStop':  return handleBenchmarkStop(msg);
+    case 'statsReset':    return handleStatsReset();
     default:
       console.warn('[renderWorker] unknown message:', msg.type);
   }
@@ -475,6 +476,10 @@ function handleDispose() {
   ctx.keyLightRig.resetCounters();
   ctx.keyLightRig.resetSnap();
   ctx.lod.clear();
+}
+
+function handleStatsReset() {
+  ctx.frameStats.resetSessionCounters();
 }
 
 /** Read-back hook used by tests: returns a small snapshot of camera +
