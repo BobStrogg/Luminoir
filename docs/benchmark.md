@@ -37,3 +37,22 @@ Notes
 - The benchmark prints a machine‑readable line:
   `__BENCH_RESULT__{"samples":...,"p50":...,"p95":...,"p99":...,"max":...}`
   which can be scraped by CI or local tooling.
+
+## Offline camera-follow harness (Node)
+
+Deterministic, browser-free harness that drives the real `CameraController`
+against the actual note timeline for built-in scores. Reports velocity,
+acceleration, and jerk statistics (dt-normalized) and exports PNG plots.
+
+Usage:
+```bash
+# Single score, 8 s, smoothing disabled (baseline)
+pnpm bench:camera -- --score=jupiter --duration=8 --smooth=false
+
+# Full sweep (Jupiter + StarTrek, 60/120 Hz, stalls/jitter)
+pnpm bench:camera:all
+```
+
+Artifacts land under `bench/camera-offline-results/`:
+- JSON metrics per run
+- Plots: `*-position.png`, `*-velocity.png`, `*-acceleration.png`
