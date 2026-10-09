@@ -284,6 +284,12 @@ async function main() {
   const all = args.includes('--all');
   const score = (args.find((a) => a.startsWith('--score=')) || '').split('=')[1] || 'jupiter';
   const durationSec = Number((args.find((a) => a.startsWith('--duration=')) || '').split('=')[1] || 30);
+  const smoothArg = (args.find((a) => a.startsWith('--smooth=')) || '').split('=')[1];
+  if (smoothArg === 'false') {
+    if (SceneConfig.camera) SceneConfig.camera.smoothTargetTrack = false;
+  } else if (smoothArg === 'true') {
+    if (SceneConfig.camera) SceneConfig.camera.smoothTargetTrack = true;
+  }
   const outDir = path.resolve('bench', 'camera-offline-results');
   fs.mkdirSync(outDir, { recursive: true });
 
