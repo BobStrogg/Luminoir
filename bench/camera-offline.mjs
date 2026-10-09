@@ -285,6 +285,10 @@ async function main() {
   const score = (args.find((a) => a.startsWith('--score=')) || '').split('=')[1] || 'jupiter';
   const durationSec = Number((args.find((a) => a.startsWith('--duration=')) || '').split('=')[1] || 30);
   const smoothArg = (args.find((a) => a.startsWith('--smooth=')) || '').split('=')[1];
+  const modesArg = (args.find((a) => a.startsWith('--modes=')) || '').split('=')[1];
+  const modes = modesArg ? modesArg.split(',').map((s) => s.trim()) : ['fixed', 'stalls:50', 'stalls:100', 'jitter'];
+  const hzArg = (args.find((a) => a.startsWith('--hz=')) || '').split('=')[1];
+  const hzList = hzArg ? hzArg.split(',').map((s) => Number(s.trim())).filter(Boolean) : [60, 120];
   if (smoothArg === 'false') {
     if (SceneConfig.camera) SceneConfig.camera.smoothTargetTrack = false;
   } else if (smoothArg === 'true') {
@@ -296,8 +300,8 @@ async function main() {
   const runs = [];
   const scoreKeys = all ? Object.keys(SCORES) : [score];
   for (const s of scoreKeys) {
-    for (const hz of [60, 120]) {
-      for (const mode of ['fixed', 'stalls:50', 'stalls:100', 'jitter']) {
+    for (const hz of hzList) {
+      for (const mode of modes) {
         // eslint-disable-next-line no-console
         console.log(`Running ${s} @ ${hz}Hz (${mode})...`);
         runs.push(await runOne({ scoreKey: s, outDir, hz, mode, durationSec }));
