@@ -81,10 +81,14 @@ export class AntiAliasing {
         this._postProcessing.outputNode = fxaa(outputPass);
       } else {
         this._effectComposer = new EffectComposer(renderer);
+        // WebGL order: render scene -> FXAA (linear space) -> Output (tone map + sRGB)
         this._effectComposer.addPass(new RenderPass(scene, camera));
-        this._effectComposer.addPass(new OutputPass());
         this._fxaaPass = new ShaderPass(FXAAShader);
         this._effectComposer.addPass(this._fxaaPass);
+        const output = new OutputPass();
+        // Ensure the very last pass writes to the default framebuffer
+        output.renderToScreen = true;
+        this._effectComposer.addPass(output);
         this.resize(renderer, width, height);
       }
       this._fxaaAvailable = true;

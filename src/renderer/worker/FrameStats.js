@@ -188,6 +188,17 @@ export class FrameStats {
     const want = Math.min(fLen, 60);
     const fMean = this._frameMsRing.mean(want);
     const fMax = this._frameMsRing.max(want);
+    const fP95 = this._frameMsRing.percentile(0.95, want, this._statsScratch);
+    const fP99 = this._frameMsRing.percentile(0.99, want, this._statsScratch);
+    // Count long frames in the recent window w.r.t 120 Hz (8.33 ms) and 60 Hz (16.67 ms) budgets
+    let over8 = 0, over16 = 0, over33 = 0;
+    const recent = this._frameMsRing.latest(want, this._statsScratch);
+    for (let i = 0; i < recent.length; i++) {
+      const v = recent[i];
+      if (v > 8.34) over8++;
+      if (v > 16.67) over16++;
+      if (v > 33.34) over33++;
+    }
     const fps = fMean > 0 ? (1000 / fMean) : 0;
 
     // Render-submit window (only render frames count; idle frames
@@ -214,7 +225,14 @@ export class FrameStats {
       fps,
       frameMs: fMean,
       frameMsMax: fMax,
+      // Keep legacy semantics: frameMsP95 reports play-session p95
       frameMsP95: playP95,
+      // Additional tail metrics over the recent window (all frames)
+      frameMsRecentP95: fP95,
+      frameMsRecentP99: fP99,
+      longFramesOver8_3: over8,
+      longFramesOver16_7: over16,
+      longFramesOver33_3: over33,
       renderMs: rMean,
       renderMsP95: rP95,
       renderMsMax: rMax,
