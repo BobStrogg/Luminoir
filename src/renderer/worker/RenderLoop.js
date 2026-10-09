@@ -214,7 +214,15 @@ export class RenderLoop {
     }
 
     if (camera && clock.playing) {
-      frameStats.recordCameraDelta(camera.position);
+      const pixelRatio = this._ctx.renderer?.getPixelRatio ? this._ctx.renderer.getPixelRatio() : 1;
+      frameStats.recordCameraDelta(
+        camera.position,
+        this._ctx.controls?.target || this._camTarget,
+        this._dtSmoothed,
+        camera,
+        pixelRatio,
+        this._ctx.viewportHeightCss,
+      );
     }
   }
 
