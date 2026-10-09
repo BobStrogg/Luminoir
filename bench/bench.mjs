@@ -60,6 +60,18 @@ async function runOne({ score, durationSec = 30, cpuThrottle = 4, headless = tru
   while (!result && Date.now() - t0 < (durationSec + 10) * 1000) {
     await delay(500);
   }
+  if (!result) {
+    // Fallback: ask the page to return the benchmark result directly
+    try {
+      result = await page.evaluate(async () => {
+        const app = window.__luminoirApp;
+        if (app?.render?.awaitBenchmarkResult) {
+          return await app.render.awaitBenchmarkResult();
+        }
+        return null;
+      });
+    } catch {}
+  }
   await context.close();
   await launch.close();
   if (!result) throw new Error(`No bench result for score ${score}`);
