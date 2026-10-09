@@ -1,0 +1,9 @@
+{
+  "durationSec": 10,
+  "cpuThrottle": 4,
+  "results": [
+    {
+      "label": "jupiter"
+    }
+  ]
+}
