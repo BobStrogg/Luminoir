@@ -54,6 +54,7 @@ async function main() {
   const benchScore = new URLSearchParams(window.location.search).get('score') || null;
   const benchDuration = parseFloat(new URLSearchParams(window.location.search).get('durationSec') || '0') || 0;
   const benchAuto = new URLSearchParams(window.location.search).get('auto') === 'play';
+  const benchNoWiden = new URLSearchParams(window.location.search).get('nowiden') === '1';
   /**
    * Drag the camera to a position you like, then run
    * `__captureCameraDefaults()` in the console.  Prints values to
@@ -145,6 +146,9 @@ async function main() {
       await app.loadDemoScore(benchScore);
     }
     if (benchMode) {
+      if (benchNoWiden) {
+        app.render.updateConfig({ 'shadow.dynamicDeadZoneEnabled': false });
+      }
       // Start worker-side aggregation, then auto-play
       app.render.benchmarkStart(benchDuration > 0 ? benchDuration : undefined);
       if (benchAuto) {

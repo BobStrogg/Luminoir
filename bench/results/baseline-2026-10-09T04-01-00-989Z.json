@@ -1,0 +1,17 @@
+{
+  "durationSec": 10,
+  "cpuThrottle": 4,
+  "results": [
+    {
+      "label": "starTrekFirstContact",
+      "samples": 54,
+      "p50": 149.9949999999999,
+      "p95": 199.98499999999876,
+      "p99": 216.65999999999985,
+      "max": 216.65999999999985,
+      "over8_3": 54,
+      "over16_7": 54,
+      "over33_3": 54
+    }
+  ]
+}

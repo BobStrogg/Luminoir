@@ -1,0 +1,20 @@
+{
+  "durationSec": 10,
+  "cpuThrottle": 4,
+  "results": [
+    {
+      "label": "jupiter"
+    },
+    {
+      "label": "starTrekFirstContact",
+      "samples": 46,
+      "p50": 150,
+      "p95": 183.32999999999993,
+      "p99": 349.98499999999876,
+      "max": 349.98499999999876,
+      "over8_3": 46,
+      "over16_7": 46,
+      "over33_3": 46
+    }
+  ]
+}

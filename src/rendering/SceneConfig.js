@@ -484,5 +484,8 @@ export const SceneConfig = {
     bias: -0.0003,
     normalBias: 0.002,
     radius: 2,
+    // Bench/feature flag: allow widening the key-light dead zone under
+    // runtime pressure to reduce recenter-triggered shadow spikes.
+    dynamicDeadZoneEnabled: true,
   },
 };
