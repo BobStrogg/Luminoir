@@ -134,6 +134,9 @@ export class QualityController {
         this._calibSort[Math.floor(ticks * 0.95)]));
       this._displayMs = snapToRefreshInterval(this._calibSort[ticks >> 1]);
       this._calibrated = true;
+      try {
+        this._ctx?.eventLog?.note?.(`aq-calibrated: baseline=${this._baselineMs.toFixed(2)} ms, display=${this._displayMs.toFixed(2)} ms`);
+      } catch {}
     }
   }
 
@@ -277,15 +280,22 @@ export class QualityController {
         keyLight.shadow.map.dispose();
         keyLight.shadow.map = null;
       }
-      keyLight.shadow.autoUpdate = true;
+      // Seed one re-render for the new allocation.  Preserve frozen
+      // constrained behaviour by keeping autoUpdate=false there.
+      keyLight.shadow.autoUpdate = keyLightRig.frozen ? false : true;
       const shadowCam = keyLight.shadow.camera;
       keyLightRig.texelSize.set(
         (shadowCam.right - shadowCam.left) / mapSize,
         (shadowCam.top - shadowCam.bottom) / mapSize,
       );
+      // Ensure the new map renders once after allocation
+      keyLight.shadow.needsUpdate = true;
     }
     keyLightRig.resetSnap();
     markDirty();
+    try {
+      this._ctx?.eventLog?.note?.(`shadow-quality: mapSize=${mapSize} softPcf=${!!softPcf} frozen=${!!keyLightRig.frozen}`);
+    } catch {}
   }
 
   stepDown() {
@@ -301,13 +311,19 @@ export class QualityController {
     this.setShadowQuality(this._maxShadowMapSize, this._maxSoftPcf);
     if (!this.runSceneProbe) {
       this._sceneProbeMsMeasured = -1;
+      try { this._ctx?.eventLog?.note?.('scene-probe: skipped'); } catch {}
       return;
     }
     let measured = await this.probeGpuCost(3, true);
+    let steps = 0;
     while (measured > this.sceneGpuBudgetMs && this.stepDown()) {
       measured = await this.probeGpuCost(3, true);
+      steps++;
     }
     this._sceneProbeMsMeasured = measured;
+    try {
+      this._ctx?.eventLog?.note?.(`scene-probe: median=${measured.toFixed(2)} ms${steps ? `, steppedDown=${steps}` : ''}`);
+    } catch {}
   }
 
   /**
