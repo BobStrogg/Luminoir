@@ -78,22 +78,29 @@ export class StatsOverlay {
     const over33T = s.longFramesOver33_3_total ?? 0;
     const aa = `${s.antiAliasing || 'None'}${s.msaaSamples > 1 ? ` (${s.msaaSamples}x)` : ''}${s.fxaaSuppressed ? ' [FXAA off]' : ''}`;
     const aq = `${s.aqCalibrated ? 'cal' : 'uncal'} base ${Number(s.aqBaselineMs || 0).toFixed(2)} ms  pressure ${Number(s.gpuPressure || 0).toFixed(2)}`;
+    const events = Array.isArray(s.events) ? s.events.slice(-8) : [];
     if (this._collapsed) {
       this._div.textContent =
         `fps ${fps}  p95 ${p95}ms  max ${fmax}ms  ${renderer} DPR ${dpr}  res ${res}`;
       this._div.appendChild(this._toggle);
       return;
     }
-    this._div.textContent = [
+    const lines = [
       `fps ${fps}    p95 ${p95} ms   p99 ${p99} ms   max ${fmax} ms`,
       `>8.3 ${over8} | >16.7 ${over16} | >33.3 ${over33}  (recent)`,
       `Σ>8.3 ${over8T} | Σ>16.7 ${over16T} | Σ>33.3 ${over33T} (session)`,
       `renderer ${renderer}   DPR ${dpr}   res ${res}`,
       `AA ${aa}`,
       `AQ ${aq}`,
-      '',
-      'Tap to reset session counters  •  Tap ▾ to collapse',
-    ].join('\n');
+    ];
+    if (events.length > 0) {
+      lines.push('');
+      lines.push('Recent events:');
+      for (const ev of events) lines.push(`- ${ev}`);
+    }
+    lines.push('');
+    lines.push('Tap to reset session counters  •  Tap ▾ to collapse');
+    this._div.textContent = lines.join('\n');
     this._div.appendChild(this._toggle);
   }
 

@@ -35,6 +35,7 @@ import { PlaybackClock } from './worker/PlaybackClock.js';
 import { FrameStats } from './worker/FrameStats.js';
 import { SceneHost } from './worker/SceneHost.js';
 import { RenderLoop } from './worker/RenderLoop.js';
+import { EventLog } from './worker/EventLog.js';
 
 /* ------------------------------------------------------------------ */
 /*  Shared worker context                                              */
@@ -73,6 +74,7 @@ ctx.quality = new QualityController(ctx);
 ctx.lod = new LodGate();
 ctx.colorizer = new PlayedNoteColorizer();
 ctx.loop = new RenderLoop(ctx);
+ctx.eventLog = new EventLog(80);
 // Convenience alias — the scene itself lives on the host.
 ctx.scene = ctx.host.scene;
 // Benchmark aggregator (enabled only during explicit bench runs)
@@ -127,6 +129,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // antialias here so dense passages stay under 16.67 ms — never the
   // framebuffer resolution itself, which always runs at native DPR.
   const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
+  ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
 
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
@@ -142,6 +145,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     return;
   }
   ctx.renderer = renderer;
+  ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}`);
 
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
@@ -181,6 +185,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   renderer.shadowMap.type = isMobile
     ? THREE.PCFShadowMap
     : THREE.PCFSoftShadowMap;
+  ctx.eventLog.note(`shadowMap.type=${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
 
   const cfg = SceneConfig.camera;
   const camera = ctx.camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
@@ -230,6 +235,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   ctx.scene.background = new THREE.Color(SceneConfig.backgroundColor);
   ctx.scene.add(ctx.host.contentRoot);
   ctx.keyLightRig.setupLighting(ctx.scene, isMobile, renderer, isConstrained);
+  if (ctx.keyLightRig.frozen) ctx.eventLog.note('shadows: frozen frustum (constrained platform)');
 
   // Save base light intensity so the runtime pressure system can scale it.
   ctx.quality.baseLightIntensity = SceneConfig.lightBall.intensity;
@@ -252,6 +258,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   const probeMs = await ctx.quality.probeGpuCost(5);
   ctx.quality.probeMsMeasured = probeMs;
   ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
+  ctx.eventLog.note(`load-probe: ${probeMs.toFixed(2)} ms → shadowMapSize=${ctx.quality.chosenShadowMapSize}`);
 
   const cameraCtrl = ctx.cameraCtrl = new CameraController(camera, controls);
   ctx.frameStats.seedCameraPos(camera.position);
@@ -299,6 +306,7 @@ function handleResize({ width, height, devicePixelRatio, rect }) {
   lod.invalidate(); // viewport changed → pixel sizes changed → re-evaluate LOD
   if (elementProxy) elementProxy.setRect(rect);
   ctx.markDirty();
+  ctx.eventLog.note(`resize: ${Math.floor(width)}×${Math.floor(height)} dpr=${(devicePixelRatio||1).toFixed(2)}`);
 }
 
 function handlePointer({ target, payload }) {
@@ -507,6 +515,7 @@ function handleDispose() {
 
 function handleStatsReset() {
   ctx.frameStats.resetSessionCounters();
+  ctx.eventLog.clear();
 }
 
 /** Read-back hook used by tests: returns a small snapshot of camera +

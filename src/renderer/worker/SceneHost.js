@@ -86,6 +86,7 @@ export class SceneHost {
 
   buildScene(parsed, cameraCtrl) {
     const { keyLightRig, frameStats, lod, colorizer } = this._ctx;
+    try { this._ctx.eventLog?.note?.('buildScene: begin'); } catch {}
     // Hold rendering for the entire build → setTimeline → precompile
     // sequence.  The main loop checks `_compiling` and skips
     // `renderer.render()` while it's true, so there's no risk of a
@@ -118,6 +119,9 @@ export class SceneHost {
     // (during the precompile warm-up, under the loading overlay) and
     // never again during playback.
     if (keyLightRig.frozen) keyLightRig.fitToScore(parsed);
+    if (keyLightRig.frozen) {
+      try { this._ctx.eventLog?.note?.('shadows: fitToScore (frozen once)'); } catch {}
+    }
     colorizer.setScene(noteMeshMap);
 
     // Create / reset light balls for this score.  `setEvents()` below
@@ -147,6 +151,7 @@ export class SceneHost {
     // Precompile is deferred to setTimeline — the scene isn't
     // in its final state yet (no light balls).
     this._pendingPrecompile = { root, parsed };
+    try { this._ctx.eventLog?.note?.('buildScene: complete (awaiting timeline)'); } catch {}
   }
 
   setTimeline({ timeline, contentMinY, contentMaxY, firstNote }, cameraCtrl) {
@@ -178,6 +183,7 @@ export class SceneHost {
     if (this._pendingPrecompile) {
       const { root } = this._pendingPrecompile;
       this._pendingPrecompile = null;
+      try { this._ctx.eventLog?.note?.('precompile: begin'); } catch {}
       if (OPTIMIZATIONS.PRECOMPILE_PIPELINES) {
         quality.refineSceneQuality()
           .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
@@ -193,6 +199,7 @@ export class SceneHost {
             // Arm sceneReady so the next render notifies the main thread,
             // matching the behaviour of the precompile path.
             this._postSceneReadyAfterRender = true;
+            try { this._ctx.eventLog?.note?.('precompile: skipped (disabled)'); } catch {}
           });
       }
     }
@@ -235,6 +242,7 @@ export class SceneHost {
     });
     scene.updateMatrixWorld(true);
 
+    const tStart = performance.now();
     const restore = () => {
       for (const t of frustumToggled) t.mesh.frustumCulled = t.prev;
       for (const t of visibilityToggled) t.obj.visible = t.prev;
@@ -248,6 +256,10 @@ export class SceneHost {
       // (which will be the first frame of the new score) clears the
       // flag and notifies the main thread.
       this._postSceneReadyAfterRender = true;
+      try {
+        const dt = (performance.now() - tStart);
+        this._ctx.eventLog?.note?.(`precompile: done in ${dt.toFixed(1)} ms`);
+      } catch {}
     };
     this._compiling = true;
     try {
