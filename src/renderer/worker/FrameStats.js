@@ -39,6 +39,8 @@ export class FrameStats {
   _playFrameMsRing = new RingBuffer(120);
   _lastFrameFlags = 0;
   _lastFrameCpuMs = 0;
+  get lastFrameFlags() { return this._lastFrameFlags; }
+  get lastFrameCpuMs() { return this._lastFrameCpuMs; }
   _jitterTotals = {
     all: FrameStats._newJitterBucket(),
     afterShadow: FrameStats._newJitterBucket(),

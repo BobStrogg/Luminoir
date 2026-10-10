@@ -148,6 +148,21 @@ export class RenderLoop {
     // Record actual rAF interval so `probe()` can distinguish
     // submit-time from real GPU-bound frame time.
     if (frameMs > 0 && frameMs < 2000) {
+      if (frameMs > 100) {
+        // Correlate with previous frame's work flags (the cost that preceded this interval)
+        const flags = frameStats.lastFrameFlags || 0;
+        const causes = [];
+        if (flags & FRAME_SHADOW) causes.push('shadow');
+        if (flags & FRAME_COLORS) causes.push('colorUpload');
+        if (flags & FRAME_STATS) causes.push('statsHeartbeat');
+        if (flags & FRAME_BUDGET_SKIP) causes.push('budgetSkip');
+        if (causes.length === 0) causes.push('none');
+        const cpu = frameStats.lastFrameCpuMs || 0;
+        const p = this._ctx.quality?.pressure ?? 0;
+        try {
+          this._ctx.eventLog?.note?.(`Long frame ${frameMs.toFixed(1)} ms after [${causes.join('+')}] (CPU ${cpu.toFixed(1)} ms, pressure ${p.toFixed(2)})`);
+        } catch {}
+      }
       frameStats.recordFrame(frameMs, clock.playing);
       // Optional benchmark aggregation (only records while playing)
       const bench = this._ctx.benchmark;
@@ -359,6 +374,7 @@ export class RenderLoop {
         antiAliasing: antiAliasing.mode,
         msaaSamples: antiAliasing.msaaSamples,
         fxaaSuppressed: antiAliasing.suppressed,
+        events: this._ctx.eventLog?.latest?.(12) || [],
       });
       if (msg) post(msg);
       this._lastStatsPostMs = now;
