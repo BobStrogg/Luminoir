@@ -85,6 +85,13 @@ ctx.benchmark = {
   over16: 0,
   over33: 0,
 };
+// Page-visibility bookkeeping for background-tab interval labelling.
+ctx._pageHidden = false;
+ctx._hiddenSince = 0;
+ctx._lastHiddenDurationMs = 0;
+ctx._visibleAt = 0;
+// Persistent diagnostic context (shown separately from rolling events).
+ctx.diagContext = [];
 
 /* ------------------------------------------------------------------ */
 /*  Message plumbing                                                   */
@@ -106,6 +113,7 @@ self.onmessage = async (e) => {
     case 'benchmarkStart': return handleBenchmarkStart(msg);
     case 'benchmarkStop':  return handleBenchmarkStop(msg);
     case 'statsReset':    return handleStatsReset();
+    case 'visibility':    return handleVisibility(msg);
     default:
       console.warn('[renderWorker] unknown message:', msg.type);
   }
@@ -130,6 +138,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // framebuffer resolution itself, which always runs at native DPR.
   const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
   ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
+  ctx.diagContext.push(`Platform: mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
 
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
@@ -146,6 +155,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   }
   ctx.renderer = renderer;
   ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}`);
+  ctx.diagContext.push(`Renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; AA=${wantAntialias ? 'MSAA' : 'none'}; DPR ${(devicePixelRatio||1).toFixed(2)}`);
 
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
@@ -186,6 +196,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     ? THREE.PCFShadowMap
     : THREE.PCFSoftShadowMap;
   ctx.eventLog.note(`shadowMap.type=${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
+  ctx.diagContext.push(`Shadows: ${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
 
   const cfg = SceneConfig.camera;
   const camera = ctx.camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
@@ -259,6 +270,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   ctx.quality.probeMsMeasured = probeMs;
   ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
   ctx.eventLog.note(`load-probe: ${probeMs.toFixed(2)} ms → shadowMapSize=${ctx.quality.chosenShadowMapSize}`);
+  ctx.diagContext.push(`Quality: shadowMapSize=${ctx.quality.chosenShadowMapSize}${ctx.keyLightRig.frozen ? ' (frozen frustum)' : ''}`);
 
   const cameraCtrl = ctx.cameraCtrl = new CameraController(camera, controls);
   ctx.frameStats.seedCameraPos(camera.position);
@@ -516,6 +528,21 @@ function handleDispose() {
 function handleStatsReset() {
   ctx.frameStats.resetSessionCounters();
   ctx.eventLog.clear();
+}
+
+function handleVisibility({ state }) {
+  const s = String(state || 'visible');
+  if (s === 'hidden') {
+    ctx._pageHidden = true;
+    ctx._hiddenSince = performance.now();
+  } else {
+    // visible (or anything else)
+    const now = performance.now();
+    ctx._pageHidden = false;
+    ctx._lastHiddenDurationMs = ctx._hiddenSince > 0 ? (now - ctx._hiddenSince) : 0;
+    ctx._visibleAt = now;
+    ctx._hiddenSince = 0;
+  }
 }
 
 /** Read-back hook used by tests: returns a small snapshot of camera +

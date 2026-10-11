@@ -137,6 +137,8 @@ export class LuminoirApp {
       } else if (document.visibilityState === 'hidden') {
         this._releaseWakeLock();
       }
+      // Forward visibility to the render worker so stats can label background intervals.
+      try { this.render.setPageVisibility(document.visibilityState); } catch {}
     });
 
     setStatus('Loading demo score...');
