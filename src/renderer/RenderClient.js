@@ -79,6 +79,11 @@ export class RenderClient {
       smoothTime: SceneConfig.camera.smoothTime,
     }, [offscreen]);
 
+    // Send initial visibility so the worker can label background intervals.
+    try {
+      this.setPageVisibility(document.visibilityState || 'visible');
+    } catch {}
+
     // Handle window resize on main, forward to worker.
     this._onResize = () => {
       const w = canvas.clientWidth || window.innerWidth;
@@ -252,6 +257,16 @@ export class RenderClient {
   updateConfig(updates) {
     if (!this._worker || !updates) return;
     this._worker.postMessage({ type: 'updateConfig', updates });
+  }
+
+  /**
+   * Inform the worker about page visibility so long rAF gaps can be
+   * labelled as background-tab intervals rather than stalls.
+   * @param {'visible'|'hidden'|string} state
+   */
+  setPageVisibility(state) {
+    if (!this._worker) return;
+    this._worker.postMessage({ type: 'visibility', state: String(state || 'visible') });
   }
 
   dispose() {
