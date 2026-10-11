@@ -18,7 +18,10 @@ export class StatsOverlay {
       'padding:8px 10px',
       'border:1px solid rgba(255,255,255,0.2)',
       'border-radius:8px',
-      'white-space:pre',
+      // Wrap long lines for narrow screens while preserving alignment.
+      'white-space:pre-wrap',
+      'overflow-wrap:anywhere',
+      'word-break:break-word',
       'pointer-events:auto',
       'user-select:none',
       'touch-action:manipulation',
@@ -79,6 +82,7 @@ export class StatsOverlay {
     const aa = `${s.antiAliasing || 'None'}${s.msaaSamples > 1 ? ` (${s.msaaSamples}x)` : ''}${s.fxaaSuppressed ? ' [FXAA off]' : ''}`;
     const aq = `${s.aqCalibrated ? 'cal' : 'uncal'} base ${Number(s.aqBaselineMs || 0).toFixed(2)} ms  pressure ${Number(s.gpuPressure || 0).toFixed(2)}`;
     const events = Array.isArray(s.events) ? s.events.slice(-8) : [];
+    const context = Array.isArray(s.context) ? s.context : [];
     if (this._collapsed) {
       this._div.textContent =
         `fps ${fps}  p95 ${p95}ms  max ${fmax}ms  ${renderer} DPR ${dpr}  res ${res}`;
@@ -93,6 +97,11 @@ export class StatsOverlay {
       `AA ${aa}`,
       `AQ ${aq}`,
     ];
+    if (context.length > 0) {
+      lines.push('');
+      lines.push('Context:');
+      for (const c of context) lines.push(`• ${c}`);
+    }
     if (events.length > 0) {
       lines.push('');
       lines.push('Recent events:');

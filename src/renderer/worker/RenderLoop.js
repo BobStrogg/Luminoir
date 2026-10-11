@@ -147,22 +147,34 @@ export class RenderLoop {
 
     // Record actual rAF interval so `probe()` can distinguish
     // submit-time from real GPU-bound frame time.
-    if (frameMs > 0 && frameMs < 2000) {
-      if (frameMs > 100) {
-        // Correlate with previous frame's work flags (the cost that preceded this interval)
-        const flags = frameStats.lastFrameFlags || 0;
-        const causes = [];
-        if (flags & FRAME_SHADOW) causes.push('shadow');
-        if (flags & FRAME_COLORS) causes.push('colorUpload');
-        if (flags & FRAME_STATS) causes.push('statsHeartbeat');
-        if (flags & FRAME_BUDGET_SKIP) causes.push('budgetSkip');
-        if (causes.length === 0) causes.push('none');
-        const cpu = frameStats.lastFrameCpuMs || 0;
-        const p = this._ctx.quality?.pressure ?? 0;
-        try {
+    // Always record an event for very long intervals so multi-second stalls
+    // are visible in the log, even though stats exclude them.
+    if (frameMs > 100) {
+      // Correlate with previous frame's work flags (the cost that preceded this interval)
+      const flags = frameStats.lastFrameFlags || 0;
+      const causes = [];
+      if (flags & FRAME_SHADOW) causes.push('shadow');
+      if (flags & FRAME_COLORS) causes.push('colorUpload');
+      if (flags & FRAME_STATS) causes.push('statsHeartbeat');
+      if (flags & FRAME_BUDGET_SKIP) causes.push('budgetSkip');
+      if (causes.length === 0) causes.push('none');
+      const cpu = frameStats.lastFrameCpuMs || 0;
+      const p = this._ctx.quality?.pressure ?? 0;
+      // Label background-tab gaps distinctly so screenshots aren't misleading.
+      const recentlyBecameVisible = (this._ctx._visibleAt || 0) > 0 && (now - this._ctx._visibleAt) < 1000;
+      const hiddenGapMs = this._ctx._lastHiddenDurationMs || 0;
+      const isBackgroundGap = frameMs >= 2000 && recentlyBecameVisible && hiddenGapMs >= 500;
+      try {
+        if (isBackgroundGap) {
+          this._ctx.eventLog?.note?.(`Background interval ${frameMs.toFixed(0)} ms (page hidden for ~${hiddenGapMs.toFixed(0)} ms)`);
+        } else if (frameMs >= 2000) {
+          this._ctx.eventLog?.note?.(`Stall ${frameMs.toFixed(0)} ms after [${causes.join('+')}] (CPU ${cpu.toFixed(1)} ms, pressure ${p.toFixed(2)})`);
+        } else {
           this._ctx.eventLog?.note?.(`Long frame ${frameMs.toFixed(1)} ms after [${causes.join('+')}] (CPU ${cpu.toFixed(1)} ms, pressure ${p.toFixed(2)})`);
-        } catch {}
-      }
+        }
+      } catch {}
+    }
+    if (frameMs > 0 && frameMs < 2000) {
       frameStats.recordFrame(frameMs, clock.playing);
       // Optional benchmark aggregation (only records while playing)
       const bench = this._ctx.benchmark;
@@ -375,6 +387,7 @@ export class RenderLoop {
         msaaSamples: antiAliasing.msaaSamples,
         fxaaSuppressed: antiAliasing.suppressed,
         events: this._ctx.eventLog?.latest?.(12) || [],
+        context: Array.isArray(this._ctx.diagContext) ? this._ctx.diagContext : [],
       });
       if (msg) post(msg);
       this._lastStatsPostMs = now;
