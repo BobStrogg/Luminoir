@@ -249,7 +249,8 @@ export const Materials = {
         })),
 
   paper: () => {
-    const { normalMap } = _sharedPaperTextures();
+    const useNormal = !SceneConfig.performance?.mobileFlatShading;
+    const normalMap = useNormal ? _sharedPaperTextures().normalMap : null;
     const mat = new THREE.MeshStandardMaterial({
       color: c(SceneConfig.paperColor.r, SceneConfig.paperColor.g, SceneConfig.paperColor.b),
       metalness: 0.0,
