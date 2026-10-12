@@ -76,6 +76,8 @@ export class FrameStats {
   _over8Total = 0;
   _over16Total = 0;
   _over33Total = 0;
+  // WebGPU queue-drain timing (approximate GPU completion latency)
+  _gpuQueueMsRing = new RingBuffer(120);
 
   get playFrameRing() { return this._playFrameMsRing; }
   /** All-frames ring — includes paused/idle ticks.  Used by the runtime
@@ -85,6 +87,7 @@ export class FrameStats {
   get frameMsRing() { return this._frameMsRing; }
   get lastRenderMs() { return this._lastRenderMs; }
   get framesSinceRender() { return this._framesSinceRender; }
+  get gpuQueueRing() { return this._gpuQueueMsRing; }
 
   static _newJitterBucket() {
     return { count: 0, sum: 0, max: 0, cpuSum: 0, cpuMax: 0, over12: 0, over16: 0, over20: 0, over33: 0 };
@@ -227,12 +230,18 @@ export class FrameStats {
     this._rendersSkipped++;
   }
 
+  /** Record an approximate GPU queue drain time (WebGPU only). */
+  recordGpuQueueDrain(ms) {
+    if (ms > 0) this._gpuQueueMsRing.push(ms);
+  }
+
   /** Flush the timing rings on play-start so stale idle-period
    *  intervals don't distort the p95 pressure signal. */
   resetForPlay() {
     this._playFrameMsRing.reset();
     this._frameMsRing.reset();
     this._frameMsRing.fill(0);
+    this._gpuQueueMsRing.reset();
     this._lastFrameFlags = 0;
     this._lastFrameCpuMs = 0;
     this.resetJitter();
@@ -289,6 +298,14 @@ export class FrameStats {
       playP95 = this._playFrameMsRing.percentile(0.95, pWant, this._statsScratch);
     }
 
+    // GPU queue drain timing (WebGPU): recent window p95/p99
+    let gpuP95 = 0, gpuP99 = 0;
+    if (this._gpuQueueMsRing.filled > 0) {
+      const gWant = Math.min(this._gpuQueueMsRing.filled, 60);
+      gpuP95 = this._gpuQueueMsRing.percentile(0.95, gWant, this._statsScratch);
+      gpuP99 = this._gpuQueueMsRing.percentile(0.99, gWant, this._statsScratch);
+    }
+
     return {
       type: 'stats',
       fps,
@@ -299,6 +316,8 @@ export class FrameStats {
       // Additional tail metrics over the recent window (all frames)
       frameMsRecentP95: fP95,
       frameMsRecentP99: fP99,
+      gpuQueueRecentP95: gpuP95,
+      gpuQueueRecentP99: gpuP99,
       longFramesOver8_3: over8,
       longFramesOver16_7: over16,
       longFramesOver33_3: over33,

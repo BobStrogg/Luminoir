@@ -37,6 +37,11 @@ export class RenderClient {
   get rendererKind() { return this._rendererKind; }
   get antiAliasing() { return this._antiAliasing; }
   get msaaSamples() { return this._msaaSamples; }
+  /** Main-thread rAF monitor rings (recent ~60 samples). */
+  _mtFrameTimes = [];
+  _mtLastTs = 0;
+  _mtRafReq = 0;
+  _driveFromMain = false;
 
   /**
    * Transfer the canvas to a worker, spin up the render loop.
@@ -79,6 +84,7 @@ export class RenderClient {
       } catch { return false; }
     })();
     const driveFromMain = (vsyncParam === 'main') || (vsyncParam == null && isTeslaUA);
+    this._driveFromMain = driveFromMain;
 
     this._worker.postMessage({
       type: 'init',
@@ -121,9 +127,9 @@ export class RenderClient {
     attachPointerForwarding(canvas, this._worker);
 
     // Optional main-thread vsync driver
-    if (driveFromMain) {
-      this._startMainVsyncDrive();
-    }
+    if (driveFromMain) this._startMainVsyncDrive();
+    // Always start a separate main-thread rAF monitor for truth timing.
+    this._startMainRafMonitor();
 
     await readyPromise;
   }
@@ -153,7 +159,10 @@ export class RenderClient {
         // Periodic worker heartbeat — forward to the FPS badge if
         // someone subscribed.  Other consumers are free to chain
         // their own callbacks; we only support one for now.
-        if (typeof this.onStats === 'function') this.onStats(msg);
+        if (typeof this.onStats === 'function') {
+          const merged = { ...msg, ...this._buildMainThreadStats(), vsyncDriver: this._driveFromMain ? 'main' : 'worker' };
+          this.onStats(merged);
+        }
         break;
       case 'sceneReady':
         // The new score's first frame has hit the canvas.  Fired
@@ -192,6 +201,32 @@ export class RenderClient {
       this._vsyncReq = requestAnimationFrame(drive);
     };
     this._vsyncReq = requestAnimationFrame(drive);
+  }
+
+  _startMainRafMonitor() {
+    if (this._mtRafReq) return;
+    const loop = (ts) => {
+      if (this._mtLastTs > 0) {
+        const dt = ts - this._mtLastTs;
+        this._mtFrameTimes.push(dt);
+        if (this._mtFrameTimes.length > 120) this._mtFrameTimes.shift();
+      }
+      this._mtLastTs = ts;
+      this._mtRafReq = requestAnimationFrame(loop);
+    };
+    this._mtRafReq = requestAnimationFrame(loop);
+  }
+
+  _buildMainThreadStats() {
+    const arr = this._mtFrameTimes.slice(-60);
+    const mean = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const sorted = arr.slice().sort((a, b) => a - b);
+    const pick = (q) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] : 0;
+    return {
+      mainFps: mean > 0 ? 1000 / mean : 0,
+      mainFrameMsRecentP95: pick(0.95),
+      mainFrameMsRecentP99: pick(0.99),
+    };
   }
 
   _probes = new Map();

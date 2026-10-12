@@ -156,7 +156,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Prefer the legacy WebGLRenderer on Safari for stall-free cadence unless
   // explicitly overridden by ?renderer=webgpu. WebGL avoids occasional
   // multi-frame queue/present stalls observed on iOS WebGPU.
-  const forceLegacy = !!forceWebGL || (isSafari && !preferWebGPU);
+  const forceLegacy = !!forceWebGL || ((isSafari || isTesla) && !preferWebGPU);
   const { renderer, usingWebGPU, error } = await createRenderer(
     { canvas, forceWebGL: forceLegacy, antialias: wantAntialias });
   if (!renderer) {
