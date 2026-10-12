@@ -55,6 +55,16 @@ export const SceneConfig = {
    */
   dtSmoothAlpha: 0.2,
 
+  /**
+   * Performance profile flags. Worker fills `mobileFlatShading=true`
+   * on constrained platforms (mobile/Tesla) so structural lines
+   * (staff/bar) can use unlit materials for a large fragment-cost win.
+   * Pure worker hint; not user-visible in Settings.
+   */
+  performance: {
+    mobileFlatShading: false,
+  },
+
 
   // Verovio renders SMuFL glyph references as <use width="480"/> pulling from
   // a <symbol viewBox="0 0 1000 1000">, so the glyph's raw path coords must
