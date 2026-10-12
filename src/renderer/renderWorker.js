@@ -124,7 +124,7 @@ self.onmessage = async (e) => {
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
-async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, driveFromMain, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
+async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, driveFromMain, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime, platformOverride, clientHints }) {
   // SceneConfig is mirrored in the worker; set the runtime flags
   // from the main thread before the renderer is configured.
   SceneConfig.shadow.enabled = shadowEnabled !== false;
@@ -137,9 +137,12 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // rAF rate the moment a frame goes over.  Trim shadow resolution and
   // antialias here so dense passages stay under 16.67 ms — never the
   // framebuffer resolution itself, which always runs at native DPR.
-  const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
+  const plat = detectPlatform({ platformOverride, ...(clientHints || {}) });
+  const { isMobile, isSafari, isTesla, isConstrained } = plat;
   ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
   ctx.diagContext.push(`Platform: mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
+  if (plat.ua) ctx.diagContext.push(`UA: ${plat.ua}`);
+  if (plat.reason) ctx.diagContext.push(`TeslaReason: ${plat.reason}`);
   // Expose Tesla flag to subsystems (RenderLoop needs it for rate-lock decisions)
   ctx.isTesla = !!isTesla;
   // Tesla: avoid budget-driven render skips (prefer steady cadence)
