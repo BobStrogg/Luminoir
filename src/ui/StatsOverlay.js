@@ -70,8 +70,13 @@ export class StatsOverlay {
     const res = `${c?.width || 0}×${c?.height || 0}`;
     const renderer = this._client.rendererKind || 'unknown';
     const fps = (s.fps || 0).toFixed(1);
+    const mfps = (s.mainFps || 0).toFixed(1);
     const p95 = (s.frameMsRecentP95 || s.frameMsP95 || 0).toFixed(2);
     const p99 = (s.frameMsRecentP99 || 0).toFixed(2);
+    const mp95 = (s.mainFrameMsRecentP95 || 0).toFixed(2);
+    const mp99 = (s.mainFrameMsRecentP99 || 0).toFixed(2);
+    const gq95 = (s.gpuQueueRecentP95 || 0).toFixed(2);
+    const gq99 = (s.gpuQueueRecentP99 || 0).toFixed(2);
     const fmax = (s.frameMsMax || 0).toFixed(2);
     const over8 = s.longFramesOver8_3 ?? 0;
     const over16 = s.longFramesOver16_7 ?? 0;
@@ -88,15 +93,18 @@ export class StatsOverlay {
     const hist = `hist 1x:${s.present1x ?? 0} 2x:${s.present2x ?? 0} 3x+:${s.present3x ?? 0}`;
     if (this._collapsed) {
       this._div.textContent =
-        `fps ${fps}  p95 ${p95}ms  max ${fmax}ms  ${renderer} DPR ${dpr}  res ${res}\nRate ${rate} • switches ${switches} • ${hist}`;
+        `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nRate ${rate} • switches ${switches} • ${hist}`;
       this._div.appendChild(this._toggle);
       return;
     }
     const lines = [
-      `fps ${fps}    p95 ${p95} ms   p99 ${p99} ms   max ${fmax} ms`,
+      `fps ${fps}  (main ${mfps})`,
+      `worker p95 ${p95} ms   p99 ${p99} ms   max ${fmax} ms`,
+      `main   p95 ${mp95} ms  p99 ${mp99} ms`,
+      `GPU queue drain p95 ${gq95} ms  p99 ${gq99} ms`,
       `>8.3 ${over8} | >16.7 ${over16} | >33.3 ${over33}  (recent)`,
       `Σ>8.3 ${over8T} | Σ>16.7 ${over16T} | Σ>33.3 ${over33T} (session)`,
-      `renderer ${renderer}   DPR ${dpr}   res ${res}`,
+      `renderer ${renderer}   vsync ${s.vsyncDriver || 'unknown'}   DPR ${dpr}   res ${res}`,
       `AA ${aa}`,
       `AQ ${aq}`,
       `Rate ${rate}   switches ${switches}   ${hist}`,
