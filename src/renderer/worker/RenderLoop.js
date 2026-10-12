@@ -314,7 +314,10 @@ export class RenderLoop {
     const budgetGate = !OPTIMIZATIONS.RENDER_BUDGET_SKIP
       || frameStats.lastRenderMs <= budgetMs
       || frameStats.framesSinceRender >= 1;
-    const shouldRender = !host.compiling && this._dirty && budgetGate;
+    // On 120 Hz devices under sustained load, render every other rAF
+    // tick for a perfectly stable 60 fps picture cadence.
+    const cadenceGate = this._halfRateLock ? (this._tickSeq % 2 === 0) : true;
+    const shouldRender = !host.compiling && this._dirty && budgetGate && cadenceGate;
     if (shouldRender) {
       if (keyLightRig.needsShadowUpdate) frameFlags |= FRAME_SHADOW;
       const t0 = performance.now();
