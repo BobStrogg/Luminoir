@@ -407,7 +407,13 @@ export class RenderLoop {
             if (latestP95 >= 21.0) n = 4;
             this._applyDecimation(n, 'initial');
           } else {
-            this._applyDecimation(1, 'initial');
+            // 60 Hz (or other) displays: on Tesla, prefer an even locked cadence
+            // at 30 fps when sustained p95 shows 60 cannot be held.
+            if (this._ctx.isTesla && this._decimationN === 1 && latestP95 >= 20.0) {
+              this._applyDecimation(2, 'initial');
+            } else {
+              this._applyDecimation(1, 'initial');
+            }
           }
         }
         // One-way step-down during playback when sustained overload occurs.
@@ -419,6 +425,11 @@ export class RenderLoop {
               this._applyDecimation(2, 'stepdown');
             } else if (this._decimationN === 2 && latestP95 >= 20.5) {
               this._applyDecimation(4, 'stepdown');
+            }
+          } else if (this._ctx.isTesla) {
+            // 60 Hz Tesla: step down to locked30 if 60 remains unsustainable.
+            if (this._decimationN === 1 && latestP95 >= 20.5) {
+              this._applyDecimation(2, 'stepdown');
             }
           }
         }
@@ -447,6 +458,11 @@ export class RenderLoop {
           if (k <= 1) h1++; else if (k === 2) h2++; else h3++;
         }
       }
+      // Dynamic rate label based on measured refresh, not hardcoded 120→60 mapping
+      const baseFps = quality.displayMs > 0 ? (1000 / quality.displayMs) : 0;
+      const lockedFps = this._decimationN > 1 && baseFps > 0 ? Math.round(baseFps / this._decimationN) : 0;
+      const rateLabel = this._decimationN === 1 ? 'native'
+        : (`locked${lockedFps || (this._decimationN === 2 ? 60 : 30)}`);
       const msg = frameStats.buildStatsMessage({
         rendering: this._dirty || clock.playing,
         autoDegrade: quality.autoDimEnabled,
@@ -456,7 +472,7 @@ export class RenderLoop {
         antiAliasing: antiAliasing.mode,
         msaaSamples: antiAliasing.msaaSamples,
         fxaaSuppressed: antiAliasing.suppressed,
-        rateMode: this._decimationN === 1 ? 'native' : (this._decimationN === 2 ? 'locked60' : 'locked30'),
+        rateMode: rateLabel,
         rateDecimationN: this._decimationN,
         rateSwitches: this._rateSwitches,
         present1x: h1, present2x: h2, present3x: h3,
@@ -479,7 +495,10 @@ export class RenderLoop {
     this._phaseAnchorTick = this._tickSeq;
     this._rateFrozen = true;
     try {
-      const label = this._decimationN === 1 ? 'Rate: native' : (this._decimationN === 2 ? 'Rate: locked60' : 'Rate: locked30');
+      const baseFps = this._ctx.quality?.displayMs > 0 ? (1000 / this._ctx.quality.displayMs) : 0;
+      const lockedFps = this._decimationN > 1 && baseFps > 0 ? Math.round(baseFps / this._decimationN) : 0;
+      const label = this._decimationN === 1 ? 'Rate: native'
+        : `Rate: locked${lockedFps || (this._decimationN === 2 ? 60 : 30)}`;
       const arr = this._ctx.diagContext;
       if (Array.isArray(arr)) {
         const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Rate:'));
