@@ -142,6 +142,14 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   ctx.diagContext.push(`Platform: mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
   // Expose Tesla flag to subsystems (RenderLoop needs it for rate-lock decisions)
   ctx.isTesla = !!isTesla;
+  // Tesla: avoid budget-driven render skips (prefer steady cadence)
+  if (isTesla) {
+    try {
+      OPTIMIZATIONS.RENDER_BUDGET_SKIP = false;
+      ctx.eventLog.note('optim: RENDER_BUDGET_SKIP disabled (Tesla)');
+      ctx.diagContext.push('Optim: no render-budget skip (Tesla)');
+    } catch {}
+  }
   // Hint materials to use cheaper, unlit variants for structural lines on
   // constrained platforms; purely visual trade-off with a big fragment win.
   try {
