@@ -114,6 +114,7 @@ self.onmessage = async (e) => {
     case 'benchmarkStop':  return handleBenchmarkStop(msg);
     case 'statsReset':    return handleStatsReset();
     case 'visibility':    return handleVisibility(msg);
+    case 'tick':          return ctx.loop.externalTick(msg.now);
     default:
       console.warn('[renderWorker] unknown message:', msg.type);
   }
@@ -123,7 +124,7 @@ self.onmessage = async (e) => {
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
-async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
+async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, driveFromMain, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
   // SceneConfig is mirrored in the worker; set the runtime flags
   // from the main thread before the renderer is configured.
   SceneConfig.shadow.enabled = shadowEnabled !== false;
@@ -307,6 +308,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     msaaSamples: ctx.antiAliasing.msaaSamples,
   });
 
+  ctx.loop.setExternalDrive(!!driveFromMain);
   ctx.loop.start();
 }
 
