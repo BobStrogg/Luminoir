@@ -354,6 +354,17 @@ export class RenderLoop {
       const t0 = performance.now();
       antiAliasing.render(renderer, host.scene, camera);
       frameStats.recordRender(performance.now() - t0);
+      // WebGPU GPU-drain timing (approximate): measure time until queue is idle.
+      try {
+        const device = renderer?.backend?.device;
+        const q = device?.queue;
+        if (q?.onSubmittedWorkDone) {
+          const start = performance.now();
+          q.onSubmittedWorkDone().then(() => {
+            try { frameStats.recordGpuQueueDrain(performance.now() - start); } catch {}
+          }).catch(() => {});
+        }
+      } catch {}
       this._dirty = false;
 
       // Tell the main thread the new score is now on screen so it

@@ -1,0 +1,18 @@
+{
+  "durationSec": 6,
+  "cpuThrottle": 1.2,
+  "results": [
+    {
+      "label": "jupiter",
+      "camJitP95": 5.139213959790879,
+      "camJitP99": 5.139213959790879,
+      "camJitMax": 5.139213959790879,
+      "dist": 0,
+      "peakSpeed": 0,
+      "velP95": 0,
+      "accP95": 0,
+      "jerkP95": 0,
+      "pixP95": 0
+    }
+  ]
+}
