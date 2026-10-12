@@ -140,6 +140,8 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
   ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
   ctx.diagContext.push(`Platform: mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
+  // Expose Tesla flag to subsystems (RenderLoop needs it for rate-lock decisions)
+  ctx.isTesla = !!isTesla;
   // Hint materials to use cheaper, unlit variants for structural lines on
   // constrained platforms; purely visual trade-off with a big fragment win.
   try {
@@ -262,7 +264,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Save base light intensity so the runtime pressure system can scale it.
   ctx.quality.baseLightIntensity = SceneConfig.lightBall.intensity;
 
-  await ctx.antiAliasing.setup(renderer, ctx.scene, camera, usingWebGPU, width, height);
+  await ctx.antiAliasing.setup(renderer, ctx.scene, camera, usingWebGPU, width, height, {
+    disableFxaa: !!isTesla,
+  });
 
   // Load-time GPU probe — renders the empty scene (lights + paper, no score
   // geometry) and uses the measured cost to select the highest shadow-map
@@ -308,8 +312,13 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     msaaSamples: ctx.antiAliasing.msaaSamples,
   });
 
-  ctx.loop.setExternalDrive(!!driveFromMain);
+  // Prefer main-thread vsync drive on Tesla unless explicitly disabled by URL.
+  const useExternalDrive = !!driveFromMain || !!isTesla;
+  ctx.loop.setExternalDrive(useExternalDrive);
   ctx.loop.start();
+  if (useExternalDrive) {
+    try { ctx.post({ type: 'requestMainVsyncDrive' }); } catch {}
+  }
 }
 
 /* ------------------------------------------------------------------ */

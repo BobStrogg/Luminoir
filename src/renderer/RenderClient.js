@@ -68,9 +68,17 @@ export class RenderClient {
     // would normally prefer WebGL (e.g. on Safari for stability).
     const preferWebGPU = urlParams.get('renderer') === 'webgpu';
     // Optional: drive the worker's ticks from the main-thread rAF. Useful on
-    // platforms where worker rAF cadence can drift from vsync. Enable with
-    // `?vsync=main`.
-    const driveFromMain = urlParams.get('vsync') === 'main';
+    // platforms where worker rAF cadence can drift from vsync.
+    // Enable explicitly with `?vsync=main`.  On Tesla UAs, default to
+    // main-thread drive unless explicitly disabled via `?vsync=worker`.
+    const vsyncParam = urlParams.get('vsync');
+    const isTeslaUA = (() => {
+      try {
+        const ua = (navigator && navigator.userAgent) || '';
+        return /Tesla|TESLA_AUTO/i.test(ua);
+      } catch { return false; }
+    })();
+    const driveFromMain = (vsyncParam === 'main') || (vsyncParam == null && isTeslaUA);
 
     this._worker.postMessage({
       type: 'init',
@@ -114,11 +122,7 @@ export class RenderClient {
 
     // Optional main-thread vsync driver
     if (driveFromMain) {
-      const drive = (ts) => {
-        try { this._worker?.postMessage({ type: 'tick', now: ts }); } catch {}
-        this._vsyncReq = requestAnimationFrame(drive);
-      };
-      this._vsyncReq = requestAnimationFrame(drive);
+      this._startMainVsyncDrive();
     }
 
     await readyPromise;
@@ -140,6 +144,11 @@ export class RenderClient {
         }
         this._readyResolve = null;
         break;
+      case 'requestMainVsyncDrive': {
+        // Worker requested main-thread vsync driving (e.g. Tesla UA).
+        this._startMainVsyncDrive();
+        break;
+      }
       case 'stats':
         // Periodic worker heartbeat — forward to the FPS badge if
         // someone subscribed.  Other consumers are free to chain
@@ -173,6 +182,16 @@ export class RenderClient {
         break;
       }
     }
+  }
+
+  _vsyncReq = 0;
+  _startMainVsyncDrive() {
+    if (this._vsyncReq) return; // already driving
+    const drive = (ts) => {
+      try { this._worker?.postMessage({ type: 'tick', now: ts }); } catch {}
+      this._vsyncReq = requestAnimationFrame(drive);
+    };
+    this._vsyncReq = requestAnimationFrame(drive);
   }
 
   _probes = new Map();

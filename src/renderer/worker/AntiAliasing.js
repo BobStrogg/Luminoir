@@ -65,10 +65,28 @@ export class AntiAliasing {
     }
   }
 
-  async setup(renderer, scene, camera, usingWebGPU, width, height) {
+  /**
+   * Configure anti-aliasing. When MSAA is available, use it. Otherwise,
+   * enable FXAA unless explicitly disabled via options.
+   * @param {THREE.WebGLRenderer|any} renderer
+   * @param {THREE.Scene} scene
+   * @param {THREE.Camera} camera
+   * @param {boolean} usingWebGPU
+   * @param {number} width
+   * @param {number} height
+   * @param {{ disableFxaa?: boolean }} [options]
+   */
+  async setup(renderer, scene, camera, usingWebGPU, width, height, options) {
     this._msaaSamples = this._measureMsaaSamples(renderer, usingWebGPU);
     if (this._msaaSamples > 1) {
       this._aaMode = `${this._msaaSamples}x MSAA`;
+      return;
+    }
+
+    if (options?.disableFxaa) {
+      // Explicitly disable post-process AA (Tesla / constrained stability path)
+      this._fxaaAvailable = false;
+      this._aaMode = 'None';
       return;
     }
 
