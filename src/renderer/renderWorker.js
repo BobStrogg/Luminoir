@@ -123,7 +123,7 @@ self.onmessage = async (e) => {
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
-async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
+async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime }) {
   // SceneConfig is mirrored in the worker; set the runtime flags
   // from the main thread before the renderer is configured.
   SceneConfig.shadow.enabled = shadowEnabled !== false;
@@ -139,13 +139,23 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   const { isMobile, isSafari, isTesla, isConstrained } = detectPlatform();
   ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
   ctx.diagContext.push(`Platform: mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
+  // Hint materials to use cheaper, unlit variants for structural lines on
+  // constrained platforms; purely visual trade-off with a big fragment win.
+  try {
+    if (!SceneConfig.performance) SceneConfig.performance = {};
+    SceneConfig.performance.mobileFlatShading = !!isConstrained;
+  } catch {}
 
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
   // frame; turning it off is one of the bigger single-knob wins on
   // iOS.  Desktop keeps the antialias for crisp notation edges.
   const wantAntialias = !isMobile && !isTesla;
+  // Prefer the legacy WebGLRenderer on Safari for stall-free cadence unless
+  // explicitly overridden by ?renderer=webgpu. WebGL avoids occasional
+  // multi-frame queue/present stalls observed on iOS WebGPU.
+  const forceLegacy = !!forceWebGL || (isSafari && !preferWebGPU);
   const { renderer, usingWebGPU, error } = await createRenderer(
-    { canvas, forceWebGL, antialias: wantAntialias });
+    { canvas, forceWebGL: forceLegacy, antialias: wantAntialias });
   if (!renderer) {
     ctx.post({
       type: 'renderer_error',
@@ -154,7 +164,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     return;
   }
   ctx.renderer = renderer;
-  ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}`);
+  ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}${forceLegacy ? ' [forced legacy on Safari]' : ''}`);
   ctx.diagContext.push(`Renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; AA=${wantAntialias ? 'MSAA' : 'none'}; DPR ${(devicePixelRatio||1).toFixed(2)}`);
 
   // Tell the `Materials` module which GLSL-injection path to use —

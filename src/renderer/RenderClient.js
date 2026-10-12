@@ -62,7 +62,11 @@ export class RenderClient {
     // Honour `?renderer=webgl` so developers can reproduce the
     // WebGL-only bugs users hit on insecure-origin URLs (e.g. a
     // `*.local` hostname) without actually moving off `localhost`.
-    const forceWebGL = new URLSearchParams(window.location.search).get('renderer') === 'webgl';
+    const urlParams = new URLSearchParams(window.location.search);
+    const forceWebGL = urlParams.get('renderer') === 'webgl';
+    // Optional developer override to insist on WebGPU even where the worker
+    // would normally prefer WebGL (e.g. on Safari for stability).
+    const preferWebGPU = urlParams.get('renderer') === 'webgpu';
 
     this._worker.postMessage({
       type: 'init',
@@ -72,6 +76,9 @@ export class RenderClient {
       devicePixelRatio,
       rect: rectFor(canvas),
       forceWebGL,
+      // Hint for worker-side renderer selection. When false (default) the
+      // worker is free to choose WebGL for known-problematic UAs.
+      preferWebGPU,
       shadowEnabled: SceneConfig.shadow.enabled,
       dtSmoothAlpha: SceneConfig.dtSmoothAlpha,
       smartCameraEnabled: SceneConfig.smartCamera.enabled,
