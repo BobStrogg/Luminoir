@@ -17,7 +17,8 @@
     "bench:camera": "node bench/camera-offline.mjs",
     "bench:camera:all": "node bench/camera-offline.mjs --all",
     "bench:export-timeline": "node bench/export-timeline.mjs",
-    "bench:export-page": "node bench/export-from-page.mjs"
+    "bench:export-page": "node bench/export-from-page.mjs",
+    "bench:webkit": "node bench/bench-webkit.mjs"
   },
   "dependencies": {
     "smplr": "^0.19.0",
