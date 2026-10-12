@@ -133,7 +133,11 @@ export class RenderLoop {
     let frameFlags = 0;
 
     // --- Animation phase (always runs) -------------------------------
-    const musicTime = this._ctx.clock.musicTimeAt(now);
+    // Derive music time from the worker's own high-resolution clock,
+    // never from rAF timestamps (main or worker). This keeps transport
+    // speed tied to the AudioContext-anchored time the main thread
+    // sends to `PlaybackClock.set(...)`, independent of vsync/decimation.
+    const musicTime = this._ctx.clock.musicTimeAt();
     // Tie animation to the presented cadence when a decimation is active:
     // integrate exactly N×displayMs per presented frame; skip on non-present ticks.
     const quality = this._ctx.quality;
