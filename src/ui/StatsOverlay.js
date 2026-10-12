@@ -83,9 +83,12 @@ export class StatsOverlay {
     const aq = `${s.aqCalibrated ? 'cal' : 'uncal'} base ${Number(s.aqBaselineMs || 0).toFixed(2)} ms  pressure ${Number(s.gpuPressure || 0).toFixed(2)}`;
     const events = Array.isArray(s.events) ? s.events.slice(-8) : [];
     const context = Array.isArray(s.context) ? s.context : [];
+    const rate = s.rateMode ? `${s.rateMode}${s.rateDecimationN ? ` (N=${s.rateDecimationN})` : ''}` : 'unknown';
+    const switches = Number(s.rateSwitches || 0);
+    const hist = `hist 1x:${s.present1x ?? 0} 2x:${s.present2x ?? 0} 3x+:${s.present3x ?? 0}`;
     if (this._collapsed) {
       this._div.textContent =
-        `fps ${fps}  p95 ${p95}ms  max ${fmax}ms  ${renderer} DPR ${dpr}  res ${res}`;
+        `fps ${fps}  p95 ${p95}ms  max ${fmax}ms  ${renderer} DPR ${dpr}  res ${res}\nRate ${rate} • switches ${switches} • ${hist}`;
       this._div.appendChild(this._toggle);
       return;
     }
@@ -96,6 +99,7 @@ export class StatsOverlay {
       `renderer ${renderer}   DPR ${dpr}   res ${res}`,
       `AA ${aa}`,
       `AQ ${aq}`,
+      `Rate ${rate}   switches ${switches}   ${hist}`,
     ];
     if (context.length > 0) {
       lines.push('');

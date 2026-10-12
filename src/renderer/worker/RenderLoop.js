@@ -77,6 +77,13 @@ export class RenderLoop {
   _rafId = 0;
   _lastFrameTime = 0;
   _lastStatsPostMs = 0;
+  // Frame-rate decimation (present on every Nth vsync): 1 = native, 2 = locked60 on 120 Hz, 4 = locked30.
+  _decimationN = 1;
+  _rateFrozen = false;
+  _rateSwitches = 0;
+  _phaseAnchorTick = 0;
+  _useExternalTicks = false;
+  _tickSeq = 0;
 
   /**
    * @param {object} ctx Shared worker context — `clock`, `host`,
@@ -88,16 +95,22 @@ export class RenderLoop {
     this._ctx = ctx;
   }
 
+  setExternalDrive(enabled) {
+    this._useExternalTicks = !!enabled;
+  }
+
   markDirty() { this._dirty = true; }
   get dirty() { return this._dirty; }
 
   start() {
     this._lastFrameTime = performance.now();
-    const loop = (frameNow) => {
-      this._rafId = requestAnimationFrame(loop);
-      this._tick(frameNow);
-    };
-    loop();
+    if (!this._useExternalTicks) {
+      const loop = (frameNow) => {
+        this._rafId = requestAnimationFrame(loop);
+        this._tick(frameNow);
+      };
+      loop();
+    }
   }
 
   stop() {
@@ -105,17 +118,35 @@ export class RenderLoop {
     this._rafId = 0;
   }
 
+  /** Optional main-thread vsync driver entry. */
+  externalTick(now) {
+    if (!this._useExternalTicks) return;
+    this._tick(Number.isFinite(now) ? now : performance.now());
+  }
+
   _tick(frameNow) {
     const now = Number.isFinite(frameNow) ? frameNow : performance.now();
     const cpuStart = performance.now();
     const dt = this._advanceTiming(now);
+    this._tickSeq++;
 
     let frameFlags = 0;
 
     // --- Animation phase (always runs) -------------------------------
     const musicTime = this._ctx.clock.musicTimeAt(now);
-    this._animate(dt, now, musicTime);
-    frameFlags |= this._updateWorld(now, musicTime);
+    // Tie animation to the presented cadence when a decimation is active:
+    // integrate exactly N×displayMs per presented frame; skip on non-present ticks.
+    const quality = this._ctx.quality;
+    const presentByCadence = this._decimationN <= 1
+      || (!this._ctx.host.compiling && ((this._tickSeq - this._phaseAnchorTick) % this._decimationN === 0));
+    const useLockedCadence = this._decimationN > 1 && quality?.calibrated && quality.displayMs > 0;
+    const dtForAnim = useLockedCadence
+      ? (presentByCadence ? (quality.displayMs * this._decimationN) / 1000 : 0)
+      : dt;
+    if (dtForAnim > 0) {
+      this._animate(dtForAnim, now, musicTime);
+      frameFlags |= this._updateWorld(now, musicTime);
+    }
 
     // --- Render phase (can be skipped when idle or under pressure) ----
     frameFlags |= this._render();
@@ -314,9 +345,9 @@ export class RenderLoop {
     const budgetGate = !OPTIMIZATIONS.RENDER_BUDGET_SKIP
       || frameStats.lastRenderMs <= budgetMs
       || frameStats.framesSinceRender >= 1;
-    // On 120 Hz devices under sustained load, render every other rAF
-    // tick for a perfectly stable 60 fps picture cadence.
-    const cadenceGate = this._halfRateLock ? (this._tickSeq % 2 === 0) : true;
+    // Strict cadence: present exactly on every Nth vsync tick, phase-anchored.
+    const cadenceGate = this._decimationN <= 1
+      || (!host.compiling && ((this._tickSeq - this._phaseAnchorTick) % this._decimationN === 0));
     const shouldRender = !host.compiling && this._dirty && budgetGate && cadenceGate;
     if (shouldRender) {
       if (keyLightRig.needsShadowUpdate) frameFlags |= FRAME_SHADOW;
@@ -365,7 +396,33 @@ export class RenderLoop {
     const frameRing = frameStats.frameMsRing;
     if (frameRing.filled > 0) {
       const latestP95 = quality.sampleAq(now, frameRing);
-      if (latestP95 > 0) quality.updateRuntimePressure(dt, latestP95);
+      if (latestP95 > 0) {
+        quality.updateRuntimePressure(dt, latestP95);
+        // Decide initial decimation before playback, behind the overlay:
+        if (!this._rateFrozen && quality.calibrated && !this._ctx.host.compiling) {
+          const is120 = quality.displayMs <= 8.5;
+          if (is120) {
+            let n = 1;
+            if (latestP95 >= 10.0) n = 2;
+            if (latestP95 >= 21.0) n = 4;
+            this._applyDecimation(n, 'initial');
+          } else {
+            this._applyDecimation(1, 'initial');
+          }
+        }
+        // One-way step-down during playback when sustained overload occurs.
+        if (this._rateFrozen && quality.calibrated && quality.displayMs > 0) {
+          const is120 = quality.displayMs <= 8.5;
+          if (is120) {
+            if (this._decimationN === 1 && latestP95 >= 10.8) {
+              // Engage locked60 after sustained evidence
+              this._applyDecimation(2, 'stepdown');
+            } else if (this._decimationN === 2 && latestP95 >= 20.5) {
+              this._applyDecimation(4, 'stepdown');
+            }
+          }
+        }
+      }
     }
   }
 
@@ -380,6 +437,16 @@ export class RenderLoop {
     const { clock, quality, antiAliasing, frameStats, post } = this._ctx;
     if (now - this._lastStatsPostMs >= STATS_POST_INTERVAL_MS) {
       frameFlags |= FRAME_STATS;
+      // Build a present-interval histogram across the recent window.
+      let h1 = 0, h2 = 0, h3 = 0;
+      const wantH = Math.min(frameStats.frameMsRing.filled, 60);
+      if (wantH > 0 && quality.displayMs > 0) {
+        const arr = frameStats.frameMsRing.latest(wantH, frameStats._statsScratch);
+        for (let i = 0; i < arr.length; i++) {
+          const k = Math.max(1, Math.round(arr[i] / quality.displayMs));
+          if (k <= 1) h1++; else if (k === 2) h2++; else h3++;
+        }
+      }
       const msg = frameStats.buildStatsMessage({
         rendering: this._dirty || clock.playing,
         autoDegrade: quality.autoDimEnabled,
@@ -389,6 +456,10 @@ export class RenderLoop {
         antiAliasing: antiAliasing.mode,
         msaaSamples: antiAliasing.msaaSamples,
         fxaaSuppressed: antiAliasing.suppressed,
+        rateMode: this._decimationN === 1 ? 'native' : (this._decimationN === 2 ? 'locked60' : 'locked30'),
+        rateDecimationN: this._decimationN,
+        rateSwitches: this._rateSwitches,
+        present1x: h1, present2x: h2, present3x: h3,
         events: this._ctx.eventLog?.latest?.(12) || [],
         context: Array.isArray(this._ctx.diagContext) ? this._ctx.diagContext : [],
       });
@@ -396,5 +467,25 @@ export class RenderLoop {
       this._lastStatsPostMs = now;
     }
     return frameFlags;
+  }
+
+  _applyDecimation(n, reason) {
+    const newN = (n === 1 || n === 2 || n === 4) ? n : 1;
+    if (this._rateFrozen && newN < this._decimationN) return; // never step up
+    if (this._decimationN !== newN) {
+      this._rateSwitches++;
+    }
+    this._decimationN = newN;
+    this._phaseAnchorTick = this._tickSeq;
+    this._rateFrozen = true;
+    try {
+      const label = this._decimationN === 1 ? 'Rate: native' : (this._decimationN === 2 ? 'Rate: locked60' : 'Rate: locked30');
+      const arr = this._ctx.diagContext;
+      if (Array.isArray(arr)) {
+        const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Rate:'));
+        if (i >= 0) arr[i] = label; else arr.push(label);
+      }
+      this._ctx.eventLog?.note?.(`rate-apply(${reason}): decimationN=${this._decimationN}`);
+    } catch {}
   }
 }

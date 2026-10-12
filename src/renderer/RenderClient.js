@@ -67,6 +67,10 @@ export class RenderClient {
     // Optional developer override to insist on WebGPU even where the worker
     // would normally prefer WebGL (e.g. on Safari for stability).
     const preferWebGPU = urlParams.get('renderer') === 'webgpu';
+    // Optional: drive the worker's ticks from the main-thread rAF. Useful on
+    // platforms where worker rAF cadence can drift from vsync. Enable with
+    // `?vsync=main`.
+    const driveFromMain = urlParams.get('vsync') === 'main';
 
     this._worker.postMessage({
       type: 'init',
@@ -79,6 +83,7 @@ export class RenderClient {
       // Hint for worker-side renderer selection. When false (default) the
       // worker is free to choose WebGL for known-problematic UAs.
       preferWebGPU,
+      driveFromMain,
       shadowEnabled: SceneConfig.shadow.enabled,
       dtSmoothAlpha: SceneConfig.dtSmoothAlpha,
       smartCameraEnabled: SceneConfig.smartCamera.enabled,
@@ -106,6 +111,15 @@ export class RenderClient {
     window.addEventListener('resize', this._onResize);
 
     attachPointerForwarding(canvas, this._worker);
+
+    // Optional main-thread vsync driver
+    if (driveFromMain) {
+      const drive = (ts) => {
+        try { this._worker?.postMessage({ type: 'tick', now: ts }); } catch {}
+        this._vsyncReq = requestAnimationFrame(drive);
+      };
+      this._vsyncReq = requestAnimationFrame(drive);
+    }
 
     await readyPromise;
   }
@@ -278,6 +292,7 @@ export class RenderClient {
 
   dispose() {
     if (this._onResize) window.removeEventListener('resize', this._onResize);
+    if (this._vsyncReq) cancelAnimationFrame(this._vsyncReq);
     if (this._worker) {
       this._worker.postMessage({ type: 'dispose' });
       this._worker.terminate();
