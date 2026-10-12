@@ -77,6 +77,7 @@ export class RenderClient {
     // Enable explicitly with `?vsync=main`.  On Tesla UAs, default to
     // main-thread drive unless explicitly disabled via `?vsync=worker`.
     const vsyncParam = urlParams.get('vsync');
+    const platformOverride = urlParams.get('platform') || '';
     const isTeslaUA = (() => {
       try {
         const ua = (navigator && navigator.userAgent) || '';
@@ -98,6 +99,8 @@ export class RenderClient {
       // worker is free to choose WebGL for known-problematic UAs.
       preferWebGPU,
       driveFromMain,
+      platformOverride,
+      clientHints: safeClientHints(),
       shadowEnabled: SceneConfig.shadow.enabled,
       dtSmoothAlpha: SceneConfig.dtSmoothAlpha,
       smartCameraEnabled: SceneConfig.smartCamera.enabled,
@@ -436,6 +439,27 @@ function attachPointerForwarding(canvas, worker) {
   };
   canvas.addEventListener('touchend', endTouch, { passive: true });
   canvas.addEventListener('touchcancel', endTouch, { passive: true });
+}
+
+function safeClientHints() {
+  try {
+    const nav = navigator || {};
+    const ua = nav.userAgent || '';
+    const uad = nav.userAgentData || {};
+    const brands = Array.isArray(uad.brands) ? uad.brands.map((b) => ({ brand: b.brand, version: b.version })) : undefined;
+    return {
+      mainUA: ua,
+      uaData: {
+        platform: uad.platform || nav.platform || '',
+        brands,
+      },
+      maxTouchPoints: Number(nav.maxTouchPoints || 0),
+      screen: { width: (typeof screen !== 'undefined' && screen.width) || 0, height: (typeof screen !== 'undefined' && screen.height) || 0 },
+      vendor: nav.vendor || '',
+    };
+  } catch {
+    return { mainUA: '', uaData: null, maxTouchPoints: 0, screen: { width: 0, height: 0 }, vendor: '' };
+  }
 }
 
 function eventPayload(ev) {
