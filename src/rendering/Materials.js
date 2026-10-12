@@ -227,18 +227,26 @@ export const Materials = {
   },
 
   staffLine: () =>
-    new THREE.MeshStandardMaterial({
-      color: c(SceneConfig.staffColor.r, SceneConfig.staffColor.g, SceneConfig.staffColor.b),
-      metalness: 0.1,
-      roughness: 0.7,
-    }),
+    (SceneConfig.performance?.mobileFlatShading
+      ? new THREE.MeshBasicMaterial({
+          color: c(SceneConfig.staffColor.r, SceneConfig.staffColor.g, SceneConfig.staffColor.b),
+        })
+      : new THREE.MeshStandardMaterial({
+          color: c(SceneConfig.staffColor.r, SceneConfig.staffColor.g, SceneConfig.staffColor.b),
+          metalness: 0.1,
+          roughness: 0.7,
+        })),
 
   barLine: () =>
-    new THREE.MeshStandardMaterial({
-      color: c(SceneConfig.barLineColor.r, SceneConfig.barLineColor.g, SceneConfig.barLineColor.b),
-      metalness: 0.1,
-      roughness: 0.7,
-    }),
+    (SceneConfig.performance?.mobileFlatShading
+      ? new THREE.MeshBasicMaterial({
+          color: c(SceneConfig.barLineColor.r, SceneConfig.barLineColor.g, SceneConfig.barLineColor.b),
+        })
+      : new THREE.MeshStandardMaterial({
+          color: c(SceneConfig.barLineColor.r, SceneConfig.barLineColor.g, SceneConfig.barLineColor.b),
+          metalness: 0.1,
+          roughness: 0.7,
+        })),
 
   paper: () => {
     const { normalMap } = _sharedPaperTextures();
