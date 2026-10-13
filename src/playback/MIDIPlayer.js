@@ -1,5 +1,6 @@
 import { Soundfont } from 'smplr';
 import { parseMIDI, GM_INSTRUMENTS } from './midiParse.js';
+import { computeSampleRateComp } from './audioUtils.js';
 
 /**
  * MIDI playback via Web Audio API with SoundFont-based instruments.
@@ -171,13 +172,16 @@ export class MIDIPlayer {
     // resume off as a fire-and-forget promise and let it complete in
     // the background.  By the time the user actually hears audio,
     // the context will have transitioned to `running`.
-    if (!this._ctx) this._ctx = new AudioContext();
+    if (!this._ctx) this._ctx = new AudioContext(chooseAudioContextOptions());
     this._setPlaybackAudioSession();
     this._primeAudio();
     this._unlockHtmlAudio();
     if (this._ctx.state === 'suspended') {
       this._ctx.resume().catch(() => { /* iOS may throw */ });
     }
+    // Environment detection + sample-rate compensation
+    this._teslaLike = detectTeslaLike();
+    this._sampleRateComp = computeSampleRateComp(this._ctx.sampleRate, this._teslaLike || urlFlag('audioratecomp') === '1');
 
     // Lazily kick off the soundfont load on first play — subsequent
     // plays re-use the cached `_instruments` Map and this is a no-op.
@@ -210,7 +214,7 @@ export class MIDIPlayer {
    * isn't blocked on a round-trip soundfont download.
    */
   warmUpAudio() {
-    if (!this._ctx) this._ctx = new AudioContext();
+    if (!this._ctx) this._ctx = new AudioContext(chooseAudioContextOptions());
     // Same gesture-window discipline as `play()`: every unlock
     // primitive is synchronous, the resume promise is fire-and-
     // forget.  Do NOT add an `await` to this method.
@@ -463,7 +467,7 @@ export class MIDIPlayer {
     this._stopAllNotes();
     const now = this._ctx.currentTime;
     const offset = this._pauseOffset;
-    const scale = 1 / this._tempoScale;
+    const scale = (1 / this._tempoScale) * (this._sampleRateComp || 1);
 
     for (const evt of this._noteEvents) {
       const noteStart = evt.time;
@@ -519,4 +523,44 @@ export class MIDIPlayer {
     // queue a fresh silent buffer the next time the user taps.
     this._primed = false;
   }
+}
+
+function urlFlag(key) {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    return p.get(key) || '';
+  } catch { return ''; }
+}
+
+function chooseAudioContextOptions() {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const sr = p.get('audiosr');
+    const sampleRate = sr ? Number(sr) : 44100; // default to 44.1k to avoid 48k speed-ups on some embedded browsers
+    if (Number.isFinite(sampleRate) && sampleRate > 8000) {
+      return { sampleRate };
+    }
+  } catch {}
+  // Fallback: let the browser pick
+  return {};
+}
+
+function detectTeslaLike() {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const platform = (p.get('platform') || '').toLowerCase();
+    if (platform === 'tesla') return true;
+    const nav = navigator || {};
+    const ua = (nav.userAgent || '').toLowerCase();
+    if (ua.includes('tesla') || ua.includes('qtcarbrowser')) return true;
+    const plat = (nav.userAgentData && nav.userAgentData.platform) || nav.platform || '';
+    const brands = (nav.userAgentData && Array.isArray(nav.userAgentData.brands)) ? nav.userAgentData.brands.map(b => b.brand).join(',') : '';
+    const isLinux = /linux|x11/i.test(plat) || /x11; linux/i.test(ua);
+    const isChromium = /chrom/i.test(ua) || /chrom/i.test(brands);
+    const touch = Number(nav.maxTouchPoints || 0);
+    const sw = (typeof screen !== 'undefined' && screen.width) || 0;
+    const sh = (typeof screen !== 'undefined' && screen.height) || 0;
+    const largeLandscape = (Math.max(sw, sh) >= 1200) && (Math.max(sw, sh) / Math.max(1, Math.min(sw, sh)) >= 1.2);
+    return isLinux && isChromium && touch > 0 && largeLandscape;
+  } catch { return false; }
 }
