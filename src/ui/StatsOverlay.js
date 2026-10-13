@@ -57,6 +57,9 @@ export class StatsOverlay {
       this._client.resetStatsCounters();
     });
     this._lastUpdate = 0;
+    this._lastAudioSampleMs = 0;
+    this._lastAudioTime = 0;
+    this._audioSpeed = 0;
     this._client.onStats = (s) => this._onStats(s);
   }
 
@@ -71,8 +74,10 @@ export class StatsOverlay {
     const renderer = this._client.rendererKind || 'unknown';
     const fps = (s.fps || 0).toFixed(1);
     const mfps = (s.mainFps || 0).toFixed(1);
+    const mhz = (s.displayHz || 0).toFixed(1);
     const p95 = (s.frameMsRecentP95 || s.frameMsP95 || 0).toFixed(2);
     const p99 = (s.frameMsRecentP99 || 0).toFixed(2);
+    const mp50 = (s.mainFrameMsRecentP50 || 0).toFixed(2);
     const mp95 = (s.mainFrameMsRecentP95 || 0).toFixed(2);
     const mp99 = (s.mainFrameMsRecentP99 || 0).toFixed(2);
     const gq95 = (s.gpuQueueRecentP95 || 0).toFixed(2);
@@ -91,20 +96,41 @@ export class StatsOverlay {
     const rate = s.rateMode ? `${s.rateMode}${s.rateDecimationN ? ` (N=${s.rateDecimationN})` : ''}` : 'unknown';
     const switches = Number(s.rateSwitches || 0);
     const hist = `hist 1x:${s.present1x ?? 0} 2x:${s.present2x ?? 0} 3x+:${s.present3x ?? 0}`;
+    // Audio metrics (from main)
+    const app = typeof window !== 'undefined' ? (window.__luminoirApp || null) : null;
+    const ac = app?.midiPlayer?._ctx || null;
+    const sr = ac?.sampleRate || 0;
+    const baseLat = ac?.baseLatency || 0;
+    const outLat = ac?.outputLatency || 0;
+    // Live audio-speed ratio: Δmusic / Δwall
+    const wallMs = performance.now();
+    const musicT = app?.midiPlayer?.currentTime || 0;
+    if (this._lastAudioSampleMs > 0) {
+      const dWall = (wallMs - this._lastAudioSampleMs) / 1000;
+      const dMus = musicT - this._lastAudioTime;
+      if (dWall > 0) this._audioSpeed = dMus / dWall;
+    }
+    this._lastAudioSampleMs = wallMs;
+    this._lastAudioTime = musicT;
+    const audioSpeed = this._audioSpeed ? this._audioSpeed.toFixed(3) : '—';
+    const missesPerMin = (s.mainMissPerMin || 0).toFixed(1);
+    const locked60 = s.mainLocked60 ? 'yes' : 'no';
     if (this._collapsed) {
       this._div.textContent =
-        `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nRate ${rate} • switches ${switches} • ${hist}`;
+        `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nAudio sr ${sr}Hz base ${Math.round(baseLat*1000)}ms out ${Math.round(outLat*1000)}ms speed ${audioSpeed}\nRate ${rate} • switches ${switches} • ${hist}`;
       this._div.appendChild(this._toggle);
       return;
     }
     const lines = [
       `fps ${fps}  (main ${mfps})`,
       `worker p95 ${p95} ms   p99 ${p99} ms   max ${fmax} ms`,
-      `main   p95 ${mp95} ms  p99 ${mp99} ms`,
+      `main   p50 ${mp50} ms  p95 ${mp95} ms  p99 ${mp99} ms`,
+      `display ${mhz} Hz  missed/min ${missesPerMin}  Locked 60: ${locked60}`,
       `GPU queue drain p95 ${gq95} ms  p99 ${gq99} ms`,
       `>8.3 ${over8} | >16.7 ${over16} | >33.3 ${over33}  (recent)`,
       `Σ>8.3 ${over8T} | Σ>16.7 ${over16T} | Σ>33.3 ${over33T} (session)`,
       `renderer ${renderer}   vsync ${s.vsyncDriver || 'unknown'}   DPR ${dpr}   res ${res}`,
+      `Audio sampleRate ${sr} Hz   baseLatency ${Math.round(baseLat*1000)} ms   outputLatency ${Math.round(outLat*1000)} ms   audioSpeed ${audioSpeed}`,
       `AA ${aa}`,
       `AQ ${aq}`,
       `Rate ${rate}   switches ${switches}   ${hist}`,

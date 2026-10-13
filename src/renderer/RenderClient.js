@@ -225,10 +225,22 @@ export class RenderClient {
     const mean = arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
     const sorted = arr.slice().sort((a, b) => a - b);
     const pick = (q) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))] : 0;
+    const p50 = pick(0.5);
+    const p95 = pick(0.95);
+    const windowMs = arr.reduce((a, b) => a + b, 0);
+    const baseline = p50 || mean || 16.67;
+    const misses = arr.filter((dt) => dt > baseline * 1.5).length;
+    const missesPerMin = windowMs > 0 ? (misses * 60000 / windowMs) : 0;
+    const displayHz = baseline > 0 ? (1000 / baseline) : 0;
+    const locked60 = Math.abs(baseline - 16.67) < 0.5 && missesPerMin < 1 && p95 < baseline * 1.1;
     return {
       mainFps: mean > 0 ? 1000 / mean : 0,
-      mainFrameMsRecentP95: pick(0.95),
+      mainFrameMsRecentP50: p50,
+      mainFrameMsRecentP95: p95,
       mainFrameMsRecentP99: pick(0.99),
+      mainMissPerMin: missesPerMin,
+      displayHz,
+      mainLocked60: locked60,
     };
   }
 
