@@ -295,6 +295,12 @@ export class QualityController {
     markDirty();
     try {
       this._ctx?.eventLog?.note?.(`shadow-quality: mapSize=${mapSize} softPcf=${!!softPcf} frozen=${!!keyLightRig.frozen}`);
+      const arr = this._ctx.diagContext;
+      if (Array.isArray(arr)) {
+        const label = `Quality: shadowMapSize=${mapSize}${keyLightRig.frozen ? ' (frozen frustum)' : ''}`;
+        const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Quality: shadowMapSize='));
+        if (i >= 0) arr[i] = label; else arr.push(label);
+      }
     } catch {}
   }
 

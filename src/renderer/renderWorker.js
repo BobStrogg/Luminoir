@@ -194,12 +194,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // first use.
   ctx.host.builder = new SVG3DBuilder();
   applyOutputSettings(renderer);
-  // Always render at the browser's native devicePixelRatio — even on
-  // mobile, where DPR 3 triples fragment work.  Resolution is the one
-  // thing we never trade for performance; the probe below recovers the
-  // budget through shadow-map size, LOD gating and the runtime pressure
-  // actuators instead.
-  renderer.setPixelRatio(devicePixelRatio || 1);
+  // On Tesla, cap DPR for locked-60 priority; elsewhere use native DPR.
+  const effectiveDpr = isTesla ? Math.min(devicePixelRatio || 1, 1.0) : (devicePixelRatio || 1);
+  renderer.setPixelRatio(effectiveDpr);
   renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
   renderer.setClearColor(SceneConfig.backgroundColor, 1);
   ctx.viewportHeightCss = height;
@@ -215,8 +212,10 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // On mobile we step down to plain `PCFShadowMap`; the soft variant
   // averages a multi-tap kernel per fragment and is one of the
   // largest single contributors to fragment cost in the shadow pass.
-  renderer.shadowMap.enabled = SceneConfig.shadow.enabled;
-  renderer.shadowMap.type = isMobile
+  // Tesla: consider much cheaper or no shadows for cadence stability.
+  const teslaShadows = false; // disable entirely for Tesla
+  renderer.shadowMap.enabled = teslaShadows ? true : (SceneConfig.shadow.enabled && !isTesla);
+  renderer.shadowMap.type = (isMobile || isTesla)
     ? THREE.PCFShadowMap
     : THREE.PCFSoftShadowMap;
   ctx.eventLog.note(`shadowMap.type=${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);

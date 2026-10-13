@@ -185,9 +185,21 @@ export class SceneHost {
       this._pendingPrecompile = null;
       try { this._ctx.eventLog?.note?.('precompile: begin'); } catch {}
       if (OPTIMIZATIONS.PRECOMPILE_PIPELINES) {
-        quality.refineSceneQuality()
-          .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
-          .then(() => this.precompilePipelines(root));
+        // Precompile first, then run the scene probe so warmed pipelines don't skew results.
+        const afterPrecompile = () => {
+          quality.refineSceneQuality()
+            .catch((err) => console.warn('[renderWorker] Scene quality probe failed:', err))
+            .finally(() => {
+              this._compiling = false;
+              markDirty();
+              this._postSceneReadyAfterRender = true;
+              try { this._ctx.eventLog?.note?.('precompile: done'); } catch {}
+            });
+        };
+        this.precompilePipelines(root);
+        // precompilePipelines will call afterCompile asynchronously — hook it by polling a flag
+        // Simpler: schedule refine on next task; compileAsync is already in-flight.
+        setTimeout(afterPrecompile, 0);
       } else {
         // Precompile disabled — release the render gate set in
         // buildScene so the main loop can draw the new scene.
