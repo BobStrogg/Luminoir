@@ -156,6 +156,7 @@ export class RenderClient {
       case 'requestMainVsyncDrive': {
         // Worker requested main-thread vsync driving (e.g. Tesla UA).
         this._startMainVsyncDrive();
+        this._driveFromMain = true;
         break;
       }
       case 'stats':

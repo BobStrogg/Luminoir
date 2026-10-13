@@ -78,6 +78,9 @@ export class FrameStats {
   _over33Total = 0;
   // WebGPU queue-drain timing (approximate GPU completion latency)
   _gpuQueueMsRing = new RingBuffer(120);
+  // Present-interval ring: time between successive rendered frames (ms)
+  _presentMsRing = new RingBuffer(120);
+  _lastPresentNow = 0;
 
   get playFrameRing() { return this._playFrameMsRing; }
   /** All-frames ring — includes paused/idle ticks.  Used by the runtime
@@ -88,6 +91,7 @@ export class FrameStats {
   get lastRenderMs() { return this._lastRenderMs; }
   get framesSinceRender() { return this._framesSinceRender; }
   get gpuQueueRing() { return this._gpuQueueMsRing; }
+  get presentRing() { return this._presentMsRing; }
 
   static _newJitterBucket() {
     return { count: 0, sum: 0, max: 0, cpuSum: 0, cpuMax: 0, over12: 0, over16: 0, over20: 0, over33: 0 };
@@ -223,6 +227,13 @@ export class FrameStats {
     this._lastRenderMs = ms;
     this._framesSinceRender = 0;
     this._renderMsRing.push(ms);
+    // Record present interval based on worker clock (presentation of new image)
+    const now = performance.now();
+    if (this._lastPresentNow > 0) {
+      const presentMs = now - this._lastPresentNow;
+      if (presentMs > 0 && presentMs < 2000) this._presentMsRing.push(presentMs);
+    }
+    this._lastPresentNow = now;
   }
 
   recordSkip() {

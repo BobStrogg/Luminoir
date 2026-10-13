@@ -463,15 +463,18 @@ export class RenderLoop {
     const { clock, quality, antiAliasing, frameStats, post } = this._ctx;
     if (now - this._lastStatsPostMs >= STATS_POST_INTERVAL_MS) {
       frameFlags |= FRAME_STATS;
-      // Build a present-interval histogram across the recent window.
-      let h1 = 0, h2 = 0, h3 = 0;
-      const wantH = Math.min(frameStats.frameMsRing.filled, 60);
+      // Build a present-interval histogram across recently RENDERED frames.
+      let h1 = 0, h2 = 0, h3 = 0, presentFps = 0;
+      const wantH = Math.min(frameStats.presentRing.filled, 60);
       if (wantH > 0 && quality.displayMs > 0) {
-        const arr = frameStats.frameMsRing.latest(wantH, frameStats._statsScratch);
+        const arr = frameStats.presentRing.latest(wantH, frameStats._statsScratch);
+        let sum = 0;
         for (let i = 0; i < arr.length; i++) {
+          sum += arr[i];
           const k = Math.max(1, Math.round(arr[i] / quality.displayMs));
           if (k <= 1) h1++; else if (k === 2) h2++; else h3++;
         }
+        if (sum > 0) presentFps = (arr.length * 1000) / sum;
       }
       // Dynamic rate label based on measured refresh, not hardcoded 120→60 mapping
       const baseFps = quality.displayMs > 0 ? (1000 / quality.displayMs) : 0;
@@ -489,6 +492,7 @@ export class RenderLoop {
         fxaaSuppressed: antiAliasing.suppressed,
         rateMode: rateLabel,
         rateDecimationN: this._decimationN,
+        presentFps,
         rateSwitches: this._rateSwitches,
         present1x: h1, present2x: h2, present3x: h3,
         events: this._ctx.eventLog?.latest?.(12) || [],
