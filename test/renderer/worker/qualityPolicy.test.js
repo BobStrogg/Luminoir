@@ -13,6 +13,12 @@ import {
   lodDetailThreshold,
   lodSubPixelFactor,
   renderBudgetMs,
+  chooseTeslaPixelRatio,
+  choosePresentDecimation,
+  rateLabelFor,
+  presentLocked60,
+  nextTeslaDecimation,
+  TESLA_LOCK60_PROBE_MS,
 } from '../../../src/renderer/worker/qualityPolicy.js';
 
 describe('chooseLoadTimeQuality', () => {
@@ -193,6 +199,96 @@ describe('lodSubPixelFactor', () => {
   it('clamps out-of-range pressure', () => {
     expect(lodSubPixelFactor(5)).toBeCloseTo(2.0);
     expect(lodSubPixelFactor(-2)).toBeCloseTo(0.7);
+  });
+});
+
+describe('chooseTeslaPixelRatio', () => {
+  it('replaces the DPR 1.0 cap with 1.5 on an 804×638 @ 1.96 Tesla panel', () => {
+    // Owner overlay: native DPR 1.96, buffer stuck at the CSS size.
+    expect(chooseTeslaPixelRatio(1.96, 804, 638)).toBe(1.5);
+  });
+
+  it('does not upscale when the native ratio is already 1', () => {
+    expect(chooseTeslaPixelRatio(1, 804, 638)).toBe(1);
+  });
+
+  it('keeps a large viewport at the 1.25 floor instead of the pixel-budget fraction', () => {
+    expect(chooseTeslaPixelRatio(2, 1920, 1200)).toBe(1.25);
+  });
+
+  it('respects an explicit pixel budget when it lands inside the band', () => {
+    // 804*638 = 512952; budget 1.0e6 → ratio ≈ 1.40, under the 1.5 cap.
+    expect(chooseTeslaPixelRatio(1.96, 804, 638, { pixelBudget: 1_000_000 })).toBe(1.4);
+  });
+});
+
+describe('choosePresentDecimation', () => {
+  const threshold = TESLA_LOCK60_PROBE_MS;
+
+  it('prefers 60 on a 60 Hz panel when the probe median fits', () => {
+    expect(choosePresentDecimation({
+      displayMs: 1000 / 60,
+      probeMedianMs: 12.4,
+      thresholdMs: threshold,
+    })).toEqual({ n: 1, label: 'locked60' });
+  });
+
+  it('steps a 60 Hz panel to locked 30 only when the median misses the threshold', () => {
+    expect(choosePresentDecimation({
+      displayMs: 1000 / 59.9,
+      probeMedianMs: 18.2,
+      thresholdMs: threshold,
+    })).toEqual({ n: 2, label: 'locked30' });
+  });
+
+  it('locks 60 (N=2) on a 120 Hz panel when the median fits one 60 Hz present', () => {
+    expect(choosePresentDecimation({
+      displayMs: 1000 / 120,
+      probeMedianMs: 12,
+      thresholdMs: threshold,
+    })).toEqual({ n: 2, label: 'locked60' });
+    expect(choosePresentDecimation({
+      displayMs: 1000 / 120,
+      probeMedianMs: 20,
+      thresholdMs: threshold,
+    })).toEqual({ n: 4, label: 'locked30' });
+  });
+});
+
+describe('present cadence verdict', () => {
+  it('labels N=1 on 60 Hz as locked60 and N=2 as locked30', () => {
+    expect(rateLabelFor(1, 1000 / 59.9)).toBe('locked60');
+    expect(rateLabelFor(2, 1000 / 59.9)).toBe('locked30');
+    expect(rateLabelFor(1, 1000 / 120)).toBe('native');
+    expect(rateLabelFor(2, 1000 / 120)).toBe('locked60');
+  });
+
+  it('does not call a 60 Hz main rAF locked-60 when decimation presents at 30', () => {
+    expect(presentLocked60(59.9, 1)).toBe(true);
+    expect(presentLocked60(59.9, 2)).toBe(false);
+    expect(presentLocked60(120, 2)).toBe(true);
+    expect(presentLocked60(120, 4)).toBe(false);
+    expect(presentLocked60(0, 1)).toBe(false);
+  });
+});
+
+describe('nextTeslaDecimation', () => {
+  it('does not step down on a 20 ms p95 blip', () => {
+    const step = nextTeslaDecimation(1, 1000 / 60, 20.5, 0);
+    expect(step).toEqual({ n: 1, consecutive: 0, step: false });
+  });
+
+  it('steps to 30 only after sustained presents near two vsyncs', () => {
+    let consecutive = 0;
+    let result = { n: 1, consecutive: 0, step: false };
+    for (let i = 0; i < 7; i++) {
+      result = nextTeslaDecimation(1, 1000 / 60, 33, consecutive);
+      consecutive = result.consecutive;
+      expect(result.step).toBe(false);
+    }
+    result = nextTeslaDecimation(1, 1000 / 60, 33, consecutive);
+    expect(result.step).toBe(true);
+    expect(result.n).toBe(2);
   });
 });
 

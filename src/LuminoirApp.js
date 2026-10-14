@@ -471,6 +471,9 @@ export class LuminoirApp {
       }
       const t = this.midiPlayer.currentTime;
       if (this.onTimeUpdate) this.onTimeUpdate(t);
+      if (this.midiPlayer.maybeApplyClockTrim()) {
+        this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+      }
       this.midiPlayer.checkComplete();
       this._tickTimer = setTimeout(tick, 100);
     };

@@ -156,7 +156,7 @@ export class KeyLightRig {
     // view; clamp to 2048 (≈ 4 M fragments, 9× cheaper) so dense
     // passages of Jupiter etc. don't trigger iOS Safari's rAF clamp.
     const sCfg = SceneConfig.shadow;
-    const mapSize = isMobile ? Math.min(sCfg.mapSize, 2048) : sCfg.mapSize;
+    const mapSize = (isMobile || isConstrained) ? Math.min(sCfg.mapSize, 2048) : sCfg.mapSize;
     key.shadow.mapSize.width = mapSize;
     key.shadow.mapSize.height = mapSize;
     const shadowCam = key.shadow.camera;
@@ -215,7 +215,7 @@ export class KeyLightRig {
    */
   fitToScore(parsed) {
     const light = this._keyLight;
-    if (!light || !parsed) return;
+    if (!light || !parsed || !SceneConfig.shadow.enabled) return;
     const { contentMinX, contentMinY, totalWidth, totalHeight } = parsed;
     if (!Number.isFinite(totalWidth) || !Number.isFinite(totalHeight)) {
       // Malformed bounds — fall back to ordinary recentering rather

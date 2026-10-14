@@ -3,7 +3,7 @@ import { SceneConfig } from '../../rendering/SceneConfig.js';
 import { setPlayheadX } from '../../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
 import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './FrameStats.js';
-import { quantizeFrameMs, renderBudgetMs } from './qualityPolicy.js';
+import { nextTeslaDecimation, quantizeFrameMs, rateLabelFor, renderBudgetMs } from './qualityPolicy.js';
 
 /**
  * Frame-budget rendering.
@@ -84,6 +84,8 @@ export class RenderLoop {
   _phaseAnchorTick = 0;
   _useExternalTicks = false;
   _tickSeq = 0;
+  /** Consecutive over-budget p95 samples for the Tesla last-resort step. */
+  _teslaHighP95 = 0;
 
   /**
    * @param {object} ctx Shared worker context — `clock`, `host`,
@@ -209,7 +211,11 @@ export class RenderLoop {
         }
       } catch {}
     }
-    if (frameMs > 0 && frameMs < 2000) {
+    // Skip the rings while a scene probe is blocking the worker on
+    // readPixels. Those gaps are the probe's own fence, not the
+    // steady present interval, and they used to freeze Tesla at
+    // locked 30.
+    if (frameMs > 0 && frameMs < 2000 && !this._ctx.host?.compiling) {
       frameStats.recordFrame(frameMs, clock.playing);
       // Optional benchmark aggregation (only records while playing)
       const bench = this._ctx.benchmark;
@@ -411,10 +417,13 @@ export class RenderLoop {
     const frameRing = frameStats.frameMsRing;
     if (frameRing.filled > 0) {
       const latestP95 = quality.sampleAq(now, frameRing);
-      if (latestP95 > 0) {
+        if (latestP95 > 0) {
         quality.updateRuntimePressure(dt, latestP95);
-        // Decide initial decimation before playback, behind the overlay:
-        if (!this._rateFrozen && quality.calibrated && !this._ctx.host.compiling) {
+        // Decide initial decimation before playback, behind the overlay.
+        // Tesla does not use this path: its lock comes from the
+        // load-time scene probe (see QualityController.refineSceneQuality).
+        // rAF p95 here includes the probe's own GPU fences.
+        if (!this._ctx.isTesla && !this._rateFrozen && quality.calibrated && !this._ctx.host.compiling) {
           const is120 = quality.displayMs <= 8.5;
           if (is120) {
             let n = 1;
@@ -422,29 +431,23 @@ export class RenderLoop {
             if (latestP95 >= 21.0) n = 4;
             this._applyDecimation(n, 'initial');
           } else {
-            // 60 Hz (or other) displays: on Tesla, prefer an even locked cadence
-            // at 30 fps when sustained p95 shows 60 cannot be held.
-            if (this._ctx.isTesla && this._decimationN === 1 && latestP95 >= 20.0) {
-              this._applyDecimation(2, 'initial');
-            } else {
-              this._applyDecimation(1, 'initial');
-            }
+            this._applyDecimation(1, 'initial');
           }
         }
         // One-way step-down during playback when sustained overload occurs.
         if (this._rateFrozen && quality.calibrated && quality.displayMs > 0) {
           const is120 = quality.displayMs <= 8.5;
-          if (is120) {
+          if (this._ctx.isTesla) {
+            const step = nextTeslaDecimation(
+              this._decimationN, quality.displayMs, latestP95, this._teslaHighP95);
+            this._teslaHighP95 = step.consecutive;
+            if (step.step) this._applyDecimation(step.n, 'stepdown');
+          } else if (is120) {
             if (this._decimationN === 1 && latestP95 >= 10.8) {
               // Engage locked60 after sustained evidence
               this._applyDecimation(2, 'stepdown');
             } else if (this._decimationN === 2 && latestP95 >= 20.5) {
               this._applyDecimation(4, 'stepdown');
-            }
-          } else if (this._ctx.isTesla) {
-            // 60 Hz Tesla: step down to locked30 if 60 remains unsustainable.
-            if (this._decimationN === 1 && latestP95 >= 20.5) {
-              this._applyDecimation(2, 'stepdown');
             }
           }
         }
@@ -476,11 +479,11 @@ export class RenderLoop {
         }
         if (sum > 0) presentFps = (arr.length * 1000) / sum;
       }
-      // Dynamic rate label based on measured refresh, not hardcoded 120→60 mapping
-      const baseFps = quality.displayMs > 0 ? (1000 / quality.displayMs) : 0;
-      const lockedFps = this._decimationN > 1 && baseFps > 0 ? Math.round(baseFps / this._decimationN) : 0;
-      const rateLabel = this._decimationN === 1 ? 'native'
-        : (`locked${lockedFps || (this._decimationN === 2 ? 60 : 30)}`);
+      // Dynamic rate label based on measured refresh, not hardcoded 120→60 mapping.
+      // N=1 on a 60 Hz panel is locked60 — the verdict must follow this
+      // decimation, not the main-thread rAF interval.
+      const rateLabel = rateLabelFor(this._decimationN, quality.displayMs);
+      const renderer = this._ctx.renderer;
       const msg = frameStats.buildStatsMessage({
         rendering: this._dirty || clock.playing,
         autoDegrade: quality.autoDimEnabled,
@@ -495,6 +498,9 @@ export class RenderLoop {
         presentFps,
         rateSwitches: this._rateSwitches,
         present1x: h1, present2x: h2, present3x: h3,
+        renderPixelRatio: renderer?.getPixelRatio?.() || 0,
+        bufferWidth: renderer?.domElement?.width || 0,
+        bufferHeight: renderer?.domElement?.height || 0,
         events: this._ctx.eventLog?.latest?.(12) || [],
         context: Array.isArray(this._ctx.diagContext) ? this._ctx.diagContext : [],
       });
@@ -502,6 +508,14 @@ export class RenderLoop {
       this._lastStatsPostMs = now;
     }
     return frameFlags;
+  }
+
+  /** Scene-probe authority for the initial lock. May select 60 even
+   *  if a transient sample had already frozen a lower rate. */
+  applyProbeDecimation(n, reason) {
+    this._rateFrozen = false;
+    this._teslaHighP95 = 0;
+    this._applyDecimation(n, reason || 'scene-probe');
   }
 
   _applyDecimation(n, reason) {
@@ -514,10 +528,7 @@ export class RenderLoop {
     this._phaseAnchorTick = this._tickSeq;
     this._rateFrozen = true;
     try {
-      const baseFps = this._ctx.quality?.displayMs > 0 ? (1000 / this._ctx.quality.displayMs) : 0;
-      const lockedFps = this._decimationN > 1 && baseFps > 0 ? Math.round(baseFps / this._decimationN) : 0;
-      const label = this._decimationN === 1 ? 'Rate: native'
-        : `Rate: locked${lockedFps || (this._decimationN === 2 ? 60 : 30)}`;
+      const label = `Rate: ${rateLabelFor(this._decimationN, this._ctx.quality?.displayMs || 0)}`;
       const arr = this._ctx.diagContext;
       if (Array.isArray(arr)) {
         const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Rate:'));

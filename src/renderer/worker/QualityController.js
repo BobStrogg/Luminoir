@@ -6,6 +6,9 @@ import {
   advancePressure,
   lightIntensityForPressure,
   snapToRefreshInterval,
+  choosePresentDecimation,
+  TESLA_LOCK60_PROBE_MS,
+  TESLA_DPR_MIN,
 } from './qualityPolicy.js';
 
 /**
@@ -211,6 +214,19 @@ export class QualityController {
   }
 
   /**
+   * Cost of the fence itself on an already-idle GPU. A 1×1 readPixels
+   * (or a queue drain) after the warmup render has finished is pure
+   * sync overhead. The scene probe subtracts it so a slow readback
+   * cannot look like a frame that missed 16.7 ms.
+   */
+  async idleFenceMs() {
+    await this.gpuSync();
+    const t0 = performance.now();
+    await this.gpuSync();
+    return Math.max(0, performance.now() - t0);
+  }
+
+  /**
    * Probe GPU rendering cost with the current scene by rendering it
    * `count` times and returning wall-clock milliseconds — including GPU
    * execution time (`gpuSync`) and a full shadow-map pass per frame.
@@ -226,7 +242,7 @@ export class QualityController {
    * the optional score-aware pass uses the median to make a
    * conservative downshift decision after real geometry is present.
    */
-  async probeGpuCost(count = 7, median = false) {
+  async probeGpuCost(count = 7, median = false, { forceShadow = true } = {}) {
     const { renderer, scene, camera, antiAliasing, keyLightRig } = this._ctx;
     if (!renderer || !scene || !camera) return 0;
     // Warm-up render — don't measure: first call often stalls on driver
@@ -235,8 +251,9 @@ export class QualityController {
     await this.gpuSync();
     let best = Infinity;
     const samples = median ? new Float64Array(count) : null;
+    const wantShadow = forceShadow && !!SceneConfig.shadow.enabled;
     for (let i = 0; i < count; i++) {
-      if (keyLightRig.light) keyLightRig.light.shadow.needsUpdate = true;
+      if (wantShadow && keyLightRig.light) keyLightRig.light.shadow.needsUpdate = true;
       const t0 = performance.now();
       antiAliasing.render(renderer, scene, camera);
       await this.gpuSync();
@@ -293,6 +310,7 @@ export class QualityController {
     }
     keyLightRig.resetSnap();
     markDirty();
+    try { this._ctx.syncShadowDiag?.(); } catch { /* diag is best-effort */ }
     try {
       this._ctx?.eventLog?.note?.(`shadow-quality: mapSize=${mapSize} softPcf=${!!softPcf} frozen=${!!keyLightRig.frozen}`);
       const arr = this._ctx.diagContext;
@@ -314,22 +332,114 @@ export class QualityController {
   }
 
   async refineSceneQuality() {
-    this.setShadowQuality(this._maxShadowMapSize, this._maxSoftPcf);
+    const shadowsOn = !!SceneConfig.shadow.enabled;
+    if (shadowsOn) {
+      this.setShadowQuality(this._maxShadowMapSize, this._maxSoftPcf);
+    }
     if (!this.runSceneProbe) {
       this._sceneProbeMsMeasured = -1;
       try { this._ctx?.eventLog?.note?.('scene-probe: skipped'); } catch {}
       return;
     }
-    let measured = await this.probeGpuCost(3, true);
+    // Tesla's rate lock used to read rAF p95 after this probe. The
+    // probe's own synchronous readPixels (and a forced shadow pass)
+    // inserted ~2× vsync gaps into that ring, so a panel whose real
+    // frames were 16.7 ms froze at N=2 (locked 30). The decision is
+    // the median below, compared to TESLA_LOCK60_PROBE_MS, and the
+    // ring is cleared afterwards.
+    const threshold = this._ctx.isTesla ? TESLA_LOCK60_PROBE_MS : this.sceneGpuBudgetMs;
+    const fence = this._ctx.isTesla ? await this.idleFenceMs() : 0;
+    let measured = await this.probeGpuCost(3, true, { forceShadow: shadowsOn });
+    const sceneMs = () => Math.max(0, measured - fence);
+    const startMeasured = measured;
+    const startDpr = this._ctx.renderer?.getPixelRatio?.() || 0;
     let steps = 0;
-    while (measured > this.sceneGpuBudgetMs && this.stepDown()) {
-      measured = await this.probeGpuCost(3, true);
-      steps++;
+    if (shadowsOn) {
+      while (measured > this.sceneGpuBudgetMs && this.stepDown()) {
+        measured = await this.probeGpuCost(3, true, { forceShadow: true });
+        steps++;
+      }
+    } else if (this._ctx.isTesla) {
+      // A lower ratio is only kept when it actually buys a 60 Hz frame
+      // or cuts the fenced scene cost by at least 25%. On a draw-call
+      // bound GPU the 1×1 readback barely moves when pixels drop, and
+      // throwing away the sharp ratio (the old 1.0 cap's failure mode)
+      // does not make 60 reachable.
+      let guard = 0;
+      let keptRatio = this._ctx.renderer?.getPixelRatio?.() || 1;
+      let keptScene = sceneMs();
+      while (sceneMs() > threshold && guard < 2) {
+        const renderer = this._ctx.renderer;
+        const ratio = renderer?.getPixelRatio?.() || 1;
+        if (ratio <= TESLA_DPR_MIN + 0.02) break;
+        const scaled = ratio * Math.sqrt(threshold / Math.max(sceneMs(), 0.01));
+        const next = Math.round(Math.max(TESLA_DPR_MIN, Math.min(ratio - 0.01, scaled)) * 100) / 100;
+        if (!(next < ratio - 0.01)) break;
+        const before = sceneMs();
+        this._ctx.applyRenderPixelRatio?.(next);
+        measured = await this.probeGpuCost(3, true, { forceShadow: false });
+        guard++;
+        steps++;
+        const saved = before > 0 ? (before - sceneMs()) / before : 0;
+        if (sceneMs() <= threshold || saved >= 0.25) {
+          keptRatio = next;
+          keptScene = sceneMs();
+          continue;
+        }
+        this._ctx.applyRenderPixelRatio?.(keptRatio);
+        measured = keptScene + fence;
+        steps = Math.max(0, steps - 1);
+        try {
+          this._ctx?.eventLog?.note?.(
+            `pixel-ratio: revert ${next.toFixed(2)} → ${keptRatio.toFixed(2)} (saved ${(saved * 100).toFixed(0)}%)`);
+        } catch {}
+        break;
+      }
+      this._ctx.probePixelRatioCeiling = keptRatio;
     }
     this._sceneProbeMsMeasured = measured;
+    let decision = null;
+    if (this._ctx.isTesla) {
+      const displayMs = this.calibrated ? this.displayMs : (1000 / 60);
+      decision = choosePresentDecimation({
+        displayMs,
+        probeMedianMs: sceneMs(),
+        thresholdMs: threshold,
+      });
+      this._ctx.loop?.applyProbeDecimation?.(decision.n, 'scene-probe');
+    }
+    this._forgetProbeStalls();
     try {
-      this._ctx?.eventLog?.note?.(`scene-probe: median=${measured.toFixed(2)} ms${steps ? `, steppedDown=${steps}` : ''}`);
+      const dpr = this._ctx.renderer?.getPixelRatio?.();
+      const dprNote = dpr ? ` dpr=${Number(dpr).toFixed(2)}` : '';
+      const stepped = steps
+        ? ` start=${startMeasured.toFixed(2)} ms at dpr=${Number(startDpr).toFixed(2)} steps=${steps}`
+        : '';
+      const verdict = decision
+        ? ` → ${decision.label} (N=${decision.n})`
+        : '';
+      const fenceNote = this._ctx.isTesla ? ` fence=${fence.toFixed(2)} ms scene=${sceneMs().toFixed(2)} ms` : '';
+      const line = `scene-probe: median=${measured.toFixed(2)} ms${fenceNote} threshold=${threshold.toFixed(2)} ms shadows=${shadowsOn ? 'on' : 'off'}${dprNote}${stepped}${verdict}`;
+      this._ctx?.eventLog?.note?.(line);
+      const arr = this._ctx.diagContext;
+      if (Array.isArray(arr)) {
+        const label = `Rate probe: median ${measured.toFixed(2)} ms${this._ctx.isTesla ? ` scene ${sceneMs().toFixed(2)} ms` : ''} threshold ${threshold.toFixed(2)} ms${decision ? ` → ${decision.label} (N=${decision.n})` : ''}`;
+        const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Rate probe:'));
+        if (i >= 0) arr[i] = label;
+        else arr.push(label);
+      }
     } catch {}
+  }
+
+  /** Drop rAF intervals recorded while the probe blocked the worker
+   *  on readPixels, and forget the cached p95 so the runtime step-down
+   *  cannot treat those stalls as "60 cannot be held". */
+  _forgetProbeStalls() {
+    const frameStats = this._ctx.frameStats;
+    frameStats?.frameMsRing?.reset?.();
+    frameStats?.playFrameRing?.reset?.();
+    this._latestAqP95 = 0;
+    this._lastAqSampleMs = typeof performance !== 'undefined' ? performance.now() : 0;
   }
 
   /**

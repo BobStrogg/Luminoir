@@ -1,3 +1,5 @@
+import { presentLocked60 } from '../renderer/worker/qualityPolicy.js';
+
 export class StatsOverlay {
   /**
    * @param {import('../renderer/RenderClient.js').RenderClient} renderClient
@@ -57,9 +59,6 @@ export class StatsOverlay {
       this._client.resetStatsCounters();
     });
     this._lastUpdate = 0;
-    this._lastAudioSampleMs = 0;
-    this._lastAudioTime = 0;
-    this._audioSpeed = 0;
     this._client.onStats = (s) => this._onStats(s);
   }
 
@@ -69,8 +68,14 @@ export class StatsOverlay {
     if (now - this._lastUpdate < 400) return;
     this._lastUpdate = now;
     const c = this._canvas;
-    const dpr = window.devicePixelRatio || 1;
-    const res = `${c?.width || 0}×${c?.height || 0}`;
+    // Prefer the worker's drawing-buffer ratio. `window.devicePixelRatio`
+    // stayed at 1.96 while Tesla rendered a 1.0 buffer, so the overlay
+    // hid the softness the owner was seeing.
+    const dprNum = s.renderPixelRatio > 0 ? s.renderPixelRatio : (window.devicePixelRatio || 1);
+    const dpr = Number(dprNum).toFixed(2);
+    const res = (s.bufferWidth > 0 && s.bufferHeight > 0)
+      ? `${s.bufferWidth}×${s.bufferHeight}`
+      : `${c?.width || 0}×${c?.height || 0}`;
     const renderer = this._client.rendererKind || 'unknown';
     const fps = (s.fps || 0).toFixed(1);
     const mfps = (s.mainFps || 0).toFixed(1);
@@ -102,19 +107,24 @@ export class StatsOverlay {
     const sr = ac?.sampleRate || 0;
     const baseLat = ac?.baseLatency || 0;
     const outLat = ac?.outputLatency || 0;
-    // Live audio-speed ratio: Δmusic / Δwall
-    const wallMs = performance.now();
-    const musicT = app?.midiPlayer?.currentTime || 0;
-    if (this._lastAudioSampleMs > 0) {
-      const dWall = (wallMs - this._lastAudioSampleMs) / 1000;
-      const dMus = musicT - this._lastAudioTime;
-      if (dWall > 0) this._audioSpeed = dMus / dWall;
+    // Long-window AudioContext/wall rate. A single ~0.5 s slice (the
+    // old estimator) jitters by about ±2%, which is where a lone
+    // 1.019 reading comes from. Until the window is 2 s the value
+    // stays blank; a sustained drift outside ±0.8% is corrected in
+    // MIDIPlayer and shown here as clock + corrected.
+    const info = app?.midiPlayer?.audioClockInfo?.() || null;
+    let audioSpeed = '—';
+    if (info?.reliable) {
+      audioSpeed = info.corrected
+        ? `1.000 (clock ${info.rate.toFixed(3)} corrected)`
+        : info.rate.toFixed(3);
     }
-    this._lastAudioSampleMs = wallMs;
-    this._lastAudioTime = musicT;
-    const audioSpeed = this._audioSpeed ? this._audioSpeed.toFixed(3) : '—';
     const missesPerMin = (s.mainMissPerMin || 0).toFixed(1);
-    const locked60 = s.mainLocked60 ? 'yes' : 'no';
+    // Present cadence, not main-thread rAF. N=2 on a 60 Hz panel is
+    // 30 fps even when main p95 is 16.7 ms.
+    const locked60 = !(s.displayHz > 0)
+      ? '…'
+      : (presentLocked60(s.displayHz, s.rateDecimationN || 1) ? 'yes' : 'no');
     if (this._collapsed) {
       this._div.textContent =
         `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nAudio sr ${sr}Hz base ${Math.round(baseLat*1000)}ms out ${Math.round(outLat*1000)}ms speed ${audioSpeed}\nRate ${rate} • switches ${switches} • ${hist}`;

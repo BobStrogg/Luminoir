@@ -24,6 +24,7 @@ import { setRendererKind } from '../rendering/Materials.js';
 import { CameraController } from '../animation/CameraController.js';
 import { ElementProxy } from './ElementProxy.js';
 import { OPTIMIZATIONS } from '../rendering/Optimizations.js';
+import { chooseTeslaPixelRatio } from './worker/qualityPolicy.js';
 import { detectPlatform } from './worker/ua.js';
 import { createRenderer, applyOutputSettings } from './worker/RendererFactory.js';
 import { AntiAliasing } from './worker/AntiAliasing.js';
@@ -92,6 +93,89 @@ ctx._lastHiddenDurationMs = 0;
 ctx._visibleAt = 0;
 // Persistent diagnostic context (shown separately from rolling events).
 ctx.diagContext = [];
+/** CSS viewport last applied, and the native vs chosen pixel ratios. */
+ctx.cssWidth = 1;
+ctx.cssHeight = 1;
+ctx.nativePixelRatio = 1;
+ctx.renderPixelRatio = 1;
+/** Set when the scene probe steps the ratio down, so a later resize
+ *  cannot climb back above a ratio the probe already rejected. */
+ctx.probePixelRatioCeiling = 0;
+
+function upsertDiag(prefix, line) {
+  const arr = ctx.diagContext;
+  if (!Array.isArray(arr)) return;
+  const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith(prefix));
+  if (i >= 0) arr[i] = line;
+  else arr.push(line);
+}
+
+function removeDiagPrefix(prefix) {
+  const arr = ctx.diagContext;
+  if (!Array.isArray(arr)) return;
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (typeof arr[i] === 'string' && arr[i].startsWith(prefix)) arr.splice(i, 1);
+  }
+}
+
+function syncShadowDiag() {
+  const enabled = !!SceneConfig.shadow.enabled && !!ctx.renderer?.shadowMap?.enabled;
+  if (!enabled) {
+    removeDiagPrefix('Quality: shadowMapSize=');
+    upsertDiag('Shadows:', 'Shadows: off');
+    return;
+  }
+  const soft = ctx.renderer.shadowMap.type === THREE.PCFSoftShadowMap;
+  const size = ctx.quality?.chosenShadowMapSize
+    || ctx.keyLightRig?.light?.shadow?.mapSize?.width
+    || 0;
+  upsertDiag('Shadows:', `Shadows: ${soft ? 'PCFSoft' : 'PCF'}${size ? ` map ${size}` : ''}`);
+}
+
+function syncRendererDprDiag() {
+  const arr = ctx.diagContext;
+  if (!Array.isArray(arr)) return;
+  const i = arr.findIndex((s) => typeof s === 'string' && s.startsWith('Renderer:'));
+  if (i < 0) return;
+  const dpr = Number(ctx.renderPixelRatio || 1).toFixed(2);
+  const native = Number(ctx.nativePixelRatio || 1).toFixed(2);
+  arr[i] = arr[i].replace(/DPR [\d.]+ \(native [\d.]+\)/, `DPR ${dpr} (native ${native})`);
+}
+
+function syncFramebufferDiag() {
+  const renderer = ctx.renderer;
+  const dpr = renderer?.getPixelRatio?.() || ctx.renderPixelRatio || 1;
+  const native = ctx.nativePixelRatio || dpr;
+  const bufW = renderer?.domElement?.width || Math.round((ctx.cssWidth || 0) * dpr);
+  const bufH = renderer?.domElement?.height || Math.round((ctx.cssHeight || 0) * dpr);
+  upsertDiag('Framebuffer:', `Framebuffer: DPR ${Number(dpr).toFixed(2)} (native ${Number(native).toFixed(2)}) ${bufW}×${bufH}`);
+}
+
+/** Apply the session pixel ratio. Tesla passes a load-time budget;
+ *  everyone else passes the native DPR. Does not change ratio during
+ *  playback except via resize, which reuses the probe ceiling. */
+function applyRenderPixelRatio(ratio) {
+  const renderer = ctx.renderer;
+  if (!renderer || !(ctx.cssWidth > 0) || !(ctx.cssHeight > 0)) return;
+  const native = ctx.nativePixelRatio || 1;
+  const next = Math.min(native, Math.max(0.25, ratio));
+  const prev = typeof renderer.getPixelRatio === 'function' ? renderer.getPixelRatio() : 0;
+  ctx.renderPixelRatio = next;
+  renderer.setPixelRatio(next);
+  renderer.setSize(ctx.cssWidth, ctx.cssHeight, false);
+  if (ctx.antiAliasing) ctx.antiAliasing.resize(renderer, ctx.cssWidth, ctx.cssHeight);
+  if (ctx.lod) ctx.lod.invalidate();
+  ctx.markDirty();
+  syncFramebufferDiag();
+  syncRendererDprDiag();
+  if (Math.abs(prev - next) > 0.01) {
+    const bufW = renderer.domElement?.width || 0;
+    const bufH = renderer.domElement?.height || 0;
+    ctx.eventLog?.note?.(`pixel-ratio: ${next.toFixed(2)} (native ${native.toFixed(2)}) buffer ${bufW}×${bufH}`);
+  }
+}
+ctx.applyRenderPixelRatio = applyRenderPixelRatio;
+ctx.syncShadowDiag = syncShadowDiag;
 
 /* ------------------------------------------------------------------ */
 /*  Message plumbing                                                   */
@@ -124,7 +208,7 @@ self.onmessage = async (e) => {
 /*  Init                                                                */
 /* ------------------------------------------------------------------ */
 
-async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, driveFromMain, shadowEnabled, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime, platformOverride, clientHints }) {
+async function handleInit({ canvas, width, height, devicePixelRatio, rect, forceWebGL, preferWebGPU, driveFromMain, shadowEnabled, forceShadows, dtSmoothAlpha, smartCameraEnabled, lookAheadSeconds, smoothTime, platformOverride, clientHints }) {
   // SceneConfig is mirrored in the worker; set the runtime flags
   // from the main thread before the renderer is configured.
   SceneConfig.shadow.enabled = shadowEnabled !== false;
@@ -135,8 +219,9 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // Mobile devices (iOS Safari especially) sit right on the edge of
   // the per-frame budget at desktop quality, and the OS halves the
   // rAF rate the moment a frame goes over.  Trim shadow resolution and
-  // antialias here so dense passages stay under 16.67 ms — never the
-  // framebuffer resolution itself, which always runs at native DPR.
+  // antialias here so dense passages stay under 16.67 ms. Desktop and
+  // phones keep native DPR. Tesla picks a load-time pixel budget
+  // (sharper than the old 1.0 cap) and does not change it mid-playback.
   const plat = detectPlatform({ platformOverride, ...(clientHints || {}) });
   const { isMobile, isSafari, isTesla, isConstrained } = plat;
   ctx.eventLog.note(`init: ua mobile=${isMobile} safari=${isSafari} tesla=${isTesla} constrained=${isConstrained}`);
@@ -158,6 +243,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   try {
     if (!SceneConfig.performance) SceneConfig.performance = {};
     SceneConfig.performance.mobileFlatShading = !!isConstrained;
+    SceneConfig.performance.cheapSurfaces = !!isTesla;
   } catch {}
 
   // MSAA on TBDR mobile GPUs costs significant memory bandwidth per
@@ -179,7 +265,6 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   }
   ctx.renderer = renderer;
   ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}${forceLegacy ? ' [forced legacy on Safari]' : ''}`);
-  ctx.diagContext.push(`Renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; AA=${wantAntialias ? 'MSAA' : 'none'}; DPR ${(devicePixelRatio||1).toFixed(2)}`);
 
   // Tell the `Materials` module which GLSL-injection path to use —
   // must be called *before* the first `Materials.noteHead()` in the
@@ -194,12 +279,21 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // first use.
   ctx.host.builder = new SVG3DBuilder();
   applyOutputSettings(renderer);
-  // On Tesla, cap DPR for locked-60 priority; elsewhere use native DPR.
-  const effectiveDpr = isTesla ? Math.min(devicePixelRatio || 1, 1.0) : (devicePixelRatio || 1);
-  renderer.setPixelRatio(effectiveDpr);
-  renderer.setSize(width, height, false); // false = don't set style; we're off-DOM
-  renderer.setClearColor(SceneConfig.backgroundColor, 1);
+  // Tesla used to clamp DPR at 1.0. On a ~2× panel that left the
+  // drawing buffer at CSS resolution (the 804×638 buffer behind a
+  // 1.96 window DPR) and the score looked soft. Pick a sharper
+  // load-time ratio instead; the scene probe may step it down while
+  // the overlay is still up, but never back to a blanket 1.0 cap.
+  ctx.cssWidth = width;
+  ctx.cssHeight = height;
+  ctx.nativePixelRatio = devicePixelRatio || 1;
   ctx.viewportHeightCss = height;
+  const effectiveDpr = isTesla
+    ? chooseTeslaPixelRatio(ctx.nativePixelRatio, width, height)
+    : ctx.nativePixelRatio;
+  applyRenderPixelRatio(effectiveDpr);
+  renderer.setClearColor(SceneConfig.backgroundColor, 1);
+  upsertDiag('Renderer:', `Renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; AA=${wantAntialias ? 'MSAA' : 'none'}; DPR ${effectiveDpr.toFixed(2)} (native ${ctx.nativePixelRatio.toFixed(2)})`);
 
   // Enable shadow rendering on whichever renderer we got.  The key
   // light below casts a soft shadow (PCF on WebGL, an equivalent
@@ -212,14 +306,17 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // On mobile we step down to plain `PCFShadowMap`; the soft variant
   // averages a multi-tap kernel per fragment and is one of the
   // largest single contributors to fragment cost in the shadow pass.
-  // Tesla: consider much cheaper or no shadows for cadence stability.
-  const teslaShadows = false; // disable entirely for Tesla
-  renderer.shadowMap.enabled = teslaShadows ? true : (SceneConfig.shadow.enabled && !isTesla);
+  // `?shadow=1` is the only way to keep shadows on Tesla. The default
+  // init flag is "on", and `KeyLightRig.applyShadowEnabled` copies
+  // `SceneConfig.shadow.enabled` onto the renderer — a later write of
+  // `shadowMap.enabled = false` used to be undone there, which is why
+  // v1.1.26 still showed a PCF shadow map.
+  if (isTesla && !forceShadows) SceneConfig.shadow.enabled = false;
+  renderer.shadowMap.enabled = !!SceneConfig.shadow.enabled;
   renderer.shadowMap.type = (isMobile || isTesla)
     ? THREE.PCFShadowMap
     : THREE.PCFSoftShadowMap;
-  ctx.eventLog.note(`shadowMap.type=${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
-  ctx.diagContext.push(`Shadows: ${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
+  ctx.eventLog.note(`shadows: ${SceneConfig.shadow.enabled ? 'on' : 'off'} type=${renderer.shadowMap.type === THREE.PCFSoftShadowMap ? 'PCFSoft' : 'PCF'}`);
 
   const cfg = SceneConfig.camera;
   const camera = ctx.camera = new THREE.PerspectiveCamera(cfg.fov, width / height, cfg.near, cfg.far);
@@ -269,7 +366,10 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   ctx.scene.background = new THREE.Color(SceneConfig.backgroundColor);
   ctx.scene.add(ctx.host.contentRoot);
   ctx.keyLightRig.setupLighting(ctx.scene, isMobile, renderer, isConstrained);
-  if (ctx.keyLightRig.frozen) ctx.eventLog.note('shadows: frozen frustum (constrained platform)');
+  syncShadowDiag();
+  if (ctx.keyLightRig.frozen && SceneConfig.shadow.enabled) {
+    ctx.eventLog.note('shadows: frozen frustum (constrained platform)');
+  }
 
   // Save base light intensity so the runtime pressure system can scale it.
   ctx.quality.baseLightIntensity = SceneConfig.lightBall.intensity;
@@ -291,11 +391,17 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
   // shadows are sub-texel anyway and excluding them roughly halves the
   // periodic shadow-pass cost.  Set before the first `lod.collect()`.
   ctx.lod.constrained = isConstrained;
-  const probeMs = await ctx.quality.probeGpuCost(5);
-  ctx.quality.probeMsMeasured = probeMs;
-  ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
-  ctx.eventLog.note(`load-probe: ${probeMs.toFixed(2)} ms → shadowMapSize=${ctx.quality.chosenShadowMapSize}`);
-  ctx.diagContext.push(`Quality: shadowMapSize=${ctx.quality.chosenShadowMapSize}${ctx.keyLightRig.frozen ? ' (frozen frustum)' : ''}`);
+  if (SceneConfig.shadow.enabled) {
+    const probeMs = await ctx.quality.probeGpuCost(5);
+    ctx.quality.probeMsMeasured = probeMs;
+    ctx.quality.applyLoadTimeQuality(probeMs, isConstrained);
+    ctx.eventLog.note(`load-probe: ${probeMs.toFixed(2)} ms → shadowMapSize=${ctx.quality.chosenShadowMapSize}`);
+    syncShadowDiag();
+  } else {
+    ctx.quality.probeMsMeasured = 0;
+    ctx.eventLog.note('load-probe: skipped (shadows off)');
+    syncShadowDiag();
+  }
 
   const cameraCtrl = ctx.cameraCtrl = new CameraController(camera, controls);
   ctx.frameStats.seedCameraPos(camera.position);
@@ -320,6 +426,8 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     renderer: usingWebGPU ? 'WebGPU' : 'WebGL',
     antiAliasing: ctx.antiAliasing.mode,
     msaaSamples: ctx.antiAliasing.msaaSamples,
+    shadowsEnabled: !!SceneConfig.shadow.enabled,
+    tesla: !!isTesla,
   });
 
   // Prefer main-thread vsync drive on Tesla unless explicitly disabled by URL.
@@ -336,20 +444,27 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
 /* ------------------------------------------------------------------ */
 
 function handleResize({ width, height, devicePixelRatio, rect }) {
-  const { renderer, camera, elementProxy, antiAliasing, lod } = ctx;
+  const { renderer, camera, elementProxy } = ctx;
   if (!renderer || !camera) return;
+  ctx.cssWidth = width;
+  ctx.cssHeight = height;
+  ctx.viewportHeightCss = height;
+  ctx.nativePixelRatio = devicePixelRatio || 1;
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  // Always render at the browser's native devicePixelRatio — resolution
-  // is never reduced for performance (see handleInit).
-  renderer.setPixelRatio(devicePixelRatio || 1);
-  renderer.setSize(width, height, false);
-  antiAliasing.resize(renderer, width, height);
-  ctx.viewportHeightCss = height;
-  lod.invalidate(); // viewport changed → pixel sizes changed → re-evaluate LOD
+  // Tesla keeps the load-time ratio (and any probe ceiling). A resize
+  // used to stamp the native DPR back on and undo the cap — or, with
+  // the old 1.0 cap, ignore it entirely. Non-Tesla stays at native.
+  if (ctx.isTesla) {
+    const chosen = chooseTeslaPixelRatio(ctx.nativePixelRatio, width, height);
+    const cap = ctx.probePixelRatioCeiling;
+    applyRenderPixelRatio(cap ? Math.min(chosen, cap) : chosen);
+  } else {
+    applyRenderPixelRatio(ctx.nativePixelRatio);
+  }
   if (elementProxy) elementProxy.setRect(rect);
   ctx.markDirty();
-  ctx.eventLog.note(`resize: ${Math.floor(width)}×${Math.floor(height)} dpr=${(devicePixelRatio||1).toFixed(2)}`);
+  ctx.eventLog.note(`resize: ${Math.floor(width)}×${Math.floor(height)} dpr=${ctx.renderPixelRatio.toFixed(2)} native=${ctx.nativePixelRatio.toFixed(2)}`);
 }
 
 function handlePointer({ target, payload }) {
@@ -533,7 +648,10 @@ function handleUpdateConfig({ updates }) {
         || path === 'camera.chaseRatio') {
       cameraDirty = true;
     }
-    if (path === 'shadow.enabled') keyLightRig.applyShadowEnabled(renderer);
+    if (path === 'shadow.enabled') {
+      keyLightRig.applyShadowEnabled(renderer);
+      syncShadowDiag();
+    }
   }
   const lastFraming = host.lastFraming;
   if (cameraDirty && cameraCtrl && lastFraming) {
