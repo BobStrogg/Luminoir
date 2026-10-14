@@ -1,4 +1,4 @@
-import { resolveAvOffsetMs } from '../playback/audioUtils.js';
+import { avOffsetFromSearch, avOffsetToPersist, clampAvOffsetMs } from '../playback/audioUtils.js';
 import { SETTINGS, applyToSceneConfig, readFromSceneConfig } from './settingsRegistry.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { loadStoredSettings, saveStoredSettings, clearStoredSettings } from './SettingsPersistence.js';
@@ -43,6 +43,18 @@ export class SettingsPanel {
   _reparseTimer = 0;
   /** Map of setting id → control element so we can re-sync on Reset. */
   _controls = new Map();
+  /**
+   * True while `?avoffset=` is the live value. Persistence must not
+   * write that session override over the saved slider position.
+   */
+  _avOffsetFromUrl = false;
+  /**
+   * Last A/V offset the user actually saved. `undefined` means the
+   * key has never been stored. Distinct from `0`, which is a real
+   * saved nudge.
+   * @type {number | undefined}
+   */
+  _savedAvOffsetMs = undefined;
   _open = false;
   _onDocClick = null;
   _onKeydown = null;
@@ -61,16 +73,21 @@ export class SettingsPanel {
   _hydrate() {
     const stored = loadStoredSettings();
     let search = '';
-    try { search = (typeof location !== 'undefined' && location.search) || ''; } catch { /* no window */ }
+    try { search = globalThis.location?.search || ''; } catch { /* no window */ }
+    const urlAv = avOffsetFromSearch(search);
+    this._avOffsetFromUrl = urlAv != null;
+    const storedAv = stored.audioVisualOffsetMs;
+    this._savedAvOffsetMs = storedAv !== undefined ? clampAvOffsetMs(storedAv, 0) : undefined;
     for (const setting of SETTINGS) {
-      let value = stored[setting.id];
       if (setting.id === 'audioVisualOffsetMs') {
-        const resolved = resolveAvOffsetMs(value, search);
-        if (resolved == null) continue;
-        value = resolved;
+        // The query param is the live value for this page only.
+        // `_savedAvOffsetMs` stays the stored slider position.
+        const live = urlAv != null ? urlAv : this._savedAvOffsetMs;
+        if (live !== undefined) applyToSceneConfig(setting, live);
+        continue;
       }
-      if (value !== undefined) {
-        applyToSceneConfig(setting, value);
+      if (stored[setting.id] !== undefined) {
+        applyToSceneConfig(setting, stored[setting.id]);
       }
     }
   }
@@ -507,6 +524,12 @@ export class SettingsPanel {
   _onChange(setting, value) {
     const changed = applyToSceneConfig(setting, value);
     if (!changed) return;
+    if (setting.id === 'audioVisualOffsetMs') {
+      // Moving the slider is a deliberate save. The URL override
+      // stops shielding the stored value after this.
+      this._avOffsetFromUrl = false;
+      this._savedAvOffsetMs = clampAvOffsetMs(value, 0);
+    }
     this._persist();
     if (setting.apply === 'live') {
       this._pushLive(setting, value);
@@ -548,9 +571,19 @@ export class SettingsPanel {
     // Re-read each setting's current effective value out of
     // SceneConfig and persist the whole map.  Cheap (≈15 entries),
     // and avoids any drift between what's in localStorage and what's
-    // actually in `SceneConfig`.
+    // actually in `SceneConfig`. `?avoffset=` is the exception: it
+    // lives in SceneConfig for the session and must not replace the
+    // saved slider position when some other setting is written.
     const map = {};
     for (const s of SETTINGS) {
+      if (s.id === 'audioVisualOffsetMs') {
+        const saved = avOffsetToPersist(readFromSceneConfig(s), {
+          fromUrl: this._avOffsetFromUrl,
+          savedMs: this._savedAvOffsetMs,
+        });
+        if (saved !== undefined) map[s.id] = saved;
+        continue;
+      }
       map[s.id] = readFromSceneConfig(s);
     }
     saveStoredSettings(map);
@@ -560,6 +593,10 @@ export class SettingsPanel {
 
   _resetAll() {
     clearStoredSettings();
+    // Reset is deliberate: the URL override must not be written
+    // back, and it must not be resurrected by the next save.
+    this._avOffsetFromUrl = false;
+    this._savedAvOffsetMs = undefined;
     const liveUpdates = {};
     let needsReparse = false;
     let resetPlaybackSpeed = false;

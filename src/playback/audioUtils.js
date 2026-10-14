@@ -100,8 +100,9 @@ export function avOffsetFromSearch(search) {
 }
 
 /**
- * Effective user offset: the URL param wins, otherwise the stored
- * value clamped into range. `null` when neither is set.
+ * Effective user offset for this session: the URL param wins,
+ * otherwise the stored value clamped into range. `null` when
+ * neither is set. The URL value is not what gets written back.
  * @param {number | string | null | undefined} stored
  * @param {string} search
  * @returns {number | null}
@@ -111,6 +112,24 @@ export function resolveAvOffsetMs(stored, search) {
   if (override != null) return override;
   if (stored == null || stored === '') return null;
   return clampAvOffsetMs(stored, 0);
+}
+
+/**
+ * Value to store for `audioVisualOffsetMs`.
+ *
+ * `?avoffset=` changes the live session only. Saving any other
+ * setting must keep the last deliberate slider value (`savedMs`),
+ * or omit the key when the user has never saved one. A slider
+ * change passes `fromUrl: false` and stores `liveMs`.
+ *
+ * @param {number} liveMs
+ * @param {{ fromUrl?: boolean, savedMs?: number | null }} [state]
+ * @returns {number | undefined}  `undefined` means leave the key out
+ */
+export function avOffsetToPersist(liveMs, { fromUrl = false, savedMs = null } = {}) {
+  if (!fromUrl) return clampAvOffsetMs(liveMs, 0);
+  if (savedMs == null || savedMs === '') return undefined;
+  return clampAvOffsetMs(savedMs, 0);
 }
 
 /** localStorage key for the master-volume slider. */

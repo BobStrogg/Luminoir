@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   audioClockTrim,
   avOffsetFromSearch,
+  avOffsetToPersist,
   clampAvOffsetMs,
   clampMasterVolume,
   computeSampleRateComp,
@@ -131,6 +132,15 @@ describe('A/V sync offset', () => {
     expect(resolveAvOffsetMs(40, '?avoffset=-20')).toBe(-20);
     expect(resolveAvOffsetMs(500, '')).toBe(300);
     expect(resolveAvOffsetMs(undefined, '')).toBeNull();
+  });
+
+  it('does not store a ?avoffset= session value over a saved slider position', () => {
+    expect(avOffsetToPersist(120, { fromUrl: true, savedMs: 40 })).toBe(40);
+    expect(avOffsetToPersist(-20, { fromUrl: true, savedMs: 0 })).toBe(0);
+    expect(avOffsetToPersist(120, { fromUrl: true, savedMs: null })).toBeUndefined();
+    expect(avOffsetToPersist(120, { fromUrl: true })).toBeUndefined();
+    expect(avOffsetToPersist(80, { fromUrl: false, savedMs: 40 })).toBe(80);
+    expect(avOffsetToPersist(450, { fromUrl: true, savedMs: 900 })).toBe(300);
   });
 });
 
