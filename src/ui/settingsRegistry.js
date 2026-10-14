@@ -109,7 +109,7 @@ export const SETTINGS = [
   {
     id: 'audioVisualOffsetMs',
     label: 'A/V sync offset',
-    description: 'Extra shift on top of the automatic speaker delay. +N moves visuals earlier, −N moves them later. Stored in this browser. ?avoffset= overrides it for one session.',
+    description: 'Extra shift on top of the automatic speaker delay. +N moves visuals earlier, −N moves them later. Stored in this browser when you move this slider. ?avoffset= overrides it for one session and is not saved.',
     type: 'range',
     min: -300, max: 300, step: 5,
     default: defaultFor('audioVisualOffsetMs'),
