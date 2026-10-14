@@ -342,28 +342,27 @@ export function presentLocked60(displayHz, decimationN) {
 }
 
 /**
- * Count frame intervals that missed the current present budget.
+ * Count rAF-to-rAF intervals that missed the display vsync.
+ * `frameMs` is the raw tick ring, not the gap between rendered
+ * frames, so the budget is one vsync — multiplying by decimation N
+ * made a 33 ms tick at N=2 look on-time and let the rate step up.
  * A gap at or above `outlierMs` (a GC, a shader link, a decode hitch)
- * is dropped entirely: one 366 ms sample must not become the p95 of
- * a short post-play window. A miss is an interval above
- * `missFactor` × the present period (vsync × decimation) and below
+ * is dropped entirely: one 366 ms sample must not fill the miss
+ * budget. A miss is an interval above `missFactor` × vsync and below
  * that outlier cap.
  *
  * @param {ArrayLike<number>} frameMs
  * @param {number} displayMs
- * @param {number} decimationN
  * @param {{ missFactor?: number, outlierMs?: number }} [opts]
  * @returns {{ samples: number, misses: number, outliers: number }}
  */
-export function countCadenceMisses(frameMs, displayMs, decimationN, {
+export function countCadenceMisses(frameMs, displayMs, {
   missFactor = 1.5,
   outlierMs = 100,
 } = {}) {
   const vsync = displayMs > 0 ? displayMs : 1000 / 60;
-  const n = decimationN === 2 || decimationN === 4 ? decimationN : 1;
-  const present = vsync * n;
-  const missAt = present * missFactor;
-  const outlierAt = Math.max(outlierMs, present * 4);
+  const missAt = vsync * missFactor;
+  const outlierAt = Math.max(outlierMs, vsync * 4);
   let samples = 0;
   let misses = 0;
   let outliers = 0;
