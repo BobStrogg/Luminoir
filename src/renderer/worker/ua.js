@@ -2,8 +2,9 @@
  *  pick a smaller shadow map, a cheaper PCF filter and no MSAA so iOS
  *  Safari's "frame went over 16.67 ms → rAF clamps to 30 Hz and stays
  *  there" behaviour doesn't trigger during dense passages of large
- *  scores like Jupiter.  (The framebuffer always runs at native
- *  devicePixelRatio — resolution is never reduced.) */
+ *  scores like Jupiter.  Desktop and phones keep the native
+ *  devicePixelRatio. Tesla is the exception: a load-time pixel budget
+ *  (see chooseTeslaPixelRatio), never a runtime DPR change. */
 export function workerUserAgent() {
   return (typeof self !== 'undefined' && self.navigator && self.navigator.userAgent) || '';
 }

@@ -63,6 +63,10 @@ export const SceneConfig = {
    */
   performance: {
     mobileFlatShading: false,
+    /** Tesla-only: Lambert paper and ink (stems, clefs) instead of
+     *  PBR Standard. Noteheads stay Standard so the played-note glow
+     *  still works. Not a settings toggle. */
+    cheapSurfaces: false,
   },
 
 

@@ -70,7 +70,11 @@ export function setRendererKind(kind) {
 /** Shared material catalogue — avoids creating duplicates per element */
 export const Materials = {
   note: () =>
-    new THREE.MeshStandardMaterial({
+    SceneConfig.performance?.cheapSurfaces
+      ? new THREE.MeshLambertMaterial({
+          color: c(SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b),
+        })
+      : new THREE.MeshStandardMaterial({
       color: c(SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b),
       // Now that the paper is a bright off-white, the note colour
       // alone gives high enough contrast without the emissive hack
@@ -249,6 +253,15 @@ export const Materials = {
         })),
 
   paper: () => {
+    // Constrained GPUs (Tesla / mobile) skip the PBR paper shader and
+    // its normal map. The page is the largest fragment surface; Lambert
+    // still takes the key light and the light balls, without a
+    // roughness/metalness evaluation on every pixel.
+    if (SceneConfig.performance?.cheapSurfaces) {
+      return new THREE.MeshLambertMaterial({
+        color: c(SceneConfig.paperColor.r, SceneConfig.paperColor.g, SceneConfig.paperColor.b),
+      });
+    }
     const useNormal = !SceneConfig.performance?.mobileFlatShading;
     const normalMap = useNormal ? _sharedPaperTextures().normalMap : null;
     const mat = new THREE.MeshStandardMaterial({
@@ -282,7 +295,9 @@ export const Materials = {
   },
 
   other: () =>
-    new THREE.MeshStandardMaterial({
+    SceneConfig.performance?.cheapSurfaces
+      ? new THREE.MeshLambertMaterial({ color: c(0.2, 0.2, 0.24) })
+      : new THREE.MeshStandardMaterial({
       color: c(0.2, 0.2, 0.24),
       metalness: 0.0,
       roughness: 0.7,

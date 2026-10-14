@@ -102,6 +102,9 @@ export class RenderClient {
       platformOverride,
       clientHints: safeClientHints(),
       shadowEnabled: SceneConfig.shadow.enabled,
+      // `?shadow=1` keeps the shadow map on Tesla. The default init
+      // flag is on, and the worker forces it off unless this is set.
+      forceShadows: urlParams.get('shadow') === '1',
       dtSmoothAlpha: SceneConfig.dtSmoothAlpha,
       smartCameraEnabled: SceneConfig.smartCamera.enabled,
       lookAheadSeconds: SceneConfig.camera.lookAheadSeconds,
@@ -143,6 +146,9 @@ export class RenderClient {
         this._rendererKind = msg.renderer;
         this._antiAliasing = msg.antiAliasing || 'unknown';
         this._msaaSamples = Number(msg.msaaSamples) || 0;
+        if (typeof msg.shadowsEnabled === 'boolean') {
+          SceneConfig.shadow.enabled = msg.shadowsEnabled;
+        }
         if (this._readyResolve) { this._readyResolve(); this._readyResolve = null; }
         this._readyReject = null;
         break;

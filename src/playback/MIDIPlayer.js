@@ -1,6 +1,6 @@
 import { Soundfont } from 'smplr';
 import { parseMIDI, GM_INSTRUMENTS } from './midiParse.js';
-import { computeSampleRateComp } from './audioUtils.js';
+import { audioClockTrim, clampMasterVolume, computeSampleRateComp } from './audioUtils.js';
 
 /**
  * MIDI playback via Web Audio API with SoundFont-based instruments.
@@ -31,6 +31,15 @@ export class MIDIPlayer {
   _isPlaying = false;
   _duration = 0;
   _tempoScale = 1;
+  /** AudioContext seconds per wall-clock second. 1 means the clocks agree. */
+  _audioPerWall = 1;
+  _trimCommitted = false;
+  /** @type {{ perf: number, audio: number } | null} */
+  _clockOrigin = null;
+  /** Master output gain, 0–1. Applied via a GainNode ahead of destination. */
+  _masterVolume = 1;
+  /** @type {GainNode | null} */
+  _masterGain = null;
 
   /**
    * iOS Safari won't produce audio from an AudioContext until the page
@@ -69,7 +78,40 @@ export class MIDIPlayer {
 
   get currentTime() {
     if (!this._ctx || !this._isPlaying) return this._pauseOffset;
-    return (this._ctx.currentTime - this._startTime) * this._tempoScale + this._pauseOffset;
+    const audioElapsed = this._ctx.currentTime - this._startTime;
+    const perWall = this._audioPerWall > 0 ? this._audioPerWall : 1;
+    return (audioElapsed / perWall) * this._tempoScale + this._pauseOffset;
+  }
+
+  /**
+   * Long-window AudioContext-vs-wall rate for the stats overlay.
+   * A single 0.5 s slice can read 1.019 from message jitter alone;
+   * this stays unreliable until `audioClockTrim` has ≥2 s.
+   */
+  audioClockInfo() {
+    const audioPerWall = this._audioPerWall > 0 ? this._audioPerWall : 1;
+    if (!this._ctx || !this._clockOrigin) {
+      return { reliable: false, rate: 0, corrected: false, audioPerWall };
+    }
+    const dWall = (performance.now() - this._clockOrigin.perf) / 1000;
+    const dAudio = this._ctx.currentTime - this._clockOrigin.audio;
+    const decision = audioClockTrim(dAudio, dWall);
+    return {
+      reliable: decision.reliable,
+      rate: decision.reliable ? decision.rate : 0,
+      corrected: !!(this._trimCommitted && Math.abs(audioPerWall - 1) > 0.008),
+      audioPerWall,
+    };
+  }
+
+  /** Master volume in [0, 1]. Safe to call before the AudioContext exists. */
+  setVolume(value) {
+    this._masterVolume = clampMasterVolume(value, this._masterVolume);
+    if (this._masterGain) this._masterGain.gain.value = this._masterVolume;
+  }
+
+  get volume() {
+    return this._masterVolume;
   }
 
   get duration() {
@@ -154,6 +196,61 @@ export class MIDIPlayer {
     return this._tempoScale;
   }
 
+  _ensureMasterGain() {
+    if (!this._ctx) return null;
+    if (!this._masterGain) {
+      const gain = this._ctx.createGain();
+      gain.gain.value = this._masterVolume;
+      gain.connect(this._ctx.destination);
+      this._masterGain = gain;
+    }
+    return this._masterGain;
+  }
+
+  /** First running-context sample. Later deltas are the drift window. */
+  _observeAudioClock() {
+    if (!this._ctx || this._ctx.state !== 'running' || this._clockOrigin) return;
+    this._clockOrigin = { perf: performance.now(), audio: this._ctx.currentTime };
+  }
+
+  /**
+   * Lock a clock correction once the window is long enough.
+   * @param {boolean} reschedule  Re-schedule the note tail when already playing.
+   * @returns {boolean} true when playback was rescheduled (caller should re-anchor the worker).
+   */
+  _commitAudioTrim(reschedule) {
+    if (this._trimCommitted || !this._ctx || !this._clockOrigin) return false;
+    const dWall = (performance.now() - this._clockOrigin.perf) / 1000;
+    const dAudio = this._ctx.currentTime - this._clockOrigin.audio;
+    const decision = audioClockTrim(dAudio, dWall);
+    if (!decision.reliable) return false;
+    this._trimCommitted = true;
+    if (!decision.correct) {
+      this._audioPerWall = 1;
+      return false;
+    }
+    if (reschedule && this._isPlaying) {
+      // Capture music position on the uncorrected clock, then continue
+      // from there at the wall-clock rate.
+      const audioElapsed = this._ctx.currentTime - this._startTime;
+      const t = audioElapsed * this._tempoScale + this._pauseOffset;
+      this._audioPerWall = decision.rate;
+      this._pauseOffset = t;
+      this._startTime = this._ctx.currentTime;
+      this._scheduleNotes();
+      return true;
+    }
+    this._audioPerWall = decision.rate;
+    return false;
+  }
+
+  /** Called from the main ticker. Returns true when the worker clock should re-anchor. */
+  maybeApplyClockTrim() {
+    if (!this._isPlaying) return false;
+    this._observeAudioClock();
+    return this._commitAudioTrim(true);
+  }
+
   async play() {
     if (this._isPlaying) return;
 
@@ -179,6 +276,8 @@ export class MIDIPlayer {
     if (this._ctx.state === 'suspended') {
       this._ctx.resume().catch(() => { /* iOS may throw */ });
     }
+    this._ensureMasterGain();
+    this._observeAudioClock();
     // Environment detection + sample-rate compensation
     this._teslaLike = detectTeslaLike();
     this._sampleRateComp = computeSampleRateComp(this._ctx.sampleRate, this._teslaLike || urlFlag('audioratecomp') === '1');
@@ -196,6 +295,13 @@ export class MIDIPlayer {
     // loaded.  On complex scores that silence can stretch for seconds,
     // which the user reads as "the music stuttered at the start".
     try { await this._instrumentsReady; } catch { /* handled below */ }
+
+    // If the context has been running through the soundfont load,
+    // a multi-second window is enough to tell clock drift from the
+    // ±2% noise of a single stats slice. Applied before the first
+    // schedule so notes and the playhead share the corrected rate.
+    this._observeAudioClock();
+    this._commitAudioTrim(false);
 
     // Initialise start time BEFORE flipping _isPlaying so currentTime
     // doesn't briefly return a stale (uninitialised) offset.
@@ -411,7 +517,10 @@ export class MIDIPlayer {
       const name = GM_INSTRUMENTS[prog] || GM_INSTRUMENTS[0];
       if (!this._instruments.has(name)) {
         try {
-          const inst = new Soundfont(this._ctx, { instrument: name });
+          const inst = new Soundfont(this._ctx, {
+            instrument: name,
+            destination: this._ensureMasterGain() || this._ctx.destination,
+          });
           this._instruments.set(name, inst);
           loadPromises.push(inst.load);
         } catch (err) {
@@ -467,7 +576,8 @@ export class MIDIPlayer {
     this._stopAllNotes();
     const now = this._ctx.currentTime;
     const offset = this._pauseOffset;
-    const scale = (1 / this._tempoScale) * (this._sampleRateComp || 1);
+    const perWall = this._audioPerWall > 0 ? this._audioPerWall : 1;
+    const scale = (1 / this._tempoScale) * (this._sampleRateComp || 1) * perWall;
 
     for (const evt of this._noteEvents) {
       const noteStart = evt.time;
@@ -510,6 +620,10 @@ export class MIDIPlayer {
       try { inst.stop(); } catch { /* ignore */ }
     }
     this._instruments.clear();
+    if (this._masterGain) {
+      try { this._masterGain.disconnect(); } catch { /* ignore */ }
+      this._masterGain = null;
+    }
     if (this._ctx) {
       this._ctx.close();
       this._ctx = null;

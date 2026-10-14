@@ -3,6 +3,7 @@
  * @param {import('../LuminoirApp.js').LuminoirApp} app
  */
 import { DemoScores } from '../data/DemoScores.js';
+import { clampMasterVolume, MASTER_VOLUME_KEY } from '../playback/audioUtils.js';
 
 export function initControls(app) {
   const bar = document.getElementById('controls-bar');
@@ -159,6 +160,26 @@ export function initControls(app) {
 
   // Stop
   btnStop.addEventListener('click', () => app.stop());
+
+  // Master volume. Persisted separately from the settings registry so
+  // a schema bump there doesn't wipe the listener's level.
+  const volumeSlider = document.getElementById('volume-slider');
+  if (volumeSlider) {
+    let stored = 1;
+    try {
+      const raw = localStorage.getItem(MASTER_VOLUME_KEY);
+      if (raw != null) stored = clampMasterVolume(raw, 1);
+    } catch { /* private mode */ }
+    volumeSlider.value = String(stored);
+    app.midiPlayer.setVolume(stored);
+    const applyVolume = () => {
+      const v = clampMasterVolume(volumeSlider.value, 1);
+      app.midiPlayer.setVolume(v);
+      try { localStorage.setItem(MASTER_VOLUME_KEY, String(v)); } catch { /* private mode */ }
+    };
+    volumeSlider.addEventListener('input', applyVolume);
+    volumeSlider.addEventListener('change', applyVolume);
+  }
 
   // Update play/pause icon
   app.onStateChange = (isPlaying) => {

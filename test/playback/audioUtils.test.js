@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeSampleRateComp } from '../../src/playback/audioUtils.js';
+import { audioClockTrim, clampMasterVolume, computeSampleRateComp } from '../../src/playback/audioUtils.js';
 
 describe('computeSampleRateComp', () => {
   it('returns 1.0 when disabled', () => {
@@ -12,6 +12,46 @@ describe('computeSampleRateComp', () => {
   it('returns sr/44100 when far from 44100 and enabled', () => {
     const f = computeSampleRateComp(48000, true);
     expect(f).toBeCloseTo(48000 / 44100, 6);
+  });
+});
+
+describe('audioClockTrim', () => {
+  it('treats a short 1.019 slice as unreliable noise', () => {
+    const r = audioClockTrim(0.5095, 0.5);
+    expect(r.reliable).toBe(false);
+    expect(r.correct).toBe(false);
+    expect(r.trim).toBe(1);
+  });
+
+  it('does not correct a 2 s window that settles near 1', () => {
+    const r = audioClockTrim(2.004, 2);
+    expect(r.reliable).toBe(true);
+    expect(r.correct).toBe(false);
+    expect(r.trim).toBe(1);
+  });
+
+  it('corrects a sustained 1.019 clock', () => {
+    const r = audioClockTrim(5.095, 5);
+    expect(r.reliable).toBe(true);
+    expect(r.correct).toBe(true);
+    expect(r.rate).toBeCloseTo(1.019, 6);
+    expect(r.trim).toBeCloseTo(1 / 1.019, 6);
+  });
+
+  it('rejects an implausible rate from a suspended context', () => {
+    const r = audioClockTrim(0.05, 5);
+    expect(r.reliable).toBe(false);
+    expect(r.correct).toBe(false);
+  });
+});
+
+describe('clampMasterVolume', () => {
+  it('clamps to [0, 1] and falls back when the stored value is junk', () => {
+    expect(clampMasterVolume(0.4)).toBe(0.4);
+    expect(clampMasterVolume('1.4')).toBe(1);
+    expect(clampMasterVolume(-0.2)).toBe(0);
+    expect(clampMasterVolume('nope', 1)).toBe(1);
+    expect(clampMasterVolume(null, 1)).toBe(1);
   });
 });
 

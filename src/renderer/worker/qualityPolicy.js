@@ -233,3 +233,143 @@ export function lodSubPixelFactor(pressure) {
 export function renderBudgetMs(baselineMs, calibrated, fallbackMs = 12) {
   return calibrated ? baselineMs * 0.75 : fallbackMs;
 }
+
+/**
+ * GPU-synced scene cost (ms), after subtracting an idle readback
+ * fence, at or under which a Tesla panel can hold a steady 60.
+ * Sits just under one 60 Hz vsync (16.67 ms). 30 fps is chosen only
+ * when that scene cost is still above this. A lower pixel ratio is
+ * kept only when the remeasure actually lands under this threshold
+ * or cuts the cost by at least 25%.
+ */
+export const TESLA_LOCK60_PROBE_MS = 16;
+
+/** Tesla framebuffer ratio band. A hard cap of 1.0 on a ~2× panel
+ *  (804×638 CSS at DPR 1.96 → 804×638 buffer) was visibly soft.
+ *  Stay inside this band, and also under `TESLA_PIXEL_BUDGET`. */
+export const TESLA_DPR_MIN = 1.25;
+export const TESLA_DPR_MAX = 1.5;
+/** Drawing-buffer pixel ceiling used to pick the load-time ratio.
+ *  1.6e6 is about 1206×957 — 1.5× an 804×638 CSS viewport — and
+ *  roughly 2.25× the old DPR-1 buffer without returning to a full
+ *  ~2× native framebuffer (~2.0e6 px at 1.96). */
+export const TESLA_PIXEL_BUDGET = 1_600_000;
+
+/**
+ * Load-time Tesla pixel ratio. Never upscales past the native DPR,
+ * never uses the old 1.0 cap when the native ratio is higher, and
+ * keeps the result inside [minRatio, maxRatio] ∩ pixel budget.
+ * Chosen once at load (and possibly stepped down by the scene probe
+ * while the loading overlay is up). It is not a runtime actuator.
+ *
+ * @param {number} nativeDpr
+ * @param {number} cssWidth
+ * @param {number} cssHeight
+ * @param {{ minRatio?: number, maxRatio?: number, pixelBudget?: number }} [opts]
+ * @returns {number}
+ */
+export function chooseTeslaPixelRatio(nativeDpr, cssWidth, cssHeight, {
+  minRatio = TESLA_DPR_MIN,
+  maxRatio = TESLA_DPR_MAX,
+  pixelBudget = TESLA_PIXEL_BUDGET,
+} = {}) {
+  const native = Number.isFinite(nativeDpr) && nativeDpr > 0 ? nativeDpr : 1;
+  const area = Math.max(1, Number(cssWidth) || 1) * Math.max(1, Number(cssHeight) || 1);
+  const budgetRatio = Math.sqrt(Math.max(1, pixelBudget) / area);
+  const ceiling = Math.min(native, maxRatio, budgetRatio);
+  const floor = Math.min(minRatio, native);
+  const chosen = Math.max(floor, ceiling);
+  return Math.round(chosen * 100) / 100;
+}
+
+/**
+ * Present decimation from the load-time scene probe.
+ * On a 60 Hz panel, N=1 presents every vsync (60) and N=2 is locked 30.
+ * On a 120 Hz panel, N=2 is locked 60 and N=4 is locked 30.
+ * 60 is preferred whenever the probe median fits in `thresholdMs`.
+ *
+ * @param {{ displayMs: number, probeMedianMs: number, thresholdMs?: number }} args
+ * @returns {{ n: 1|2|4, label: 'locked60'|'locked30' }}
+ */
+export function choosePresentDecimation({
+  displayMs,
+  probeMedianMs,
+  thresholdMs = TESLA_LOCK60_PROBE_MS,
+}) {
+  const vsync = displayMs > 0 ? displayMs : 1000 / 60;
+  const is120 = vsync <= 8.5;
+  const hold60 = !(probeMedianMs > thresholdMs);
+  if (is120) {
+    return hold60 ? { n: 2, label: 'locked60' } : { n: 4, label: 'locked30' };
+  }
+  return hold60 ? { n: 1, label: 'locked60' } : { n: 2, label: 'locked30' };
+}
+
+/**
+ * Overlay rate label from the decimation the loop is actually using.
+ * N=1 on a 60 Hz panel is `locked60` (every vsync), not a separate
+ * "main rAF looks like 60" claim.
+ *
+ * @param {number} decimationN
+ * @param {number} displayMs
+ * @returns {string}
+ */
+export function rateLabelFor(decimationN, displayMs) {
+  const n = decimationN === 2 || decimationN === 4 ? decimationN : 1;
+  const baseHz = displayMs > 0 ? 1000 / displayMs : 0;
+  if (n === 1) {
+    if (baseHz > 58 && baseHz < 62) return 'locked60';
+    return 'native';
+  }
+  const locked = baseHz > 0 ? Math.round(baseHz / n) : (n === 2 ? 60 : 30);
+  return `locked${locked}`;
+}
+
+/**
+ * True when the presented cadence (display refresh ÷ decimation N)
+ * is 60 Hz. Main-thread rAF staying at 16.7 ms is not sufficient:
+ * N=2 on a 60 Hz panel presents at 30.
+ *
+ * @param {number} displayHz
+ * @param {number} decimationN
+ * @returns {boolean}
+ */
+export function presentLocked60(displayHz, decimationN) {
+  const hz = Number(displayHz);
+  const n = decimationN === 2 || decimationN === 4 ? decimationN : 1;
+  if (!(hz > 0)) return false;
+  return Math.abs(hz / n - 60) < 1.5;
+}
+
+/**
+ * Last-resort runtime step-down. Requires several consecutive p95
+ * samples worse than ~1.7× the current present interval (about 28 ms
+ * when presenting at 60) so a single probe stall or a 20 ms blip
+ * cannot freeze the panel at 30.
+ *
+ * @param {number} currentN
+ * @param {number} displayMs
+ * @param {number} p95
+ * @param {number} consecutiveHigh
+ * @param {{ highFactor?: number, samplesNeeded?: number }} [opts]
+ * @returns {{ n: number, consecutive: number, step: boolean }}
+ */
+export function nextTeslaDecimation(currentN, displayMs, p95, consecutiveHigh, {
+  highFactor = 1.7,
+  samplesNeeded = 8,
+} = {}) {
+  const n0 = currentN === 2 || currentN === 4 ? currentN : 1;
+  const vsync = displayMs > 0 ? displayMs : 1000 / 60;
+  const is120 = vsync <= 8.5;
+  const maxN = is120 ? 4 : 2;
+  if (n0 >= maxN) return { n: n0, consecutive: 0, step: false };
+  const presentMs = vsync * n0;
+  const highMs = presentMs * highFactor;
+  if (p95 >= highMs) {
+    const consecutive = (consecutiveHigh || 0) + 1;
+    const n = is120 ? Math.min(maxN, n0 * 2) : 2;
+    if (consecutive >= samplesNeeded) return { n, consecutive, step: true };
+    return { n: n0, consecutive, step: false };
+  }
+  return { n: n0, consecutive: 0, step: false };
+}
