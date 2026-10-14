@@ -1,6 +1,6 @@
 import { Soundfont } from 'smplr';
 import { parseMIDI, GM_INSTRUMENTS } from './midiParse.js';
-import { audioClockTrim, clampMasterVolume, computeSampleRateComp } from './audioUtils.js';
+import { audioClockTrim, clampMasterVolume, computeSampleRateComp, outputDelaySec } from './audioUtils.js';
 
 /**
  * MIDI playback via Web Audio API with SoundFont-based instruments.
@@ -313,6 +313,16 @@ export class MIDIPlayer {
     }
     this._audioPerWall = decision.rate;
     return false;
+  }
+
+  /**
+   * Speaker delay in milliseconds. Preferred source is
+   * `getOutputTimestamp()`; otherwise `outputLatency + baseLatency`.
+   * Zero until an AudioContext exists.
+   */
+  outputDelayMs() {
+    if (!this._ctx) return 0;
+    return outputDelaySec(this._ctx, performance.now()) * 1000;
   }
 
   /** Called from the main ticker. Returns true when the worker clock should re-anchor. */

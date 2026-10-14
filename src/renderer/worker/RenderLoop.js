@@ -524,6 +524,9 @@ export class RenderLoop {
         bufferHeight: renderer?.domElement?.height || 0,
         events: this._ctx.eventLog?.latest?.(12) || [],
         context: Array.isArray(this._ctx.diagContext) ? this._ctx.diagContext : [],
+        avOffsetMs: clock.appliedOffsetMs(),
+        avOutputMs: clock.outputDelayMs(),
+        avUserMs: Number(SceneConfig.audioVisualOffsetMs) || 0,
       });
       if (msg) post(msg);
       this._lastStatsPostMs = now;

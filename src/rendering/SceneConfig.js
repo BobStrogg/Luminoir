@@ -13,25 +13,29 @@ export const SceneConfig = {
   scale: 0.001,
 
   /**
-   * Audio/visual sync offset in milliseconds.  Added to the music time
-   * the visual side reads each frame, so:
+   * User A/V sync nudge in milliseconds of music time, on top of the
+   * automatic speaker delay. Added to the music time the visual side
+   * reads each frame:
    *
-   *   • +N — visuals are shifted N ms *earlier* in music time, i.e.
-   *     the light ball lights up a note ≈ N ms before the audio
-   *     emits it.  Use this when the audio output appears to lag
-   *     behind the visuals (audio interface buffer, Bluetooth speaker
-   *     latency, etc.).
-   *   • -N — visuals are shifted N ms *later*; useful if visuals
-   *     somehow run ahead of audio (rare in this codebase since both
-   *     are anchored to the same `performance.now()` clock).
-   *   •  0 — visuals follow the same clock as audio with no shift.
+   *   • +N — visuals move N ms earlier (use when compensation
+   *     overshoots and the picture now lags the sound).
+   *   • −N — visuals move N ms later.
+   *   •  0 — only the measured output delay shifts the picture.
    *
-   * The offset lives in `SceneConfig` so it can be tweaked at runtime
-   * from the settings panel; the worker reads it inside
-   * `currentMusicTime()` every frame, so changes apply on the very
-   * next rAF without any reparse or scene rebuild.
+   * Clamped to ±300 ms. `?avoffset=` overrides the stored value for
+   * the session. The worker reads it inside `musicTimeAt()` every
+   * frame, so a slider change applies on the next tick.
    */
   audioVisualOffsetMs: DEFAULT_AUDIO_VISUAL_OFFSET_MS,
+
+  /**
+   * Latest measured speaker delay in milliseconds of AudioContext
+   * time (`outputLatency + baseLatency`, or the output-timestamp
+   * mapping). Not a user setting and not persisted — the main thread
+   * pushes a new sample as the device reports it. The worker eases
+   * the value it actually subtracts, so the camera does not jump.
+   */
+  audioOutputDelayMs: 0,
 
   /**
    * Playback-speed multiplier applied on top of the score's native
