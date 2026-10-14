@@ -7,6 +7,7 @@ import {
   lightIntensityForPressure,
   snapToRefreshInterval,
   choosePresentDecimation,
+  sharpRatioStillFits,
   TESLA_LOCK60_PROBE_MS,
   TESLA_DPR_MIN,
 } from './qualityPolicy.js';
@@ -360,11 +361,15 @@ export class QualityController {
         steps++;
       }
     } else if (this._ctx.isTesla) {
-      // A lower ratio is only kept when it actually buys a 60 Hz frame
-      // or cuts the fenced scene cost by at least 25%. On a draw-call
-      // bound GPU the 1×1 readback barely moves when pixels drop, and
-      // throwing away the sharp ratio (the old 1.0 cap's failure mode)
-      // does not make 60 reachable.
+      // The first median often includes a one-time program link.
+      // Remeasure at the sharp ratio before trading it away: on the
+      // v1.1.27 car the cold pass stepped 1.50 → 1.25, and the warm
+      // scene cost at 1.25 was 10.10 ms (still inside 16 ms at 1.50
+      // if cost scales with pixels).
+      const sharpRatio = this._ctx.renderer?.getPixelRatio?.() || 1;
+      if (sceneMs() > threshold) {
+        measured = await this.probeGpuCost(3, true, { forceShadow: false });
+      }
       let guard = 0;
       let keptRatio = this._ctx.renderer?.getPixelRatio?.() || 1;
       let keptScene = sceneMs();
@@ -394,6 +399,22 @@ export class QualityController {
             `pixel-ratio: revert ${next.toFixed(2)} → ${keptRatio.toFixed(2)} (saved ${(saved * 100).toFixed(0)}%)`);
         } catch {}
         break;
+      }
+      if (keptRatio < sharpRatio - 0.01 && sharpRatioStillFits(keptScene, keptRatio, sharpRatio, threshold)) {
+        this._ctx.applyRenderPixelRatio?.(sharpRatio);
+        measured = await this.probeGpuCost(3, true, { forceShadow: false });
+        if (sceneMs() <= threshold) {
+          keptRatio = sharpRatio;
+          keptScene = sceneMs();
+          steps = 0;
+          try {
+            this._ctx?.eventLog?.note?.(
+              `pixel-ratio: restore ${sharpRatio.toFixed(2)} (scene ${keptScene.toFixed(2)} ms)`);
+          } catch {}
+        } else {
+          this._ctx.applyRenderPixelRatio?.(keptRatio);
+          measured = keptScene + fence;
+        }
       }
       this._ctx.probePixelRatioCeiling = keptRatio;
     }

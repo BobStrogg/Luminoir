@@ -300,12 +300,23 @@ export class SceneHost {
       // there's no visible flash anymore: by the time this runs,
       // `handleSetTimeline` has already fired and the camera is snapped
       // to the first note.
-      const afterCompile = () => {
-        try {
+    const afterCompile = () => {
+      try {
+        antiAliasing.render(renderer, scene, camera);
+        // The first played-note tint uses a partial instanceColor
+        // upload (updateRanges) that the initial full-buffer seed
+        // does not. Run that path once here, under the loading
+        // overlay, then put the score back to unplayed colours.
+        const colorizer = this._ctx.colorizer;
+        if (colorizer?.sync) {
+          colorizer.sync(Number.POSITIVE_INFINITY);
           antiAliasing.render(renderer, scene, camera);
-        } catch { /* swallow */ }
-        restore();
-      };
+          colorizer.sync(0);
+          antiAliasing.render(renderer, scene, camera);
+        }
+      } catch { /* swallow */ }
+      restore();
+    };
       if (typeof renderer.compileAsync === 'function') {
         renderer.compileAsync(scene, camera).then(afterCompile, afterCompile);
       } else if (typeof renderer.compile === 'function') {

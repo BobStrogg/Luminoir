@@ -38,6 +38,21 @@ describe('audioClockTrim', () => {
     expect(r.trim).toBeCloseTo(1 / 1.019, 6);
   });
 
+  it('reads a 22 ms output-latency offset over 2 s as 0.989', () => {
+    // currentTime lags performance.now() by a constant ~22 ms.
+    // From the first sample that is (2.000 - 0.022) / 2.000 = 0.989,
+    // which the old origin window treated as drift. The slope between
+    // two later samples cancels the offset.
+    const lag = 0.022;
+    const fromOrigin = audioClockTrim(2 - lag, 2);
+    expect(fromOrigin.rate).toBeCloseTo(0.989, 3);
+    expect(fromOrigin.correct).toBe(true);
+    const slope = audioClockTrim((4 - lag) - (2 - lag), 2);
+    expect(slope.rate).toBeCloseTo(1, 6);
+    expect(slope.correct).toBe(false);
+    expect(slope.trim).toBe(1);
+  });
+
   it('rejects an implausible rate from a suspended context', () => {
     const r = audioClockTrim(0.05, 5);
     expect(r.reliable).toBe(false);

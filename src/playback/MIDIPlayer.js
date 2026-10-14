@@ -36,6 +36,9 @@ export class MIDIPlayer {
   _trimCommitted = false;
   /** @type {{ perf: number, audio: number } | null} */
   _clockOrigin = null;
+  /** Second sample, taken after 2 s, so the rate is a slope. */
+  /** @type {{ perf: number, audio: number } | null} */
+  _slopeMark = null;
   /** Master output gain, 0–1. Applied via a GainNode ahead of destination. */
   _masterVolume = 1;
   /** @type {GainNode | null} */
@@ -90,11 +93,15 @@ export class MIDIPlayer {
    */
   audioClockInfo() {
     const audioPerWall = this._audioPerWall > 0 ? this._audioPerWall : 1;
-    if (!this._ctx || !this._clockOrigin) {
+    // Slope between two samples taken after the clock is already
+    // running. Measuring from the first currentTime includes a
+    // constant output-latency offset: ~22 ms over the 2 s minimum
+    // window is 0.989, which is not a tempo error.
+    if (!this._ctx || !this._slopeMark) {
       return { reliable: false, rate: 0, corrected: false, audioPerWall };
     }
-    const dWall = (performance.now() - this._clockOrigin.perf) / 1000;
-    const dAudio = this._ctx.currentTime - this._clockOrigin.audio;
+    const dWall = (performance.now() - this._slopeMark.perf) / 1000;
+    const dAudio = this._ctx.currentTime - this._slopeMark.audio;
     const decision = audioClockTrim(dAudio, dWall);
     return {
       reliable: decision.reliable,
@@ -149,14 +156,32 @@ export class MIDIPlayer {
         : 0;
     this._pauseOffset = 0;
 
-    // NOTE: soundfont loading is deferred to `play()` (which runs in a
-    // user-gesture context) because the Soundfont constructor requires
-    // an AudioContext.  On desktop this means a ~200 ms delay on the
-    // first Play click; on iOS it is the *only* way to get audio at
-    // all.  If we want eager loading for already-unlocked contexts we
-    // can call _ensureInstruments() from the first touchstart/click
-    // listener instead.
-    this._instrumentsReady = null;
+    // Decode SoundFonts while the score is still loading, on browsers
+    // that can start an AudioContext without a gesture. The first Play
+    // used to do this on the main thread and stall rAF for hundreds of
+    // milliseconds (the 366 ms "Long frame" at ~8.7 s, worker CPU 0.2 ms).
+    // iOS must wait for a user gesture or decodeAudioData on a suspended
+    // context produces silent buffers.
+    if (!this._needsUserGestureForAudio()) {
+      const preload = this._preloadInstruments();
+      if (preload) {
+        this._instrumentsReady = preload;
+        try {
+          await Promise.race([
+            preload,
+            new Promise((_, reject) => {
+              setTimeout(() => reject(new Error('soundfont preload timeout')), 8000);
+            }),
+          ]);
+        } catch {
+          this._instrumentsReady = null;
+        }
+      }
+    }
+
+    // iOS defers SoundFont loading to `play()` (a user-gesture). Creating
+    // the context here would leave it suspended, and decodeAudioData on
+    // a suspended context produces silent buffers.
   }
 
   /**
@@ -219,9 +244,23 @@ export class MIDIPlayer {
    * @returns {boolean} true when playback was rescheduled (caller should re-anchor the worker).
    */
   _commitAudioTrim(reschedule) {
-    if (this._trimCommitted || !this._ctx || !this._clockOrigin) return false;
-    const dWall = (performance.now() - this._clockOrigin.perf) / 1000;
-    const dAudio = this._ctx.currentTime - this._clockOrigin.audio;
+    if (this._trimCommitted || !this._ctx || this._ctx.state !== 'running') return false;
+    const perf = performance.now();
+    const audio = this._ctx.currentTime;
+    if (!this._clockOrigin) {
+      this._clockOrigin = { perf, audio };
+      return false;
+    }
+    if (!this._slopeMark) {
+      // First 2 s absorb the output-latency offset. The slope starts
+      // only after that, so a 22 ms lag cannot lock in a 0.989 trim.
+      const warmup = (perf - this._clockOrigin.perf) / 1000;
+      if (warmup < 2) return false;
+      this._slopeMark = { perf, audio };
+      return false;
+    }
+    const dWall = (perf - this._slopeMark.perf) / 1000;
+    const dAudio = audio - this._slopeMark.audio;
     const decision = audioClockTrim(dAudio, dWall);
     if (!decision.reliable) return false;
     this._trimCommitted = true;
@@ -319,6 +358,42 @@ export class MIDIPlayer {
    * Lets the UI eagerly prepare audio so the first click on Play
    * isn't blocked on a round-trip soundfont download.
    */
+  /** iOS Safari only produces audio from a gesture-created context. */
+  _needsUserGestureForAudio() {
+    try {
+      return /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Start SoundFont decode immediately. Returns null when the context
+   * cannot run yet, so `play()` will load inside the gesture instead.
+   * @returns {Promise<void> | null}
+   */
+  _preloadInstruments() {
+    try {
+      if (!this._ctx) this._ctx = new AudioContext(chooseAudioContextOptions());
+    } catch {
+      return null;
+    }
+    const run = async () => {
+      if (this._ctx.state === 'suspended') {
+        await Promise.race([
+          this._ctx.resume().catch(() => {}),
+          new Promise((resolve) => { setTimeout(resolve, 1500); }),
+        ]);
+      }
+      if (!this._ctx || this._ctx.state !== 'running') {
+        throw new Error('audio context not running');
+      }
+      this._ensureMasterGain();
+      await this._loadInstruments();
+    };
+    return run();
+  }
+
   warmUpAudio() {
     if (!this._ctx) this._ctx = new AudioContext(chooseAudioContextOptions());
     // Same gesture-window discipline as `play()`: every unlock
