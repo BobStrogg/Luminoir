@@ -342,34 +342,114 @@ export function presentLocked60(displayHz, decimationN) {
 }
 
 /**
- * Last-resort runtime step-down. Requires several consecutive p95
- * samples worse than ~1.7× the current present interval (about 28 ms
- * when presenting at 60) so a single probe stall or a 20 ms blip
- * cannot freeze the panel at 30.
+ * Count frame intervals that missed the current present budget.
+ * A gap at or above `outlierMs` (a GC, a shader link, a decode hitch)
+ * is dropped entirely: one 366 ms sample must not become the p95 of
+ * a short post-play window. A miss is an interval above
+ * `missFactor` × the present period (vsync × decimation) and below
+ * that outlier cap.
+ *
+ * @param {ArrayLike<number>} frameMs
+ * @param {number} displayMs
+ * @param {number} decimationN
+ * @param {{ missFactor?: number, outlierMs?: number }} [opts]
+ * @returns {{ samples: number, misses: number, outliers: number }}
+ */
+export function countCadenceMisses(frameMs, displayMs, decimationN, {
+  missFactor = 1.5,
+  outlierMs = 100,
+} = {}) {
+  const vsync = displayMs > 0 ? displayMs : 1000 / 60;
+  const n = decimationN === 2 || decimationN === 4 ? decimationN : 1;
+  const present = vsync * n;
+  const missAt = present * missFactor;
+  const outlierAt = Math.max(outlierMs, present * 4);
+  let samples = 0;
+  let misses = 0;
+  let outliers = 0;
+  const len = frameMs?.length || 0;
+  for (let i = 0; i < len; i++) {
+    const v = frameMs[i];
+    if (!(v > 0)) continue;
+    if (v >= outlierAt) { outliers++; continue; }
+    samples++;
+    if (v > missAt) misses++;
+  }
+  return { samples, misses, outliers };
+}
+
+/**
+ * True when a scene that already fits in `thresholdMs` at `lowRatio`
+ * would still fit at `sharpRatio` if cost scaled with pixel count.
+ * Used to undo a cold-probe step from 1.50 to 1.25: 10.10 ms at
+ * 1.25 estimates 14.5 ms at 1.50, which is still inside 16 ms.
+ *
+ * @param {number} sceneAtLow
+ * @param {number} lowRatio
+ * @param {number} sharpRatio
+ * @param {number} thresholdMs
+ * @returns {boolean}
+ */
+export function sharpRatioStillFits(sceneAtLow, lowRatio, sharpRatio, thresholdMs) {
+  if (!(sceneAtLow >= 0) || !(lowRatio > 0) || !(sharpRatio > lowRatio)) return false;
+  const scale = (sharpRatio / lowRatio) ** 2;
+  return sceneAtLow * scale <= thresholdMs;
+}
+
+/**
+ * Runtime Tesla present-rate decision, sampled once per window rather
+ * than once per frame.
+ *
+ * Step down only after several windows each contain at least
+ * `missesNeeded` in-budget misses, and only once the window itself
+ * has `minSamples` frames. A single outlier cannot satisfy that.
+ * Step back up toward `minN` (the load-time probe choice, usually
+ * locked 60) after several clean windows, so a bad step does not
+ * last the rest of the song.
  *
  * @param {number} currentN
  * @param {number} displayMs
- * @param {number} p95
- * @param {number} consecutiveHigh
- * @param {{ highFactor?: number, samplesNeeded?: number }} [opts]
- * @returns {{ n: number, consecutive: number, step: boolean }}
+ * @param {{ samples?: number, misses?: number }} stats
+ * @param {{ consecutiveMiss?: number, consecutiveClean?: number }} [state]
+ * @param {{ minSamples?: number, missesNeeded?: number, windowsNeeded?: number, cleanWindowsNeeded?: number, minN?: number }} [opts]
+ * @returns {{ n: number, consecutiveMiss: number, consecutiveClean: number, step: boolean, direction: 'down'|'up'|null }}
  */
-export function nextTeslaDecimation(currentN, displayMs, p95, consecutiveHigh, {
-  highFactor = 1.7,
-  samplesNeeded = 8,
+export function nextTeslaDecimation(currentN, displayMs, stats, state = {}, {
+  minSamples = 45,
+  missesNeeded = 8,
+  windowsNeeded = 4,
+  cleanWindowsNeeded = 8,
+  minN = 1,
 } = {}) {
   const n0 = currentN === 2 || currentN === 4 ? currentN : 1;
   const vsync = displayMs > 0 ? displayMs : 1000 / 60;
   const is120 = vsync <= 8.5;
   const maxN = is120 ? 4 : 2;
-  if (n0 >= maxN) return { n: n0, consecutive: 0, step: false };
-  const presentMs = vsync * n0;
-  const highMs = presentMs * highFactor;
-  if (p95 >= highMs) {
-    const consecutive = (consecutiveHigh || 0) + 1;
-    const n = is120 ? Math.min(maxN, n0 * 2) : 2;
-    if (consecutive >= samplesNeeded) return { n, consecutive, step: true };
-    return { n: n0, consecutive, step: false };
+  const floorN = minN === 2 || minN === 4 ? minN : 1;
+  const samples = stats?.samples || 0;
+  const misses = stats?.misses || 0;
+  let consecutiveMiss = state?.consecutiveMiss || 0;
+  let consecutiveClean = state?.consecutiveClean || 0;
+  if (samples < minSamples) {
+    return { n: n0, consecutiveMiss, consecutiveClean, step: false, direction: null };
   }
-  return { n: n0, consecutive: 0, step: false };
+  if (misses >= missesNeeded) {
+    consecutiveMiss += 1;
+    consecutiveClean = 0;
+  } else if (misses === 0) {
+    consecutiveClean += 1;
+    consecutiveMiss = 0;
+  } else {
+    consecutiveMiss = 0;
+    consecutiveClean = 0;
+  }
+  if (n0 < maxN && consecutiveMiss >= windowsNeeded) {
+    const n = is120 ? Math.min(maxN, n0 * 2) : 2;
+    return { n, consecutiveMiss: 0, consecutiveClean: 0, step: true, direction: 'down' };
+  }
+  if (n0 > floorN && consecutiveClean >= cleanWindowsNeeded) {
+    const n = is120 ? Math.max(floorN, n0 / 2) : floorN;
+    return { n, consecutiveMiss: 0, consecutiveClean: 0, step: true, direction: 'up' };
+  }
+  return { n: n0, consecutiveMiss, consecutiveClean, step: false, direction: null };
 }

@@ -18,6 +18,8 @@ import {
   rateLabelFor,
   presentLocked60,
   nextTeslaDecimation,
+  countCadenceMisses,
+  sharpRatioStillFits,
   TESLA_LOCK60_PROBE_MS,
 } from '../../../src/renderer/worker/qualityPolicy.js';
 
@@ -272,23 +274,73 @@ describe('present cadence verdict', () => {
   });
 });
 
-describe('nextTeslaDecimation', () => {
-  it('does not step down on a 20 ms p95 blip', () => {
-    const step = nextTeslaDecimation(1, 1000 / 60, 20.5, 0);
-    expect(step).toEqual({ n: 1, consecutive: 0, step: false });
+describe('countCadenceMisses', () => {
+  it('ignores one 366 ms outlier in an otherwise steady 60 Hz window', () => {
+    const frames = Array.from({ length: 59 }, () => 16.7);
+    frames.push(366.6);
+    expect(countCadenceMisses(frames, 1000 / 60, 1)).toEqual({
+      samples: 59, misses: 0, outliers: 1,
+    });
   });
 
-  it('steps to 30 only after sustained presents near two vsyncs', () => {
-    let consecutive = 0;
-    let result = { n: 1, consecutive: 0, step: false };
-    for (let i = 0; i < 7; i++) {
-      result = nextTeslaDecimation(1, 1000 / 60, 33, consecutive);
-      consecutive = result.consecutive;
+  it('counts intervals that miss 1.5× the present period', () => {
+    const frames = Array.from({ length: 52 }, () => 16.7);
+    for (let i = 0; i < 8; i++) frames.push(33.4);
+    const c = countCadenceMisses(frames, 1000 / 60, 1);
+    expect(c.samples).toBe(60);
+    expect(c.misses).toBe(8);
+    expect(c.outliers).toBe(0);
+  });
+});
+
+describe('sharpRatioStillFits', () => {
+  it('keeps 1.50 when 10.10 ms at 1.25 still estimates under 16 ms', () => {
+    expect(sharpRatioStillFits(10.10, 1.25, 1.5, 16)).toBe(true);
+  });
+
+  it('keeps the lower ratio when the sharp estimate misses the threshold', () => {
+    expect(sharpRatioStillFits(14, 1.25, 1.5, 16)).toBe(false);
+  });
+});
+
+describe('nextTeslaDecimation', () => {
+  const steady = { samples: 60, misses: 0 };
+  const overloaded = { samples: 60, misses: 8 };
+
+  it('does not step down on a short window or a single outlier', () => {
+    const early = nextTeslaDecimation(1, 1000 / 60, { samples: 12, misses: 1 }, {});
+    expect(early.step).toBe(false);
+    expect(early.n).toBe(1);
+    const one = nextTeslaDecimation(1, 1000 / 60, steady, {});
+    expect(one.step).toBe(false);
+  });
+
+  it('steps to 30 only after several windows of sustained misses', () => {
+    let state = {};
+    let result = { n: 1, step: false };
+    for (let i = 0; i < 3; i++) {
+      result = nextTeslaDecimation(1, 1000 / 60, overloaded, state);
+      state = result;
       expect(result.step).toBe(false);
     }
-    result = nextTeslaDecimation(1, 1000 / 60, 33, consecutive);
+    result = nextTeslaDecimation(1, 1000 / 60, overloaded, state);
     expect(result.step).toBe(true);
+    expect(result.direction).toBe('down');
     expect(result.n).toBe(2);
+  });
+
+  it('steps back up to the probe choice after a clean run', () => {
+    let state = {};
+    let result = { n: 2, step: false };
+    for (let i = 0; i < 7; i++) {
+      result = nextTeslaDecimation(2, 1000 / 60, steady, state, { minN: 1 });
+      state = result;
+      expect(result.step).toBe(false);
+    }
+    result = nextTeslaDecimation(2, 1000 / 60, steady, state, { minN: 1 });
+    expect(result.step).toBe(true);
+    expect(result.direction).toBe('up');
+    expect(result.n).toBe(1);
   });
 });
 

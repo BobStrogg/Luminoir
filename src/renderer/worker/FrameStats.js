@@ -246,12 +246,11 @@ export class FrameStats {
     if (ms > 0) this._gpuQueueMsRing.push(ms);
   }
 
-  /** Flush the timing rings on play-start so stale idle-period
-   *  intervals don't distort the p95 pressure signal. */
+  /** Flush the play-session ring on play-start. The all-frames ring
+   *  stays: idle ticks are the same vsync, and emptying it made the
+   *  first hitch after Play (a single 366 ms gap) the entire p95. */
   resetForPlay() {
     this._playFrameMsRing.reset();
-    this._frameMsRing.reset();
-    this._frameMsRing.fill(0);
     this._gpuQueueMsRing.reset();
     this._lastFrameFlags = 0;
     this._lastFrameCpuMs = 0;

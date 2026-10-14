@@ -36,9 +36,13 @@ export function clampMasterVolume(value, fallback = 1) {
  * A single ~0.5 s stats slice is noisy by about ±2% (message jitter
  * plus the audio render quantum), so a reading of 1.019 from that
  * slice is not evidence of drift. This only reports a reliable rate
- * after `minSec` of running context. Rates inside `deadband` of 1 are
- * left uncorrected. Rates outside [minRate, maxRate] are treated as a
- * bad sample (suspended context, clock jump) and not applied.
+ * after `minSec` of running context. Feed it a slope between two
+ * samples taken after the context is already running: a constant
+ * output-latency offset (about 22 ms) over a 2 s window that starts
+ * at the first currentTime reads 0.989 and is not a clock rate.
+ * Rates inside `deadband` of 1 are left uncorrected. Rates outside
+ * [minRate, maxRate] are treated as a bad sample (suspended context,
+ * clock jump) and not applied.
  *
  * `trim` is the factor that converts a wall-clock delay into an
  * AudioContext delay: schedule notes at `audioDelay = wallDelay * rate`

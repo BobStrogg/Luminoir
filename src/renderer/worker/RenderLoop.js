@@ -3,7 +3,7 @@ import { SceneConfig } from '../../rendering/SceneConfig.js';
 import { setPlayheadX } from '../../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
 import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './FrameStats.js';
-import { nextTeslaDecimation, quantizeFrameMs, rateLabelFor, renderBudgetMs } from './qualityPolicy.js';
+import { countCadenceMisses, nextTeslaDecimation, quantizeFrameMs, rateLabelFor, renderBudgetMs } from './qualityPolicy.js';
 
 /**
  * Frame-budget rendering.
@@ -85,7 +85,12 @@ export class RenderLoop {
   _useExternalTicks = false;
   _tickSeq = 0;
   /** Consecutive over-budget p95 samples for the Tesla last-resort step. */
-  _teslaHighP95 = 0;
+  /** Load-time probe choice. Runtime step-up never goes below this. */
+  _probeN = 1;
+  _teslaMissWindows = 0;
+  _teslaCleanWindows = 0;
+  _teslaRateSampleMs = 0;
+  _missScratch = new Float64Array(60);
 
   /**
    * @param {object} ctx Shared worker context — `clock`, `host`,
@@ -435,13 +440,27 @@ export class RenderLoop {
           }
         }
         // One-way step-down during playback when sustained overload occurs.
+        // Tesla samples once per window and can step back up to the
+        // probe choice; a single stalled timestamp is not a miss.
         if (this._rateFrozen && quality.calibrated && quality.displayMs > 0) {
           const is120 = quality.displayMs <= 8.5;
           if (this._ctx.isTesla) {
-            const step = nextTeslaDecimation(
-              this._decimationN, quality.displayMs, latestP95, this._teslaHighP95);
-            this._teslaHighP95 = step.consecutive;
-            if (step.step) this._applyDecimation(step.n, 'stepdown');
+            if (now - this._teslaRateSampleMs >= 250) {
+              this._teslaRateSampleMs = now;
+              const ring = frameStats.frameMsRing;
+              const recent = ring.latest(Math.min(ring.filled, 60), this._missScratch);
+              const stats = countCadenceMisses(recent, quality.displayMs, this._decimationN);
+              const step = nextTeslaDecimation(
+                this._decimationN, quality.displayMs, stats, {
+                  consecutiveMiss: this._teslaMissWindows,
+                  consecutiveClean: this._teslaCleanWindows,
+                }, { minN: this._probeN });
+              this._teslaMissWindows = step.consecutiveMiss;
+              this._teslaCleanWindows = step.consecutiveClean;
+              if (step.step) {
+                this._applyDecimation(step.n, step.direction === 'up' ? 'stepup' : 'stepdown');
+              }
+            }
           } else if (is120) {
             if (this._decimationN === 1 && latestP95 >= 10.8) {
               // Engage locked60 after sustained evidence
@@ -514,13 +533,17 @@ export class RenderLoop {
    *  if a transient sample had already frozen a lower rate. */
   applyProbeDecimation(n, reason) {
     this._rateFrozen = false;
-    this._teslaHighP95 = 0;
-    this._applyDecimation(n, reason || 'scene-probe');
+    this._teslaMissWindows = 0;
+    this._teslaCleanWindows = 0;
+    this._probeN = (n === 2 || n === 4) ? n : 1;
+    this._applyDecimation(this._probeN, reason || 'scene-probe');
   }
 
   _applyDecimation(n, reason) {
     const newN = (n === 1 || n === 2 || n === 4) ? n : 1;
-    if (this._rateFrozen && newN < this._decimationN) return; // never step up
+    // Step up only on an explicit clean-window recovery, and never
+    // past the load-time probe choice.
+    if (this._rateFrozen && newN < this._decimationN && reason !== 'stepup') return;
     if (this._decimationN !== newN) {
       this._rateSwitches++;
     }
