@@ -449,7 +449,9 @@ export class RenderLoop {
               this._teslaRateSampleMs = now;
               const ring = frameStats.frameMsRing;
               const recent = ring.latest(Math.min(ring.filled, 60), this._missScratch);
-              const stats = countCadenceMisses(recent, quality.displayMs, this._decimationN);
+              // Raw rAF ticks, judged against one vsync. At N=2 a
+              // healthy tick is still ~16.7 ms; ~33 ms is a miss.
+              const stats = countCadenceMisses(recent, quality.displayMs);
               const step = nextTeslaDecimation(
                 this._decimationN, quality.displayMs, stats, {
                   consecutiveMiss: this._teslaMissWindows,

@@ -18,6 +18,23 @@ export class MIDIPlayer {
   /** @type {Map<string, Soundfont>} instrument name → loaded Soundfont */
   _instruments = new Map();
   /**
+   * In-flight `inst.load` promises. An entry can sit in `_instruments`
+   * before its samples finish decoding; a later `play()` must await
+   * this promise instead of treating the map entry as ready.
+   * @type {Map<string, Promise<void>>}
+   */
+  _instrumentLoads = new Map();
+  /**
+   * Promise that resolves when every program in the current score has
+   * finished loading. Null when nothing is loaded or the program set
+   * changed. A preload timeout does not clear it — the overlay stops
+   * waiting, and `play()` still awaits the same decode.
+   * @type {Promise<void> | null}
+   */
+  _instrumentsReady = null;
+  /** Sorted unique GM program ids covered by `_instrumentsReady`. */
+  _instrumentProgramKey = '';
+  /**
    * StopFns returned by smplr's `inst.start()`.  Each one cancels its queued
    * scheduler event *and* stops any voices that have already started.  We
    * must call these on pause/stop — smplr's `inst.stop()` alone only affects
@@ -156,6 +173,15 @@ export class MIDIPlayer {
         : 0;
     this._pauseOffset = 0;
 
+    // A resolved promise from the previous score would make play() skip
+    // `_loadInstruments`. New GM programs would stay silent — including
+    // on iOS, where this method does not start a replacement preload.
+    const programKey = instrumentProgramKey(channelPrograms);
+    if (programKey !== this._instrumentProgramKey) {
+      this._instrumentProgramKey = programKey;
+      this._instrumentsReady = null;
+    }
+
     // Decode SoundFonts while the score is still loading, on browsers
     // that can start an AudioContext without a gesture. The first Play
     // used to do this on the main thread and stall rAF for hundreds of
@@ -173,15 +199,21 @@ export class MIDIPlayer {
               setTimeout(() => reject(new Error('soundfont preload timeout')), 8000);
             }),
           ]);
-        } catch {
-          this._instrumentsReady = null;
+        } catch (err) {
+          // The 8s timeout only unblocks the loading overlay. play()
+          // still awaits this same promise, which is what finishes
+          // `inst.load`. Nulling it made the next `_loadInstruments`
+          // see the Soundfont already in the map and skip the decode.
+          // A real failure (context never started) is dropped so play()
+          // can try again inside the gesture — but only if a newer
+          // score has not already replaced the promise.
+          const timedOut = !!(err && err.message === 'soundfont preload timeout');
+          if (!timedOut && this._instrumentsReady === preload) {
+            this._instrumentsReady = null;
+          }
         }
       }
     }
-
-    // iOS defers SoundFont loading to `play()` (a user-gesture). Creating
-    // the context here would leave it suspended, and decodeAudioData on
-    // a suspended context produces silent buffers.
   }
 
   /**
@@ -590,17 +622,29 @@ export class MIDIPlayer {
     const loadPromises = [];
     for (const prog of programs) {
       const name = GM_INSTRUMENTS[prog] || GM_INSTRUMENTS[0];
-      if (!this._instruments.has(name)) {
-        try {
-          const inst = new Soundfont(this._ctx, {
-            instrument: name,
-            destination: this._ensureMasterGain() || this._ctx.destination,
-          });
-          this._instruments.set(name, inst);
-          loadPromises.push(inst.load);
-        } catch (err) {
-          console.warn(`[Luminoir] Failed to create instrument ${name}:`, err);
-        }
+      const pending = this._instrumentLoads.get(name);
+      if (pending) {
+        // Already constructed, samples still decoding. Await the
+        // original load instead of treating the map entry as ready.
+        loadPromises.push(pending);
+        continue;
+      }
+      if (this._instruments.has(name)) continue;
+      try {
+        const inst = new Soundfont(this._ctx, {
+          instrument: name,
+          destination: this._ensureMasterGain() || this._ctx.destination,
+        });
+        const load = Promise.resolve(inst.load).finally(() => {
+          if (this._instrumentLoads.get(name) === load) this._instrumentLoads.delete(name);
+        });
+        // Record both before the next turn so a concurrent play()
+        // observes the in-flight decode.
+        this._instruments.set(name, inst);
+        this._instrumentLoads.set(name, load);
+        loadPromises.push(load);
+      } catch (err) {
+        console.warn(`[Luminoir] Failed to create instrument ${name}:`, err);
       }
     }
 
@@ -695,6 +739,9 @@ export class MIDIPlayer {
       try { inst.stop(); } catch { /* ignore */ }
     }
     this._instruments.clear();
+    this._instrumentLoads.clear();
+    this._instrumentsReady = null;
+    this._instrumentProgramKey = '';
     if (this._masterGain) {
       try { this._masterGain.disconnect(); } catch { /* ignore */ }
       this._masterGain = null;
@@ -712,6 +759,26 @@ export class MIDIPlayer {
     // queue a fresh silent buffer the next time the user taps.
     this._primed = false;
   }
+}
+
+/**
+ * Stable id for the GM programs a score actually needs. An empty
+ * program map is piano (0), matching `_loadInstruments`. Channel
+ * order does not matter — only the set of instruments does.
+ *
+ * @param {Map<number, number> | null | undefined} channelPrograms
+ * @returns {string}
+ */
+export function instrumentProgramKey(channelPrograms) {
+  const ids = new Set();
+  if (channelPrograms) {
+    for (const prog of channelPrograms.values()) {
+      const n = Number(prog);
+      if (Number.isFinite(n)) ids.add(n);
+    }
+  }
+  if (ids.size === 0) ids.add(0);
+  return [...ids].sort((a, b) => a - b).join(',');
 }
 
 function urlFlag(key) {

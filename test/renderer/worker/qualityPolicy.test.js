@@ -278,18 +278,44 @@ describe('countCadenceMisses', () => {
   it('ignores one 366 ms outlier in an otherwise steady 60 Hz window', () => {
     const frames = Array.from({ length: 59 }, () => 16.7);
     frames.push(366.6);
-    expect(countCadenceMisses(frames, 1000 / 60, 1)).toEqual({
+    expect(countCadenceMisses(frames, 1000 / 60)).toEqual({
       samples: 59, misses: 0, outliers: 1,
     });
   });
 
-  it('counts intervals that miss 1.5× the present period', () => {
+  it('counts intervals that miss 1.5× the vsync interval', () => {
     const frames = Array.from({ length: 52 }, () => 16.7);
     for (let i = 0; i < 8; i++) frames.push(33.4);
-    const c = countCadenceMisses(frames, 1000 / 60, 1);
+    const c = countCadenceMisses(frames, 1000 / 60);
     expect(c.samples).toBe(60);
     expect(c.misses).toBe(8);
     expect(c.outliers).toBe(0);
+  });
+
+  it('scores ~33 ms rAF ticks as misses so N=2 cannot look clean', () => {
+    // The ring is rAF-to-rAF. Budgeting missAt = vsync × N treated
+    // these as on-time (33 < 1.5 × 33.3) and nextTeslaDecimation
+    // stepped back up to the probe choice.
+    const late = Array.from({ length: 60 }, () => 33.3);
+    const lateStats = countCadenceMisses(late, 1000 / 60);
+    expect(lateStats.samples).toBe(60);
+    expect(lateStats.misses).toBe(60);
+    const held = nextTeslaDecimation(
+      2, 1000 / 60, lateStats, { consecutiveClean: 7 }, { minN: 1 },
+    );
+    expect(held.step).toBe(false);
+    expect(held.n).toBe(2);
+    expect(held.consecutiveClean).toBe(0);
+
+    const steady = Array.from({ length: 60 }, () => 16.7);
+    const steadyStats = countCadenceMisses(steady, 1000 / 60);
+    expect(steadyStats.misses).toBe(0);
+    const up = nextTeslaDecimation(
+      2, 1000 / 60, steadyStats, { consecutiveClean: 7 }, { minN: 1 },
+    );
+    expect(up.step).toBe(true);
+    expect(up.direction).toBe('up');
+    expect(up.n).toBe(1);
   });
 });
 
