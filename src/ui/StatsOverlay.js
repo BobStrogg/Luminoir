@@ -112,6 +112,9 @@ export class StatsOverlay {
     // 1.019 reading comes from. Until the window is 2 s the value
     // stays blank; a sustained drift outside ±0.8% is corrected in
     // MIDIPlayer and shown here as clock + corrected.
+    const avApplied = formatSignedMs(s.avOffsetMs);
+    const avOutput = formatSignedMs(s.avOutputMs, false);
+    const avUser = formatSignedMs(s.avUserMs);
     const info = app?.midiPlayer?.audioClockInfo?.() || null;
     let audioSpeed = '—';
     if (info?.reliable) {
@@ -127,7 +130,7 @@ export class StatsOverlay {
       : (presentLocked60(s.displayHz, s.rateDecimationN || 1) ? 'yes' : 'no');
     if (this._collapsed) {
       this._div.textContent =
-        `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nAudio sr ${sr}Hz base ${Math.round(baseLat*1000)}ms out ${Math.round(outLat*1000)}ms speed ${audioSpeed}\nRate ${rate} • switches ${switches} • ${hist}`;
+        `fps ${fps} (main ${mfps})  p95 ${p95}ms (main ${mp95}ms)  max ${fmax}ms\nGPU q p95 ${gq95}ms  ${renderer} DPR ${dpr} res ${res}\nAudio sr ${sr}Hz base ${Math.round(baseLat*1000)}ms out ${Math.round(outLat*1000)}ms speed ${audioSpeed}\nA/V applied ${avApplied}  output ${avOutput}  user ${avUser}\nRate ${rate} • switches ${switches} • ${hist}`;
       this._div.appendChild(this._toggle);
       return;
     }
@@ -141,6 +144,7 @@ export class StatsOverlay {
       `Σ>8.3 ${over8T} | Σ>16.7 ${over16T} | Σ>33.3 ${over33T} (session)`,
       `renderer ${renderer}   vsync ${s.vsyncDriver || 'unknown'}   DPR ${dpr}   res ${res}`,
       `Audio sampleRate ${sr} Hz   baseLatency ${Math.round(baseLat*1000)} ms   outputLatency ${Math.round(outLat*1000)} ms   audioSpeed ${audioSpeed}`,
+      `A/V applied ${avApplied}   output ${avOutput}   user ${avUser}`,
       `AA ${aa}`,
       `AQ ${aq}`,
       `Rate ${rate}   switches ${switches}   ${hist}`,
@@ -166,5 +170,12 @@ export class StatsOverlay {
     this._div = null;
     this._client.onStats = null;
   }
+}
+
+function formatSignedMs(value, signed = true) {
+  if (!Number.isFinite(value)) return '—';
+  const r = Math.round(value);
+  if (!signed) return `${r} ms`;
+  return r > 0 ? `+${r} ms` : `${r} ms`;
 }
 

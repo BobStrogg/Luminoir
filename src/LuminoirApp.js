@@ -132,7 +132,7 @@ export class LuminoirApp {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible' && this._isPlaying) {
         this.midiPlayer.reschedule();
-        this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+        this._anchorClock('playing');
         this._requestWakeLock();
       } else if (document.visibilityState === 'hidden') {
         this._releaseWakeLock();
@@ -315,7 +315,7 @@ export class LuminoirApp {
     }
 
     // Fresh score, fresh clock.
-    this.render.setClock('stopped', 0, this.midiPlayer.tempoScale);
+    this.render.setClock('stopped', 0, this.midiPlayer.tempoScale, this.midiPlayer.outputDelayMs());
 
     // Don't fire onLoadEnd / hide the spinner until the worker
     // confirms the new score's first frame has hit the canvas.  The
@@ -409,8 +409,10 @@ export class LuminoirApp {
     // heavy animation / rendering happens in the worker, but we still
     // need a place to notice "playback reached the end".
     this._startMainTicker();
-    // The worker tracks music time locally from this anchor.
-    this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+    // The worker tracks music time locally from this anchor. The
+    // speaker delay rides along so the first visual frame snaps to
+    // audio time minus the output delay instead of easing into it.
+    this._anchorClock('playing');
     if (this.onStateChange) this.onStateChange(true);
   }
 
@@ -420,7 +422,7 @@ export class LuminoirApp {
     this._releaseWakeLock();
     const t = this.midiPlayer.currentTime;
     this.midiPlayer.pause();
-    this.render.setClock('paused', t, this.midiPlayer.tempoScale);
+    this._anchorClock('paused', t);
     if (this.onStateChange) this.onStateChange(false);
   }
 
@@ -435,7 +437,7 @@ export class LuminoirApp {
     this._playPending = false;
     this._releaseWakeLock();
     this.midiPlayer.stop();
-    this.render.setClock('stopped', 0, this.midiPlayer.tempoScale);
+    this.render.setClock('stopped', 0, this.midiPlayer.tempoScale, this.midiPlayer.outputDelayMs());
     if (this.onStateChange) this.onStateChange(false);
   }
 
@@ -452,8 +454,28 @@ export class LuminoirApp {
     this.midiPlayer.setPlaybackSpeed(scale);
     // If we're playing, re-anchor so the worker's clock uses the new scale.
     if (this._isPlaying) {
-      this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+      this._anchorClock('playing');
     }
+  }
+
+  /**
+   * Re-anchor the worker clock. `musicTime` is the audio-clock music
+   * time; the worker subtracts the smoothed speaker delay itself.
+   * @param {'playing'|'paused'|'stopped'} state
+   * @param {number} [musicTime]
+   */
+  _anchorClock(state, musicTime = this.midiPlayer.currentTime) {
+    const delayMs = this.midiPlayer.outputDelayMs();
+    this._outputDelayMs = delayMs;
+    this.render.setClock(state, musicTime, this.midiPlayer.tempoScale, delayMs);
+  }
+
+  /** Push a new speaker-delay sample when the estimate actually moves. */
+  _pushOutputDelay() {
+    const ms = this.midiPlayer.outputDelayMs();
+    if (this._outputDelayMs != null && Math.abs(ms - this._outputDelayMs) < 1) return;
+    this._outputDelayMs = ms;
+    this.render.updateConfig({ audioOutputDelayMs: ms });
   }
 
   get isPlaying() { return this._isPlaying; }
@@ -471,8 +493,9 @@ export class LuminoirApp {
       }
       const t = this.midiPlayer.currentTime;
       if (this.onTimeUpdate) this.onTimeUpdate(t);
+      this._pushOutputDelay();
       if (this.midiPlayer.maybeApplyClockTrim()) {
-        this.render.setClock('playing', this.midiPlayer.currentTime, this.midiPlayer.tempoScale);
+        this._anchorClock('playing');
       }
       this.midiPlayer.checkComplete();
       this._tickTimer = setTimeout(tick, 100);

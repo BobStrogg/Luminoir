@@ -1,3 +1,4 @@
+import { resolveAvOffsetMs } from '../playback/audioUtils.js';
 import { SETTINGS, applyToSceneConfig, readFromSceneConfig } from './settingsRegistry.js';
 import { SceneConfig } from '../rendering/SceneConfig.js';
 import { loadStoredSettings, saveStoredSettings, clearStoredSettings } from './SettingsPersistence.js';
@@ -59,9 +60,17 @@ export class SettingsPanel {
    */
   _hydrate() {
     const stored = loadStoredSettings();
+    let search = '';
+    try { search = (typeof location !== 'undefined' && location.search) || ''; } catch { /* no window */ }
     for (const setting of SETTINGS) {
-      if (stored[setting.id] !== undefined) {
-        applyToSceneConfig(setting, stored[setting.id]);
+      let value = stored[setting.id];
+      if (setting.id === 'audioVisualOffsetMs') {
+        const resolved = resolveAvOffsetMs(value, search);
+        if (resolved == null) continue;
+        value = resolved;
+      }
+      if (value !== undefined) {
+        applyToSceneConfig(setting, value);
       }
     }
   }

@@ -108,10 +108,10 @@ export const SETTINGS = [
   /* --------------------------- A/V SYNC ------------------------------ */
   {
     id: 'audioVisualOffsetMs',
-    label: 'Audio-visual offset',
-    description: '+N shifts visuals N ms earlier in music time (use when audio appears to lag behind the light balls). −N shifts visuals later; Safari defaults to −500 ms to compensate its Web Audio output latency.',
+    label: 'A/V sync offset',
+    description: 'Extra shift on top of the automatic speaker delay. +N moves visuals earlier, −N moves them later. Stored in this browser. ?avoffset= overrides it for one session.',
     type: 'range',
-    min: -1000, max: 1000, step: 5,
+    min: -300, max: 300, step: 5,
     default: defaultFor('audioVisualOffsetMs'),
     unit: ' ms',
     apply: 'live',

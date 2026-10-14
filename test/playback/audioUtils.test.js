@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { audioClockTrim, clampMasterVolume, computeSampleRateComp } from '../../src/playback/audioUtils.js';
+import {
+  audioClockTrim,
+  avOffsetFromSearch,
+  clampAvOffsetMs,
+  clampMasterVolume,
+  computeSampleRateComp,
+  outputDelaySec,
+  resolveAvOffsetMs,
+} from '../../src/playback/audioUtils.js';
 
 describe('computeSampleRateComp', () => {
   it('returns 1.0 when disabled', () => {
@@ -57,6 +65,72 @@ describe('audioClockTrim', () => {
     const r = audioClockTrim(0.05, 5);
     expect(r.reliable).toBe(false);
     expect(r.correct).toBe(false);
+  });
+});
+
+describe('outputDelaySec', () => {
+  it('uses outputLatency + baseLatency when the timestamp has not started', () => {
+    // Tesla overlay: baseLatency 43 ms, outputLatency 264–280 ms.
+    const early = {
+      currentTime: 1,
+      baseLatency: 0.043,
+      outputLatency: 0.264,
+      getOutputTimestamp: () => ({ contextTime: 0, performanceTime: 0 }),
+    };
+    expect(outputDelaySec(early, 1000)).toBeCloseTo(0.307, 5);
+    expect(outputDelaySec({
+      currentTime: 1,
+      baseLatency: 0.043,
+      outputLatency: 0.280,
+    }, 1000)).toBeCloseTo(0.323, 5);
+  });
+
+  it('prefers the getOutputTimestamp mapping over the latency sum', () => {
+    // contextTime 10.000 was at the speaker at performance 5000 ms.
+    // At 5020 ms the audible context time is 10.020. currentTime 10.320
+    // is 300 ms ahead — that is the delay, not the 307 ms sum.
+    const ctx = {
+      currentTime: 10.320,
+      baseLatency: 0.043,
+      outputLatency: 0.264,
+      getOutputTimestamp: () => ({ contextTime: 10.000, performanceTime: 5000 }),
+    };
+    expect(outputDelaySec(ctx, 5020)).toBeCloseTo(0.300, 5);
+  });
+
+  it('falls back when the timestamp delay is implausible', () => {
+    const ctx = {
+      currentTime: 8,
+      baseLatency: 0.043,
+      outputLatency: 0.264,
+      getOutputTimestamp: () => ({ contextTime: 1, performanceTime: 0 }),
+    };
+    expect(outputDelaySec(ctx, 1000)).toBeCloseTo(0.307, 5);
+  });
+
+  it('returns 0 without a context', () => {
+    expect(outputDelaySec(null, 0)).toBe(0);
+  });
+});
+
+describe('A/V sync offset', () => {
+  it('clamps the user nudge to ±300 ms', () => {
+    expect(clampAvOffsetMs(120)).toBe(120);
+    expect(clampAvOffsetMs(-300)).toBe(-300);
+    expect(clampAvOffsetMs(450)).toBe(300);
+    expect(clampAvOffsetMs(-900)).toBe(-300);
+    expect(clampAvOffsetMs('nope', 0)).toBe(0);
+    expect(clampAvOffsetMs(null, 0)).toBe(0);
+  });
+
+  it('reads ?avoffset= and lets it override a stored value', () => {
+    expect(avOffsetFromSearch('')).toBeNull();
+    expect(avOffsetFromSearch('?stats=1')).toBeNull();
+    expect(avOffsetFromSearch('?avoffset=120')).toBe(120);
+    expect(avOffsetFromSearch('?avoffset=-450')).toBe(-300);
+    expect(resolveAvOffsetMs(40, '?avoffset=-20')).toBe(-20);
+    expect(resolveAvOffsetMs(500, '')).toBe(300);
+    expect(resolveAvOffsetMs(undefined, '')).toBeNull();
   });
 });
 

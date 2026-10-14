@@ -334,9 +334,12 @@ export class RenderClient {
    * @param {'playing'|'paused'|'stopped'} state
    * @param {number} musicTime seconds of music
    * @param {number} tempoScale
+   * @param {number} [outputDelayMs]  Speaker delay to snap in with this anchor.
    */
-  setClock(state, musicTime, tempoScale = 1) {
-    this._worker.postMessage({ type: 'clock', state, musicTime, tempoScale });
+  setClock(state, musicTime, tempoScale = 1, outputDelayMs) {
+    const msg = { type: 'clock', state, musicTime, tempoScale };
+    if (Number.isFinite(outputDelayMs)) msg.outputDelayMs = outputDelayMs;
+    this._worker.postMessage(msg);
   }
 
   /**

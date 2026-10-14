@@ -499,8 +499,11 @@ function handleSnapCamera({ x, y }) {
 /*  Playback clock                                                      */
 /* ------------------------------------------------------------------ */
 
-function handleClock({ state, musicTime, tempoScale }) {
+function handleClock({ state, musicTime, tempoScale, outputDelayMs }) {
   const { clock, host, frameStats } = ctx;
+  // Land the delay before `set` flags the play-start snap, so the
+  // first visual frame is already behind currentTime by the speaker delay.
+  if (Number.isFinite(outputDelayMs)) SceneConfig.audioOutputDelayMs = outputDelayMs;
   clock.set(state, musicTime, tempoScale);
   if (state === 'playing') {
     if (host.lightBalls) host.lightBalls.play();

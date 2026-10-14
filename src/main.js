@@ -156,7 +156,7 @@ async function main() {
       if (benchAuto) {
         try { await app.play(); } catch {}
         // Force the worker clock to playing state even if browser blocks audio autoplay
-        app.render.setClock('playing', app.midiPlayer.currentTime, app.midiPlayer.tempoScale);
+        app.render.setClock('playing', app.midiPlayer.currentTime, app.midiPlayer.tempoScale, app.midiPlayer.outputDelayMs());
       }
       // Stop after duration or on explicit stop; if duration==0, wait for playback to finish
       const done = new Promise((resolve) => {
