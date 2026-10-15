@@ -223,6 +223,16 @@ export class FrameStats {
     this._prevTargetX = null;
   }
 
+  /** Recent render-submit p95, or 0 until the ring has enough real
+   *  submits.  Idle ticks never enter this ring, so a quiet rAF gap
+   *  cannot look like a full frame of work. */
+  recentRenderP95(minSamples = 8) {
+    const n = this._renderMsRing.filled;
+    if (n < minSamples) return 0;
+    const want = Math.min(n, 60);
+    return this._renderMsRing.percentile(0.95, want, this._statsScratch);
+  }
+
   recordRender(ms) {
     this._lastRenderMs = ms;
     this._framesSinceRender = 0;

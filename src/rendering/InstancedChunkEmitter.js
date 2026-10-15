@@ -138,7 +138,13 @@ export function emitInstancedChunks(
       noteIds ? noteIds[0] : null, defaultInstanceColor, noteMeshMap, tagLod);
     return;
   }
-  if (!OPTIMIZATIONS.CHUNK_BUCKETS_BY_X) {
+  // Detail (stems / flags / ledgers) is always split along X, even when
+  // global chunking is off.  One score-wide mesh cannot hide distant
+  // stems without also hiding the playhead stem.  Frustum culling stays
+  // tied to the global flag: Chromium WebGPU pops chunks at oblique
+  // angles, and LodGate hides those chunks by distance instead.
+  const chunkDetail = !!(lodInfo && lodInfo.lodDetail);
+  if (!OPTIMIZATIONS.CHUNK_BUCKETS_BY_X && !chunkDetail) {
     // One InstancedMesh per bucket, no horizontal chunking.  The
     // whole bucket always passes the frustum test because its
     // bounding sphere spans the entire score, so we draw every
@@ -172,6 +178,6 @@ export function emitInstancedChunks(
       continue;
     }
     emitInstancedMesh(root, geometry, material, arr,
-      defaultInstanceColor, noteMeshMap, tagLod, true);
+      defaultInstanceColor, noteMeshMap, tagLod, !!OPTIMIZATIONS.CHUNK_BUCKETS_BY_X);
   }
 }

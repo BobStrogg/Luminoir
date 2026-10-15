@@ -7,9 +7,12 @@ import {
   lightIntensityForPressure,
   snapToRefreshInterval,
   choosePresentDecimation,
+  detailReachForHeadroom,
+  frameHeadroom,
   sharpRatioStillFits,
   TESLA_LOCK60_PROBE_MS,
   TESLA_DPR_MIN,
+  LOD_FAR_RADIUS,
 } from './qualityPolicy.js';
 
 /**
@@ -114,6 +117,10 @@ export class QualityController {
   get chosenShadowMapSize() { return this._chosenShadowMapSize; }
   get probeMs() { return this.probeMsMeasured; }
   get sceneProbeMs() { return this._sceneProbeMsMeasured; }
+  /** GPU scene cost after the idle-fence subtraction, in ms.  This is
+   *  the number the Tesla rate lock compares to 16 ms. */
+  get sceneGpuMs() { return this._sceneGpuMs; }
+  _sceneGpuMs = 0;
 
   /** Feed one rAF interval sample.  Locks `_baselineMs` / `_displayMs`
    *  after `_CALIB_TICKS` samples.  Samples above 40 ms are rejected:
@@ -323,6 +330,48 @@ export class QualityController {
     } catch {}
   }
 
+  /**
+   * When the full-detail GPU scene is already past 92 % of the budget,
+   * hide detail beyond the headroom reach (never the near field) and
+   * measure once more while the loading overlay is up.  Keep the shed
+   * only when it actually gets cheaper.  Does not touch DPR or the
+   * shadow map.
+   * @returns {Promise<{ raw: number }|null>}
+   */
+  async _shedDistantDetail(fullSceneMs, fence, thresholdMs) {
+    const lod = this._ctx.lod;
+    const camera = this._ctx.camera;
+    const controls = this._ctx.controls;
+    if (!lod || !camera || !controls || !(fullSceneMs > thresholdMs * 0.92)) return null;
+    const displayMs = this.calibrated ? this.displayMs : (1000 / 60);
+    const reach = detailReachForHeadroom(frameHeadroom(fullSceneMs, displayMs));
+    if (reach >= LOD_FAR_RADIUS - 0.5) return null;
+    const pixelRatio = this._ctx.renderer?.getPixelRatio?.() || 1;
+    const height = this._ctx.viewportHeightCss || 1;
+    lod.snapGovernor(reach);
+    lod.apply(camera, controls, pixelRatio, height, 0);
+    const raw = await this.probeGpuCost(3, true, { forceShadow: !!SceneConfig.shadow.enabled });
+    const shedScene = Math.max(0, raw - fence);
+    const saved = fullSceneMs > 0 ? (fullSceneMs - shedScene) / fullSceneMs : 0;
+    if (shedScene + 1 < fullSceneMs && saved >= 0.08) {
+      lod.capReach(reach);
+      lod.setGpuModel(fullSceneMs, shedScene, lod.detailVisibleFraction);
+      try {
+        this._ctx?.eventLog?.note?.(
+          `detail-governor: reach=${reach.toFixed(1)} wu scene ${fullSceneMs.toFixed(1)} → ${shedScene.toFixed(1)} ms`);
+      } catch {}
+      return { raw };
+    }
+    lod.snapGovernor(LOD_FAR_RADIUS);
+    lod.capReach(LOD_FAR_RADIUS);
+    lod.apply(camera, controls, pixelRatio, height, 0);
+    try {
+      this._ctx?.eventLog?.note?.(
+        `detail-governor: shed skipped (scene ${fullSceneMs.toFixed(1)} → ${shedScene.toFixed(1)} ms)`);
+    } catch {}
+    return null;
+  }
+
   stepDown() {
     const step = nextQualityStep(this._chosenShadowMapSize, {
       allowVeryLowQuality: this.allowVeryLowQuality,
@@ -418,7 +467,11 @@ export class QualityController {
       }
       this._ctx.probePixelRatioCeiling = keptRatio;
     }
+    const fullScene = Math.max(0, measured - fence);
+    const shed = await this._shedDistantDetail(fullScene, fence, threshold);
+    if (shed) measured = shed.raw;
     this._sceneProbeMsMeasured = measured;
+    this._sceneGpuMs = Math.max(0, measured - fence);
     let decision = null;
     if (this._ctx.isTesla) {
       const displayMs = this.calibrated ? this.displayMs : (1000 / 60);

@@ -51,12 +51,12 @@
  *
  * Effect on geometry / draw cost when zoomed out
  * ----------------------------------------------
- *   `LOD_DISTANT_ELEMENTS`  when the camera is further than
- *                           `LOD_DISTANCE_THRESHOLD` from its target,
- *                           skip emitting the small per-note decorations
- *                           (child paths — stems, flags, ledger lines)
- *                           at build time.  Their draw-call cost stays
- *                           but we render far fewer total primitives.
+ *   `LOD_DISTANT_ELEMENTS`  runtime: hide stems, flags and ledger lines
+ *                           whose chunk is farther along the score than
+ *                           the detail governor's reach.  The near field
+ *                           around the playhead is never hidden.  The
+ *                           old camera-zoom threshold dropped every stem
+ *                           at once, including the ones under the camera.
  *   `DISTANCE_CLIP_GLYPHS`  when the camera is far enough away that
  *                           individual notehead glyphs would be sub-pixel
  *                           anyway, cull them from the render list each

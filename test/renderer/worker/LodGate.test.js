@@ -52,3 +52,66 @@ describe('LodGate caster suppression', () => {
     expect(detail.castShadow).toBe(true);   // recovered below 0.30
   });
 });
+
+function cameraAt(distance) {
+  return { fov: 45, position: { distanceTo: () => distance } };
+}
+function lookingAt(x) {
+  return { target: { x, y: 0, z: 0 } };
+}
+/** Detail chunk centred at score X. */
+function chunk(x, radius, userData) {
+  return {
+    isMesh: true,
+    visible: true,
+    castShadow: true,
+    count: 4,
+    userData,
+    boundingSphere: { center: { x }, radius },
+    position: { x: 0, y: 0, z: 0 },
+  };
+}
+
+describe('LodGate distance order', () => {
+  it('keeps the playhead stem when zoom would previously hide every stem', () => {
+    const near = chunk(10, 1, { lodDetail: true, lodSize: 0.007 });
+    const far = chunk(40, 1, { lodDetail: true, lodSize: 0.007 });
+    const gate = new LodGate();
+    gate.collect(rootOf([near, far]));
+    gate.snapGovernor(6);
+    // Camera is 20 wu from the target — the old rule hid all detail
+    // past 12 wu, and full pressure shrank that to 3.6.
+    gate.apply(cameraAt(20), lookingAt(10), 1, 800, 1);
+    expect(near.visible).toBe(true);
+    expect(far.visible).toBe(false);
+    expect(gate.nearHiddenCount).toBe(0);
+  });
+
+  it('does not sub-pixel-cull a stem sitting on the playhead', () => {
+    const stem = chunk(0, 0.5, { lodDetail: true, lodSize: 0.007 });
+    const gate = new LodGate();
+    gate.collect(rootOf([stem]));
+    gate.snapGovernor(36);
+    gate.apply(cameraAt(40), lookingAt(0), 1, 100, 1);
+    expect(stem.visible).toBe(true);
+  });
+
+  it('never hides a chunk with no anchor', () => {
+    const stem = mesh({ lodDetail: true, lodSize: 0.007 });
+    const gate = new LodGate();
+    gate.collect(rootOf([stem]));
+    gate.snapGovernor(6);
+    gate.apply(cameraAt(30), lookingAt(100), 1, 800, 1);
+    expect(stem.visible).toBe(true);
+  });
+
+  it('sub-pixel-culls a far glyph and keeps a near one', () => {
+    const near = chunk(0, 0.2, { lodDetail: false, lodSize: 0.001 });
+    const far = chunk(30, 0.2, { lodDetail: false, lodSize: 0.001 });
+    const gate = new LodGate();
+    gate.collect(rootOf([near, far]));
+    gate.apply(cameraAt(20), lookingAt(0), 1, 800, 0);
+    expect(near.visible).toBe(true);
+    expect(far.visible).toBe(false);
+  });
+});

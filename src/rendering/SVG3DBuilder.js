@@ -26,6 +26,9 @@ const NOTE_ATTACHED_TYPES = new Set([
 export class SVG3DBuilder {
   constructor() {
     this._noteMat = Materials.note();
+    // Stems, flags and ledger lines.  A separate material from
+    // `_noteMat` so the distance fade does not dissolve beams.
+    this._detailMat = Materials.detail();
     // Noteheads (the `glyphPath` on each `note`) use a white-base
     // variant so `InstancedMesh.setColorAt()` can recolour a note to
     // its staff's palette entry during playback without being muted
@@ -123,7 +126,7 @@ export class SVG3DBuilder {
     return {
       geometries: new Set([this._unitBox, ...this._geometryCache.values()]),
       materials: new Set([
-        this._noteMat, this._noteHeadMat, this._staffMat, this._barMat, this._otherMat,
+        this._noteMat, this._detailMat, this._noteHeadMat, this._staffMat, this._barMat, this._otherMat,
       ].filter(Boolean)),
     };
   }
@@ -160,7 +163,7 @@ export class SVG3DBuilder {
       const offY = (note.ancestorY ?? 0) - note.y;
       for (const d of note.childPaths) {
         bucketer.addGlyph(d, SceneConfig.extrusionDepth * 0.5,
-          this._noteMat, 'path', note.x + offX, note.y + offY, SceneConfig.noteElevation,
+          this._detailMat, 'path', note.x + offX, note.y + offY, SceneConfig.noteElevation,
           null, 0, true);
       }
     }
@@ -206,7 +209,6 @@ export class SVG3DBuilder {
   _bucketOtherElements(bucketer, parsed) {
     for (const el of parsed.otherElements) {
       const attached = NOTE_ATTACHED_TYPES.has(el.type);
-      const mat = attached ? this._noteMat : this._otherMat;
       const z = attached ? SceneConfig.noteElevation : SceneConfig.otherElementsElevation;
       // Stems and flags are the per-note detail class the LOD pass can
       // hide at distance.  Beams are deliberately NOT tagged: they're
@@ -214,6 +216,8 @@ export class SVG3DBuilder {
       // the LOD threshold, and hiding them would visibly change the
       // music's texture at moderate zoom-outs.
       const lodDetail = el.type === 'stem' || el.type === 'flag';
+      // Beams stay on `_noteMat` (no fade, never distance-hidden).
+      const mat = lodDetail ? this._detailMat : (attached ? this._noteMat : this._otherMat);
       if (el.isLine) {
         // Beam bars (and any future axis-aligned quad elements) are
         // emitted by the parser as `isLine: true` with a thickness.

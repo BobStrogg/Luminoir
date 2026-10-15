@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { MeshStandardNodeMaterial } from 'three/webgpu';
 import {
+  abs,
   add,
   clamp,
   float,
@@ -9,11 +10,19 @@ import {
   materialEmissive,
   mul,
   positionWorld,
+  screenCoordinate,
+  sin,
+  smoothstep,
   sub,
   uniform,
   varyingProperty,
+  vec2,
+  floor,
+  fract,
+  dot,
 } from 'three/tsl';
 import { SceneConfig } from './SceneConfig.js';
+import { LOD_FADE_WIDTH, LOD_FAR_RADIUS, LOD_NEAR_RADIUS } from './lodDistances.js';
 
 const c = (r, g, b) => new THREE.Color(r, g, b);
 
@@ -30,6 +39,104 @@ let _playheadXGLSL = null;  // { value: number } object ref (WebGL)
 export function setPlayheadX(x) {
   if (_playheadXTSL)  _playheadXTSL.value = x;
   if (_playheadXGLSL) _playheadXGLSL.value = x;
+}
+
+/**
+ * Detail-fade uniforms.  One shared set: stems, flags and ledger lines
+ * dissolve across `LOD_FADE_WIDTH` as they cross the governor's reach,
+ * and instances inside the near radius stay fully opaque.  Beams stay
+ * on the note material and do not fade.
+ */
+const _detailFade = {
+  focusX: 0,
+  reach: LOD_FAR_RADIUS,
+};
+let _detailFocusTSL = null;
+let _detailReachTSL = null;
+const _detailUniformSets = [];
+
+/** Push the playhead X and the current detail reach into the fade. */
+export function setDetailFade(focusX, reach) {
+  _detailFade.focusX = focusX;
+  _detailFade.reach = reach;
+  if (_detailFocusTSL) _detailFocusTSL.value = focusX;
+  if (_detailReachTSL) _detailReachTSL.value = reach;
+  for (const u of _detailUniformSets) {
+    u.uFocusX.value = focusX;
+    u.uReach.value = reach;
+  }
+}
+
+function _noteColor() {
+  return c(SceneConfig.noteColor.r, SceneConfig.noteColor.g, SceneConfig.noteColor.b);
+}
+
+/** WebGL dither-discard.  Opaque when `fade` is 1, gone when it is 0,
+ *  stippled in between so the reach boundary does not pop.  No
+ *  transparency, so stems stay in the opaque pass. */
+function _attachDetailFadeGLSL(mat) {
+  mat.onBeforeCompile = (shader) => {
+    const uFocusX = { value: _detailFade.focusX };
+    const uReach = { value: _detailFade.reach };
+    shader.uniforms.uDetailFocusX = uFocusX;
+    shader.uniforms.uDetailReach = uReach;
+    _detailUniformSets.push({ uFocusX, uReach });
+    shader.vertexShader = 'varying float vDetailWorldX;\n' + shader.vertexShader;
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <project_vertex>',
+      [
+        '{',
+        '  vec4 _dw = vec4(transformed, 1.0);',
+        '  #ifdef USE_INSTANCING',
+        '  _dw = instanceMatrix * _dw;',
+        '  #endif',
+        '  vDetailWorldX = (modelMatrix * _dw).x;',
+        '}',
+        '#include <project_vertex>',
+      ].join('\n'),
+    );
+    shader.fragmentShader =
+      'varying float vDetailWorldX;\n'
+      + 'uniform float uDetailFocusX;\n'
+      + 'uniform float uDetailReach;\n'
+      + shader.fragmentShader;
+    const near = LOD_NEAR_RADIUS.toFixed(1);
+    const fadeW = LOD_FADE_WIDTH.toFixed(1);
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <clipping_planes_fragment>',
+      [
+        '#include <clipping_planes_fragment>',
+        '{',
+        '  float _dist = abs(vDetailWorldX - uDetailFocusX);',
+        `  if (_dist > ${near}) {`,
+        `    float _start = max(${near}, uDetailReach - ${fadeW});`,
+        '    float _fade = 1.0 - smoothstep(_start, max(_start + 0.001, uDetailReach), _dist);',
+        '    float _dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);',
+        '    if (_fade < _dither) discard;',
+        '  }',
+        '}',
+      ].join('\n'),
+    );
+  };
+}
+
+function _attachDetailFadeNodes(mat) {
+  if (!_detailFocusTSL) {
+    _detailFocusTSL = uniform(_detailFade.focusX);
+    _detailReachTSL = uniform(_detailFade.reach);
+  }
+  const dist = abs(sub(positionWorld.x, _detailFocusTSL));
+  const near = float(LOD_NEAR_RADIUS);
+  const start = max(near, sub(_detailReachTSL, float(LOD_FADE_WIDTH)));
+  const outside = smoothstep(start, max(add(start, float(0.001)), _detailReachTSL), dist);
+  const fade = dist.lessThanEqual(near).select(float(1), sub(float(1), outside));
+  mat.opacityNode = fade;
+  const dither = fract(mul(
+    sin(dot(floor(screenCoordinate), vec2(12.9898, 78.233))),
+    float(43758.5453),
+  ));
+  mat.alphaTestNode = dither;
+  mat.transparent = false;
 }
 
 /**
@@ -98,6 +205,38 @@ export const Materials = {
       // doesn't visibly matter, which is why the bug only shows up
       // on `.local` URLs where Chrome falls back to WebGL.
     }),
+
+  /**
+   * Stems, flags and ledger lines.  Same ink as `note()`, plus a
+   * distance fade so detail past the governor's reach dissolves
+   * instead of popping.  Not shared with beams — those stay on
+   * `note()` and are never distance-hidden.
+   */
+  detail: () => {
+    const color = _noteColor();
+    if (_rendererKind === 'webgpu') {
+      const mat = new MeshStandardNodeMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.15,
+        metalness: SceneConfig.noteMetalness,
+        roughness: SceneConfig.noteRoughness,
+      });
+      _attachDetailFadeNodes(mat);
+      return mat;
+    }
+    const mat = SceneConfig.performance?.cheapSurfaces
+      ? new THREE.MeshLambertMaterial({ color })
+      : new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.15,
+        metalness: SceneConfig.noteMetalness,
+        roughness: SceneConfig.noteRoughness,
+      });
+    _attachDetailFadeGLSL(mat);
+    return mat;
+  },
 
   /**
    * Notehead material.  Branches on the current renderer:
