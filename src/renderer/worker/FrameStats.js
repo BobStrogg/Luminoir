@@ -257,6 +257,14 @@ export class FrameStats {
     this.resetJitter();
   }
 
+  /** Drop the recent frame/render window so a bench can measure the
+   *  score that is on screen, not the load that preceded it. */
+  resetSampleWindow() {
+    this._frameMsRing.reset();
+    this._renderMsRing.reset();
+    this._playFrameMsRing.reset();
+  }
+
   /** Store this tick's flags + worker CPU so the *next* frame's
    *  interval can be correlated with the work that preceded it. */
   endFrame(frameFlags, cpuMs) {

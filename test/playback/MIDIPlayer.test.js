@@ -10,13 +10,16 @@ vi.mock('smplr', () => ({
         this.resolveLoad = resolve;
       });
       this.start = () => () => {};
-      this.stop = () => {};
+      this.stopped = false;
+      this.disconnected = false;
+      this.stop = () => { this.stopped = true; };
+      this.disconnect = () => { this.disconnected = true; };
       created.push(this);
     }
   },
 }));
 
-import { MIDIPlayer, instrumentProgramKey } from '../../src/playback/MIDIPlayer.js';
+import { MIDIPlayer, instrumentProgramKey, instrumentNamesFor } from '../../src/playback/MIDIPlayer.js';
 
 function midiBase64({ division = 480, noteTicks = 480, program = 40 } = {}) {
   const track = [
@@ -76,6 +79,44 @@ describe('instrumentProgramKey', () => {
     expect(instrumentProgramKey(new Map([[0, 40], [1, 40]]))).toBe('40');
     expect(instrumentProgramKey(new Map())).toBe('0');
     expect(instrumentProgramKey(null)).toBe('0');
+  });
+});
+
+describe('instrumentNamesFor', () => {
+  it('maps program ids onto soundfont names', () => {
+    expect([...instrumentNamesFor(new Map([[0, 40]]))]).toEqual(['violin']);
+    expect([...instrumentNamesFor(new Map())]).toEqual(['acoustic_grand_piano']);
+  });
+});
+
+describe('unused soundfonts', () => {
+  beforeEach(() => { created.length = 0; });
+
+  it('disconnects instruments the next score does not use', async () => {
+    const player = fakePlayer();
+    const first = player._loadInstruments();
+    await tick();
+    created[0].resolveLoad();
+    await first;
+    expect(player._instruments.has('violin')).toBe(true);
+
+    player._channelPrograms = new Map([[0, 0]]);
+    const second = player._loadInstruments();
+    await tick();
+    const piano = created.find((c) => c.instrument === 'acoustic_grand_piano');
+    piano.resolveLoad();
+    await second;
+
+    expect(created[0].stopped).toBe(true);
+    expect(created[0].disconnected).toBe(true);
+    expect(player._instruments.has('violin')).toBe(false);
+    expect(player._instruments.has('acoustic_grand_piano')).toBe(true);
+    expect(player.resourceSnapshot()).toMatchObject({
+      contexts: 1,
+      instruments: 1,
+      gainNodes: 1,
+      scheduled: 0,
+    });
   });
 });
 

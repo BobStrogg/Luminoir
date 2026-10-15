@@ -15,6 +15,8 @@ export class EventLog {
       // swallow — logging is best-effort only
     }
   }
+  get size() { return this._events.length; }
+
   clear() {
     this._events.length = 0;
   }

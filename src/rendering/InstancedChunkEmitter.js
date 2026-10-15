@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OPTIMIZATIONS } from './Optimizations.js';
+import { retainInstanceBuffers } from './instanceLedger.js';
 
 /**
  * Emit a single plain `THREE.Mesh` for the count-1 fast path.
@@ -79,6 +80,7 @@ function emitInstancedMesh(root, geometry, material, items, defaultInstanceColor
     }
   }
   tagLod(mesh);
+  retainInstanceBuffers(mesh);
   root.add(mesh);
 }
 

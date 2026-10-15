@@ -1,6 +1,6 @@
 {
   "name": "luminoir",
-  "version": "1.1.31",
+  "version": "1.1.32",
   "description": "Browser-based 3D sheet-music visualisation built on Three.js, Verovio and Web Audio.",
   "type": "module",
   "packageManager": "pnpm@10.32.1",
@@ -18,7 +18,8 @@
     "bench:camera:all": "node bench/camera-offline.mjs --all",
     "bench:export-timeline": "node bench/export-timeline.mjs",
     "bench:export-page": "node bench/export-from-page.mjs",
-    "bench:webkit": "node bench/bench-webkit.mjs"
+    "bench:webkit": "node bench/bench-webkit.mjs",
+    "bench:score-switch": "node bench/score-switch-leak.mjs"
   },
   "dependencies": {
     "smplr": "^0.19.0",

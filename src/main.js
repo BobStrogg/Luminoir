@@ -139,7 +139,11 @@ async function main() {
   }
 
   try {
-    await app.init(canvas, setStatus);
+    // `?score=` picks the first score so a leak bench can measure a
+    // fresh load. Bench mode still starts on Albatross and then
+    // switches, which is what the existing harness records.
+    const firstScore = (!benchMode && urlParams.get('score')) || 'albatross';
+    await app.init(canvas, setStatus, { firstScore });
     console.log(
       `[Luminoir] Ready — renderer: ${app.render.rendererKind}`,
     );

@@ -80,8 +80,9 @@ export class LuminoirApp {
   /**
    * @param {HTMLCanvasElement} canvas
    * @param {(msg: string) => void} setStatus – loading status callback
+   * @param {{ firstScore?: string }} [opts]
    */
-  async init(canvas, setStatus) {
+  async init(canvas, setStatus, opts = {}) {
     setStatus('Loading music engine...');
     await this.scoreClient.init();
 
@@ -141,8 +142,9 @@ export class LuminoirApp {
       try { this.render.setPageVisibility(document.visibilityState); } catch {}
     });
 
+    const firstScore = opts.firstScore || 'albatross';
     setStatus('Loading demo score...');
-    await this.loadDemoScore('albatross');
+    await this.loadDemoScore(firstScore);
 
     if (this.onReady) this.onReady();
   }
