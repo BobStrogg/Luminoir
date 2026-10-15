@@ -273,6 +273,11 @@ export class RenderClient {
     if (!this._worker) return;
     this._worker.postMessage({ type: 'statsReset' });
   }
+  /** Clear the worker's recent frame/render rings. */
+  resetFrameWindow() {
+    if (!this._worker) return;
+    this._worker.postMessage({ type: 'resetFrameWindow' });
+  }
   /** Stop benchmark and await the aggregated result. */
   awaitBenchmarkResult() {
     if (!this._worker) return Promise.resolve(null);

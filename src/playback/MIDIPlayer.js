@@ -138,6 +138,23 @@ export class MIDIPlayer {
     return this._masterVolume;
   }
 
+  /**
+   * Live audio graph owned by this player. Used by the score-switch
+   * leak bench — instrument caches and scheduled notes must return
+   * to the current score, and there is only ever one context.
+   */
+  resourceSnapshot() {
+    return {
+      contexts: this._ctx ? 1 : 0,
+      contextState: this._ctx ? this._ctx.state : null,
+      instruments: this._instruments.size,
+      pendingLoads: this._instrumentLoads.size,
+      scheduled: this._scheduledStopFns.length,
+      gainNodes: this._masterGain ? 1 : 0,
+      instrumentNames: [...this._instruments.keys()].sort(),
+    };
+  }
+
   get duration() {
     return this._duration;
   }
@@ -624,6 +641,10 @@ export class MIDIPlayer {
     // gesture handler — we're just waiting for Safari to honour it before
     // handing the context to smplr.
     await this._waitForContextRunning();
+    // A previous score's Soundfont keeps its channel GainNodes connected
+    // for the life of the context. Drop programs this score does not use
+    // so the graph returns to the current instrumentation.
+    this._releaseUnusedInstruments();
 
     // Collect unique program numbers used across channels
     const programs = new Set(this._channelPrograms.values());
@@ -689,6 +710,17 @@ export class MIDIPlayer {
   }
 
   /** Resolve the loaded instrument for a given MIDI channel */
+  _releaseUnusedInstruments() {
+    const keep = instrumentNamesFor(this._channelPrograms);
+    for (const [name, inst] of this._instruments) {
+      if (keep.has(name)) continue;
+      try { inst.stop(); } catch { /* already stopped */ }
+      try { inst.disconnect?.(); } catch { /* already disconnected */ }
+      this._instruments.delete(name);
+      this._instrumentLoads.delete(name);
+    }
+  }
+
   _getInstrumentForChannel(channel) {
     // Channel 9 is always percussion in GM — skip (not supported by Soundfont)
     if (channel === 9) return null;
@@ -789,6 +821,16 @@ export function instrumentProgramKey(channelPrograms) {
   }
   if (ids.size === 0) ids.add(0);
   return [...ids].sort((a, b) => a - b).join(',');
+}
+
+/** Soundfont names the current program set needs. Empty → piano. */
+export function instrumentNamesFor(channelPrograms) {
+  const names = new Set();
+  for (const part of instrumentProgramKey(channelPrograms).split(',')) {
+    const prog = Number(part);
+    names.add(GM_INSTRUMENTS[prog] || GM_INSTRUMENTS[0]);
+  }
+  return names;
 }
 
 function urlFlag(key) {

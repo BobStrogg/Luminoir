@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { LightBallController } from '../../animation/LightBallController.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
+import { disposeScoreSubtree } from '../../rendering/sceneDisposal.js';
 
 /**
  * Owns the scene graph (`scene`, `contentRoot`), the score builder,
@@ -96,14 +97,11 @@ export class SceneHost {
     keyLightRig.resetSnap();
     frameStats.resetJitter();
 
-    // Remove previous content.  We don't dispose the InstancedMesh
-    // geometries / materials because they're cached inside the builder
-    // and shared across score loads — disposing them here would leave
-    // the cache pointing at zombie GPU buffers that the next
-    // `builder.build()` would unwittingly re-use, producing the
-    // characteristic "stray glyphs drawn in the wrong place" bug.
-    // The only per-scene resource in the tree is the paper backdrop,
-    // which we dispose by hand below.
+    // Remove previous content. Shared glyph geometries and materials
+    // stay in the builder cache (disposing them produced stray glyphs).
+    // Everything else — instance buffers, cloned materials, paper,
+    // title — is released here. Unused cache entries are dropped at
+    // the end of the next `builder.build()`.
     while (this.contentRoot.children.length) {
       const child = this.contentRoot.children[0];
       this.contentRoot.remove(child);
@@ -340,41 +338,12 @@ export class SceneHost {
   }
 
   disposePerSceneResources(obj) {
-    // Only dispose things that were created *for this scene* and aren't
-    // in the builder's shared cache.
-    //
-    //   - In the bucketing build path (`BUCKET_INSTANCES: true`) every
-    //     extruded glyph `BufferGeometry` lives in the builder's
-    //     `_geometryCache` and the box-line geometry is the shared
-    //     `_unitBox`.  The paper backdrop is the only per-scene
-    //     object — disposing any of the shared geometries here would
-    //     leave the cache pointing at zombie GPU buffers that the next
-    //     `builder.build()` would re-use, producing the characteristic
-    //     "stray glyphs drawn in the wrong place" bug.
-    //
-    //   - In the one-mesh-per-element fallback
-    //     (`BUCKET_INSTANCES: false`) each line creates its own
-    //     `BoxGeometry`, so we dispose those here.  Extruded glyph
-    //     geometries are still cached, so we skip those.
-    obj.traverse((node) => {
-      if (node.name === 'paper') {
-        if (node.geometry) node.geometry.dispose();
-        if (node.material) node.material.dispose();
-        return;
-      }
-      // Title text: ExtrudeGeometry + cloned material, both created per
-      // score load and not in any shared cache.
-      if (node.name === 'title') {
-        if (node.geometry) node.geometry.dispose();
-        if (node.material) node.material.dispose();
-        return;
-      }
-      if (!OPTIMIZATIONS.BUCKET_INSTANCES) {
-        if (node.isMesh && node.geometry && node.geometry.type === 'BoxGeometry') {
-          node.geometry.dispose();
-        }
-      }
-    });
+    // Shared cache members are kept. Per-score meshes (paper, title,
+    // legacy boxes, cloned note materials, InstancedMesh buffers) are
+    // released. See `disposeScoreSubtree`.
+    const shared = this.builder?.sharedResources()
+      || { geometries: new Set(), materials: new Set() };
+    disposeScoreSubtree(obj, shared, (mesh) => this._ctx.gpuDisposal?.dispose(mesh));
   }
 
   dispose() {

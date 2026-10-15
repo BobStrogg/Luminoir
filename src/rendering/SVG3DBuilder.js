@@ -8,6 +8,7 @@ import { InstanceBucketer } from './InstanceBuckets.js';
 import { emitInstancedChunks } from './InstancedChunkEmitter.js';
 import { addPaper, addTitle, measureTitleLayout } from './PaperAndTitle.js';
 import { buildOneMeshPerElement } from './LegacyMeshBuilder.js';
+import { releaseUnusedGeometries } from './sceneDisposal.js';
 
 /**
  * Elements that count as "note-attached" rather than "decoration"
@@ -78,6 +79,7 @@ export class SVG3DBuilder {
     const root = new THREE.Group();
     /** @type {Map<string, { mesh: THREE.Mesh, index: number, material?: THREE.Material }>} */
     const noteMeshMap = new Map();
+    this._usedGeometryKeys = new Set();
 
     if (!OPTIMIZATIONS.BUCKET_INSTANCES) {
       // Fallback: one `THREE.Mesh` per SVG element.  Slow on large
@@ -85,6 +87,7 @@ export class SVG3DBuilder {
       // bisecting visual regressions — exactly the path we had before
       // the bucketing optimisations landed.
       buildOneMeshPerElement(this, root, parsed, noteMeshMap);
+      this._releaseUnusedGeometries();
       return { root, noteMeshMap };
     }
 
@@ -111,7 +114,22 @@ export class SVG3DBuilder {
       addTitle(root, parsed, titleLayout, this._otherMat);
     }
 
+    this._releaseUnusedGeometries();
     return { root, noteMeshMap };
+  }
+
+  /** Geometries and materials the next score is allowed to reuse. */
+  sharedResources() {
+    return {
+      geometries: new Set([this._unitBox, ...this._geometryCache.values()]),
+      materials: new Set([
+        this._noteMat, this._noteHeadMat, this._staffMat, this._barMat, this._otherMat,
+      ].filter(Boolean)),
+    };
+  }
+
+  _releaseUnusedGeometries() {
+    releaseUnusedGeometries(this._geometryCache, this._usedGeometryKeys);
   }
 
   /**
@@ -324,6 +342,7 @@ export class SVG3DBuilder {
    */
   makeExtrudedGeometry(pathD, depth, kind) {
     const cacheKey = kind + ':' + depth + ':' + pathD;
+    if (this._usedGeometryKeys) this._usedGeometryKeys.add(cacheKey);
     const cached = this._geometryCache.get(cacheKey);
     if (cached) return cached;
     try {

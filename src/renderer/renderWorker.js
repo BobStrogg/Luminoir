@@ -37,6 +37,8 @@ import { FrameStats } from './worker/FrameStats.js';
 import { SceneHost } from './worker/SceneHost.js';
 import { RenderLoop } from './worker/RenderLoop.js';
 import { EventLog } from './worker/EventLog.js';
+import { installMeshGpuDisposal } from './worker/meshGpuDisposal.js';
+import { instanceBytesOutstanding } from '../rendering/instanceLedger.js';
 
 /* ------------------------------------------------------------------ */
 /*  Shared worker context                                              */
@@ -197,6 +199,7 @@ self.onmessage = async (e) => {
     case 'benchmarkStart': return handleBenchmarkStart(msg);
     case 'benchmarkStop':  return handleBenchmarkStop(msg);
     case 'statsReset':    return handleStatsReset();
+    case 'resetFrameWindow': return handleResetFrameWindow();
     case 'visibility':    return handleVisibility(msg);
     case 'tick':          return ctx.loop.externalTick(msg.now);
     default:
@@ -264,6 +267,7 @@ async function handleInit({ canvas, width, height, devicePixelRatio, rect, force
     return;
   }
   ctx.renderer = renderer;
+  ctx.gpuDisposal = installMeshGpuDisposal(renderer);
   ctx.eventLog.note(`renderer: ${usingWebGPU ? 'WebGPU' : 'WebGL'}; antialias=${wantAntialias ? 'MSAA' : 'none'}; dpr=${(devicePixelRatio||1).toFixed(2)}${forceLegacy ? ' [forced legacy on Safari]' : ''}`);
 
   // Tell the `Materials` module which GLSL-injection path to use —
@@ -682,6 +686,10 @@ function handleStatsReset() {
   ctx.eventLog.clear();
 }
 
+function handleResetFrameWindow() {
+  ctx.frameStats.resetSampleWindow();
+}
+
 function handleVisibility({ state }) {
   const s = String(state || 'visible');
   if (s === 'hidden') {
@@ -718,7 +726,21 @@ function handleProbe({ id }) {
     if (n.isAmbientLight) ambientLightCount++;
   });
   const renderInfo = renderer?.info?.render || {};
+  const memoryInfo = renderer?.info?.memory || {};
+  const programList = renderer?.info?.programs;
+  const pipelines = renderer?._pipelines;
+  const stagePrograms = pipelines?.programs;
   const lastFraming = host.lastFraming;
+  const listenerHosts = [ctx.scene, camera, controls, renderer, host.contentRoot, keyLightRig.light];
+  let listenerCount = 0;
+  for (const obj of listenerHosts) {
+    const map = obj && obj._listeners;
+    if (!map) continue;
+    for (const key of Object.keys(map)) {
+      const list = map[key];
+      if (Array.isArray(list)) listenerCount += list.length;
+    }
+  }
   self.postMessage({
     type: 'probe',
     id,
@@ -765,8 +787,24 @@ function handleProbe({ id }) {
         pointLights: pointLightCount,
         directionalLights: directionalLightCount,
         ambientLights: ambientLightCount,
+        childCount: ctx.scene?.children?.length || 0,
+        contentChildren: host.contentRoot?.children?.length || 0,
         drawCalls: renderInfo.calls || 0,
         triangles: renderInfo.triangles || 0,
+        geometries: memoryInfo.geometries || 0,
+        textures: memoryInfo.textures || 0,
+        programs: Array.isArray(programList) ? programList.length : null,
+        pipelines: pipelines?.caches?.size ?? null,
+        stagePrograms: stagePrograms
+          ? (stagePrograms.vertex?.size || 0) + (stagePrograms.fragment?.size || 0) + (stagePrograms.compute?.size || 0)
+          : null,
+        geometryCache: host.builder?._geometryCache?.size || 0,
+        instanceBytes: instanceBytesOutstanding(),
+        gpuTrackedMeshes: ctx.gpuDisposal?.trackedMeshes ?? 0,
+        gpuTrackedObjects: ctx.gpuDisposal?.trackedObjects ?? 0,
+        listeners: listenerCount,
+        eventLog: ctx.eventLog?.size || 0,
+        backend: renderer?.isWebGPURenderer ? 'webgpu' : 'webgl',
       },
       quality: {
         probeMs: quality.probeMs,
