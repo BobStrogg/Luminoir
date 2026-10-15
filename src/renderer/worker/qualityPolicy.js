@@ -5,6 +5,10 @@
  * a renderer; the worker keeps the state and side effects.
  */
 
+import { LOD_FAR_RADIUS, LOD_NEAR_RADIUS } from '../../rendering/lodDistances.js';
+
+export { LOD_FAR_RADIUS, LOD_NEAR_RADIUS, LOD_FADE_WIDTH } from '../../rendering/lodDistances.js';
+
 /**
  * Choose shadow-map size and PCF type based on the result of
  * `_probeGpuCost()`.  Resolution is deliberately NOT part of this
@@ -221,6 +225,99 @@ export function lodDetailThreshold(baseThreshold, pressure) {
  */
 export function lodSubPixelFactor(pressure) {
   return 0.7 + 1.3 * _clamp01(pressure);
+}
+
+/**
+ * Headroom of a frame-cost sample against the display interval.
+ * 1 means the recent cost is at or under 55 % of a vsync (plenty of
+ * room).  0 means the cost has reached 92 % of a vsync — still before
+ * a missed frame, which is the point the governor must already be
+ * shedding distant detail.  An empty or non-positive cost reads as
+ * full headroom so idle gaps and an unfilled render ring cannot
+ * tighten the reach.
+ *
+ * @param {number} costP95  Recent render-submit or GPU-scene p95, ms.
+ * @param {number} displayMs  Calibrated refresh interval, ms.
+ * @returns {number} 0..1
+ */
+export function frameHeadroom(costP95, displayMs) {
+  if (!(costP95 > 0) || !(displayMs > 0)) return 1;
+  const full = displayMs * 0.55;
+  const empty = displayMs * 0.92;
+  if (costP95 <= full) return 1;
+  if (costP95 >= empty) return 0;
+  return (empty - costP95) / (empty - full);
+}
+
+/**
+ * Detail reach (wu along score X) for a headroom sample.  Full
+ * headroom keeps `far`.  No headroom pulls in to `near` and stops
+ * there — the near field is never a cull target.
+ */
+export function detailReachForHeadroom(headroom, near = LOD_NEAR_RADIUS, far = LOD_FAR_RADIUS) {
+  const span = Math.max(0, far - near);
+  return near + span * _clamp01(headroom);
+}
+
+/**
+ * Glide the detail-reach governor one tick.
+ *
+ * Hysteresis: leave `open` only when headroom drops below 0.35, and
+ * return to `open` only after it climbs past 0.62, so a noisy p95
+ * cannot pump the cutoff.  Tightening uses a ~0.45 s time constant;
+ * relaxing uses ~1.4 s.  `cap` is a load-time ceiling (the widest
+ * reach that still fit the GPU probe); the glide never reopens past
+ * it.  When `active` is false the reach holds — idle rAF gaps must
+ * not restore a score's worth of stems and then hitch on the next play.
+ *
+ * @param {{ mode?: string, reach?: number, headroom?: number }} state
+ * @param {number} costP95
+ * @param {number} displayMs
+ * @param {number} dt Seconds.
+ * @param {boolean} [active]
+ * @param {number} [cap]
+ * @returns {{ mode: 'open'|'tight', reach: number, headroom: number }}
+ */
+export function stepDetailGovernor(state, costP95, displayMs, dt, active = true, cap = LOD_FAR_RADIUS) {
+  const far = Math.max(LOD_NEAR_RADIUS, Math.min(LOD_FAR_RADIUS, cap > 0 ? cap : LOD_FAR_RADIUS));
+  const prevReach = Number.isFinite(state?.reach) ? state.reach : far;
+  const prevMode = state?.mode === 'tight' ? 'tight' : 'open';
+  if (!active) {
+    return {
+      mode: prevMode,
+      reach: Math.max(LOD_NEAR_RADIUS, Math.min(far, prevReach)),
+      headroom: Number.isFinite(state?.headroom) ? state.headroom : 1,
+    };
+  }
+  const headroom = frameHeadroom(costP95, displayMs);
+  let mode = prevMode;
+  if (mode === 'open' && headroom < 0.35) mode = 'tight';
+  else if (mode === 'tight' && headroom > 0.62) mode = 'open';
+  const target = mode === 'open' ? far : Math.min(far, detailReachForHeadroom(headroom, LOD_NEAR_RADIUS, far));
+  const clamped = Math.max(LOD_NEAR_RADIUS, Math.min(far, target));
+  const held = Math.max(LOD_NEAR_RADIUS, Math.min(far, prevReach));
+  const tightening = clamped < held - 0.01;
+  const tau = tightening ? 0.45 : 1.4;
+  const dtS = dt > 0 ? dt : 0;
+  const k = 1 - Math.exp(-dtS / tau);
+  const reach = Math.max(LOD_NEAR_RADIUS, Math.min(far, held + (clamped - held) * k));
+  return { mode, reach, headroom };
+}
+
+/**
+ * Interpolate a GPU-scene cost between the full-detail probe and the
+ * tightened-reach probe.  `visibleFraction` is 1 when every detail
+ * instance is drawn and equals `tightFraction` at the tightened probe.
+ * Returns 0 when the tightened probe did not actually get cheaper, so
+ * the governor will not shed stems that do not buy frame time.
+ */
+export function estimateDetailGpuMs(fullMs, tightMs, visibleFraction, tightFraction) {
+  if (!(fullMs > 0) || !(tightMs > 0) || tightMs >= fullMs * 0.92) return 0;
+  const span = 1 - tightFraction;
+  const f = _clamp01(visibleFraction);
+  if (!(span > 0.02)) return tightMs;
+  const t = _clamp01((f - tightFraction) / span);
+  return tightMs + (fullMs - tightMs) * t;
 }
 
 /**

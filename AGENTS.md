@@ -185,9 +185,11 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
      never changes shadow direction; it only slides the 40 wu-wide coverage frustum,
      so this is visually stable.  (On constrained platforms this actuator is dormant —
      the frustum is frozen over the whole score, see "Shadow / key light".)
-  3. **LOD pressure actuator** (`LodGate.apply`): the detail-hide distance shrinks
-     toward 30 % of base (≈3.6 wu) and the sub-pixel cutoff rises from ~0.7 to ~2
-     device px at full pressure — real GPU savings with no pipeline recompiles.
+  3. **Detail-reach governor** (`LodGate.stepGovernor`): frame-cost headroom
+     (render-submit p95, plus the load-time GPU scene cost when shedding
+     detail measured cheaper) glides how far along the score stems stay.
+     It engages before a vsync miss (cost ≥ 92 % of the refresh) and never
+     hides the near field.  It does not change DPR or shadow-map size.
   4. **FXAA suppression** hysteresis (suppress ≥ 0.7, restore ≤ 0.25).
   5. **Detail-caster suppression** (`LodGate.updateCasters`): `lodDetail` meshes stop
      casting shadows above pressure 0.55 and cast again below 0.30 — `castShadow`
@@ -202,13 +204,15 @@ Mobile UA detection: `_isMobileUA()` in `renderWorker.js` (matches iPhone/iPad/i
 - Build time: stems/flags/ledger-line buckets are tagged `userData.lodDetail`; every
   glyph bucket gets `userData.lodSize` (world-unit footprint).  Detail-tagged box lines
   (simple-line stems) get their own InstancedMesh, separate from beams/staff/bar lines.
-- Runtime: detail buckets hide beyond `LOD_DISTANCE_THRESHOLD` (12 wu, where they are
-  ≈ 1 px); any tagged bucket hides when its footprint projects below ~0.7 device px.
-  Both rules have 15–20 % hysteresis so the smart camera's ±6 % zoom oscillation can't
-  flicker them.  The pass runs when camera distance changes > 1 % or runtime pressure
-  shifts ≥ 0.05 — pressure scales both thresholds (see actuators above).
+- Runtime: detail chunks hide when their closest point along score X is past the
+  governor's reach (6 wu near floor, 36 wu at full headroom).  A chunk inside the
+  6 wu near radius is never hidden, at any zoom.  Stems are not sub-pixel culled —
+  their thin axis used to fail that test while the stem was still clearly visible.
+  Non-detail glyphs can still sub-pixel cull, but only outside the near field, at
+  a fixed ~0.7 device px.  The detail material dither-fades the last 2.5 wu so a
+  chunk edge does not pop.  Hysteresis is 0.8 wu on the hide/show reach.
 - Staff lines, bar lines, beams, and noteheads are never distance-hidden (structure);
-  noteheads only go sub-pixel past d ≈ 100 (controls maxDistance = 100).
+  noteheads only go sub-pixel outside the near field, at extreme zoom.
 - `lodDetail` meshes also stop casting shadows entirely on constrained platforms
   (set once in `LodGate.collect` — their shadows are sub-texel at 1024–2048² anyway)
   and are pressure-gated elsewhere (actuator 5 above).  This roughly halves the

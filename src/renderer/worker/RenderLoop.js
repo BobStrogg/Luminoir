@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { SceneConfig } from '../../rendering/SceneConfig.js';
-import { setPlayheadX } from '../../rendering/Materials.js';
+import { setDetailFade, setPlayheadX } from '../../rendering/Materials.js';
 import { OPTIMIZATIONS } from '../../rendering/Optimizations.js';
 import { FRAME_SHADOW, FRAME_COLORS, FRAME_STATS, FRAME_BUDGET_SKIP } from './FrameStats.js';
 import { countCadenceMisses, nextTeslaDecimation, quantizeFrameMs, rateLabelFor, renderBudgetMs } from './qualityPolicy.js';
@@ -302,7 +302,7 @@ export class RenderLoop {
   /** World-space per-frame updates: key-light slide, LOD gating,
    *  playhead uniform, played-note colour sync.  Returns frame flags. */
   _updateWorld(now, musicTime) {
-    const { host, controls, camera, renderer, keyLightRig, lod, colorizer, quality } = this._ctx;
+    const { host, controls, camera, renderer, keyLightRig, lod, colorizer, quality, frameStats, clock } = this._ctx;
     let frameFlags = 0;
 
     // Slide the key light's shadow camera to straddle whatever the
@@ -322,6 +322,15 @@ export class RenderLoop {
       const pixelRatio = renderer && typeof renderer.getPixelRatio === 'function'
         ? renderer.getPixelRatio()
         : 1;
+      // Headroom against the refresh interval, from real submit cost
+      // and (when the load-time probe proved it) the GPU scene cost
+      // scaled by how much distant detail is still drawn.  Idle frames
+      // are not a cost sample: the render ring only records submits.
+      const displayMs = quality.displayMs > 0 ? quality.displayMs : (1000 / 60);
+      const renderCost = frameStats?.recentRenderP95?.() || 0;
+      const gpuCost = lod.estimateGpuMs?.() || 0;
+      const cost = Math.max(renderCost, gpuCost);
+      lod.stepGovernor(cost, displayMs, this._dtSmoothed, !!clock?.playing && cost > 0);
       if (lod.apply(camera, controls, pixelRatio, this._ctx.viewportHeightCss,
         quality.pressure)) {
         this.markDirty();
@@ -333,6 +342,7 @@ export class RenderLoop {
     // Feed the current playhead X into the glow-falloff uniform so the
     // noteHead shader can fade out emissive glow on distant played notes.
     setPlayheadX(this._camTarget.x);
+    setDetailFade(controls?.target?.x ?? this._camTarget.x, lod.reach);
     // Advance / rewind the played-note cursor and apply per-staff
     // instanceColor updates.  Runs every frame so playback keeps the
     // coloured-note state exactly in sync with the current music

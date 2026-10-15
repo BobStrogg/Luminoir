@@ -13,6 +13,12 @@ import {
   lodDetailThreshold,
   lodSubPixelFactor,
   renderBudgetMs,
+  frameHeadroom,
+  detailReachForHeadroom,
+  stepDetailGovernor,
+  estimateDetailGpuMs,
+  LOD_NEAR_RADIUS,
+  LOD_FAR_RADIUS,
   chooseTeslaPixelRatio,
   choosePresentDecimation,
   rateLabelFor,
@@ -379,5 +385,75 @@ describe('renderBudgetMs', () => {
   it('returns 75 % of the calibrated baseline', () => {
     expect(renderBudgetMs(16.67, true)).toBeCloseTo(12.5);
     expect(renderBudgetMs(8.33, true)).toBeCloseTo(6.25);
+  });
+});
+
+describe('frameHeadroom', () => {
+  const display = 1000 / 60;
+
+  it('is full until cost reaches 55 % of a vsync and empty at 92 %', () => {
+    expect(frameHeadroom(0, display)).toBe(1);
+    expect(frameHeadroom(display * 0.55, display)).toBe(1);
+    expect(frameHeadroom(display * 0.92, display)).toBe(0);
+    expect(frameHeadroom(display, display)).toBe(0);
+    expect(frameHeadroom(5, 0)).toBe(1);
+  });
+
+  it('is halfway between the two knees', () => {
+    const mid = display * (0.55 + 0.92) / 2;
+    expect(frameHeadroom(mid, display)).toBeCloseTo(0.5);
+  });
+});
+
+describe('detail reach governor', () => {
+  const display = 1000 / 60;
+
+  it('never pulls the reach inside the near radius', () => {
+    expect(detailReachForHeadroom(0)).toBe(LOD_NEAR_RADIUS);
+    expect(detailReachForHeadroom(1)).toBe(LOD_FAR_RADIUS);
+    expect(detailReachForHeadroom(0.5)).toBeCloseTo((LOD_NEAR_RADIUS + LOD_FAR_RADIUS) / 2);
+  });
+
+  it('stays open while headroom is healthy and tightens before a miss', () => {
+    const open = stepDetailGovernor(
+      { mode: 'open', reach: LOD_FAR_RADIUS, headroom: 1 },
+      display * 0.5, display, 0.5, true);
+    expect(open.mode).toBe('open');
+    expect(open.reach).toBeCloseTo(LOD_FAR_RADIUS);
+
+    const tight = stepDetailGovernor(
+      { mode: 'open', reach: LOD_FAR_RADIUS, headroom: 1 },
+      display, display, 0.5, true);
+    expect(tight.mode).toBe('tight');
+    expect(tight.reach).toBeLessThan(LOD_FAR_RADIUS);
+    expect(tight.reach).toBeGreaterThanOrEqual(LOD_NEAR_RADIUS);
+  });
+
+  it('holds a tight reach across the hysteresis band and while idle', () => {
+    const held = stepDetailGovernor(
+      { mode: 'tight', reach: 12, headroom: 0.2 },
+      display * 0.75, display, 0.5, true);
+    expect(held.mode).toBe('tight');
+
+    const idle = stepDetailGovernor(
+      { mode: 'tight', reach: 12, headroom: 0.2 },
+      0, display, 1, false);
+    expect(idle.mode).toBe('tight');
+    expect(idle.reach).toBe(12);
+  });
+
+  it('does not reopen past the load-time cap', () => {
+    const capped = stepDetailGovernor(
+      { mode: 'tight', reach: 8, headroom: 0 },
+      display * 0.4, display, 2, true, 8);
+    expect(capped.mode).toBe('open');
+    expect(capped.reach).toBeLessThanOrEqual(8);
+    expect(capped.reach).toBeGreaterThanOrEqual(LOD_NEAR_RADIUS);
+  });
+
+  it('ignores a tightened probe that did not get cheaper', () => {
+    expect(estimateDetailGpuMs(20, 19, 0.4, 0.3)).toBe(0);
+    expect(estimateDetailGpuMs(20, 10, 1, 0.25)).toBeCloseTo(20);
+    expect(estimateDetailGpuMs(20, 10, 0.25, 0.25)).toBeCloseTo(10);
   });
 });
